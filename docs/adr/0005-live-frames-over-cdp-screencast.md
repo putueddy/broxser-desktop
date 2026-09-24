@@ -23,10 +23,11 @@ blocking browser I/O stays off the GPUI thread and nothing leaks on close.
 - Input uses `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent` in CSS pixels,
   mapped from the painted frame bounds. Pointer moves and wheel deltas are
   coalesced with one dispatch in flight per device.
-- Sync reuses the core router and stays inside one session. A link navigation
-  synchronizes only right after a forwarded click or key on that device; scripted
-  navigations, forms, typing and pointer events never synchronize. Wheel deltas
-  are mirrored at the destination's center and dropped after it navigates.
+- Sync reuses the core router and stays inside one session and visible devices.
+  ADR 0006 replaces the initial recent-input heuristic with isolated-world trusted
+  link intent matched to the navigation request and loader. Scripted links after
+  ordinary typing do not synchronize. Wheel deltas are mirrored at the destination's
+  center and dropped after navigation or hiding.
 - Crashes, detached targets, browser exit and transport errors end in explicit
   states. A restart is a user action that restores configuration and loads the
   URL once; it never replays clicks, typing or navigations.

@@ -57,10 +57,10 @@ deterministik untuk capture statis.
 | --- | --- |
 | `Ctrl+L`, ketik, `Enter` / **Go** | Navigasi semua device satu kali; tanpa skema diawali `http://` |
 | Klik device | Memilih device; pointer dan wheel ke device di bawah kursor |
-| Keyboard | Ke device terpilih setelah kanvasnya diklik; `Ctrl+Q/R/L` tetap pintasan Broxser |
+| Keyboard | Ke device terpilih yang terlihat; `Ctrl+Q/R/L` tetap pintasan Broxser |
 | **Reload** / `Ctrl+R` | Reload device terpilih saja |
-| **Sync links** / **Sync scroll** | Opt-in, hanya dalam session yang sama; link sinkron hanya setelah klik/tombol yang diteruskan |
-| **Hide** di sidebar | Menghentikan stream device itu |
+| **Sync links** / **Sync scroll** | Opt-in, hanya antar-device terlihat dalam session yang sama; link memerlukan aktivasi tepercaya dan navigasi yang cocok |
+| **Hide** di sidebar | Menghentikan stream dan input; memilih device terlihat lain, atau tanpa target keyboard bila semuanya disembunyikan |
 | `+` / `−` | Skala tampilan; frame diminta sebesar ukuran tampilan |
 | **Restart runtime** | Muncul setelah browser berhenti; memulihkan konfigurasi, tidak memutar ulang aksi |
 | `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus |
@@ -70,6 +70,12 @@ Mode statis: tambahkan `--static`, lalu **Capture previews** atau `Ctrl+R`; opsi
 membatalkannya dan menunggu cleanup (sekitar setengah detik). Jika proses Broxser
 dibunuh (SIGTERM/SIGKILL) atau crash, pembersihan tidak berjalan dan browser dapat
 tertinggal. URL dapat diganti lewat `--url http://localhost:3000` atau file workspace.
+
+Sync link memakai observer terisolasi, bukan asumsi bahwa setiap navigasi setelah
+mengetik berasal dari pengguna. Link lambat tetap dapat tersinkron; URL melebihi
+batas validasi ditolak untuk sync tanpa dipotong. Redirect ke URL berbeda, link
+subframe, download dan pembukaan tab baru belum dicakup kontrak sync ini.
+Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable
 tersebut. Tidak ada fallback Chromium diam-diam. `--browser /usr/bin/chromium`

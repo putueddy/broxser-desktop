@@ -32,6 +32,18 @@ Live input is forwarded only to the device the user targets. Sync never broadcas
 typing, form submission, clicks or pointer events, never crosses sessions, and a
 restart restores configuration without replaying user actions.
 
+Link sync requires a trusted link report from the device's isolated main-frame
+execution context and the matching browser navigation request/loader. The binding
+does not expose native capabilities to page scripts. A recent ordinary keypress
+cannot authorize scripted links. Full URLs are validated before routing; oversized
+destinations are rejected rather than shortened. Hidden devices receive no page
+input or synchronized navigation/scroll, even through the engine API (ADR 0006).
+
+Extension observations are retained across context-registration ordering and
+target destruction, then checked before targets in a new session are opened.
+Websocket handshake progress is cancellable and retains its overall deadline;
+partial upgrades and navigation URLs are not replayed.
+
 HTTP and HTTPS are accepted deliberately, including localhost and internal sites.
 This is a developer desktop app, not a public URL-fetching service. Do not expose
 the CLI as an unauthenticated server: that would create an SSRF boundary the current

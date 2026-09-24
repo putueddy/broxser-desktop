@@ -178,12 +178,14 @@ bukan salinan state aplikasi web yang bisa dipulihkan.
 | Config berubah saat capture | Selesaikan snapshot aktif, pakai perubahan pada job berikutnya |
 
 Router memerlukan opt-in, memeriksa source session/device, dan tidak mengaktifkan
-click/typing. Live session menyinkronkan navigasi link hanya sesaat setelah klik atau
-tombol yang diteruskan ke device itu, sehingga navigasi dari script, form dan timer
-tidak pernah menyebar; scroll dicerminkan sebagai delta wheel yang di-coalesce dan
-dibuang bila tujuan sudah bernavigasi (navigation generation). Antrean command,
-frame dan event berbatas. Jangan memakai klaim exactly-once untuk aksi web; side
-effect di server tidak bisa dibatalkan oleh router lokal.
+click/typing. Live session memerlukan bukti aktivasi link tepercaya dari execution
+context terisolasi pada main frame, lalu mencocokkannya dengan request dan loader
+navigasi (ADR 0006). Respons HTTP lambat tidak menghapus kelayakan yang sudah
+terikat ke navigasi itu. URL asli divalidasi tanpa dipotong; redirect ke URL berbeda
+tidak dicerminkan. Scroll di-coalesce dan dibuang bila tujuan sudah bernavigasi
+atau tersembunyi. Device tersembunyi tidak menerima input atau sync. Antrean
+command, frame dan event berbatas. Jangan memakai klaim exactly-once untuk aksi
+web; side effect di server tidak bisa dibatalkan oleh router lokal.
 
 ## 8. Security and privacy considerations
 

@@ -3,6 +3,54 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR 4 review fixes 25 September 2026
+
+Verified locally with Rust 1.98.1, GPUI 0.2.2 and the pinned Helium 0.18.1.1.
+The six review findings now have regression coverage; the original independent
+reproducers were rebuilt against the updated engine as an additional check.
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 36 default tests (8 core + 28 engine), strict Clippy and desktop check |
+| Desktop unit tests | Passed: 4, covering visible selection, all-hidden state, X11-style repeats and shifted ASCII key identity |
+| Native desktop build | Passed |
+| Whole live Helium suite | Passed: 14 tests, two test threads, including six slow-page runs with no foreign navigations or session extensions |
+| Scripted link after ordinary typing | Original reproducer now navigates only the source; one effect request, peer remains on its original page |
+| Genuine link with a three-second response | Both intended same-session devices arrive; two document requests |
+| Long link | Source requests the intact 2,312-character path; no truncated peer request |
+| Hidden input and individual reload | No hidden input callback or hidden reload request |
+| Canceled click and interactive/editable descendants | Peer remains unchanged, including cancellation that clears timers and Enter inside an input nested in a link |
+| Early extension announcement | Original fake CDP returns a qualification error before page navigation; created/changed and subsequently destroyed targets are covered in capture and live tests |
+| Cancellation during stalled websocket upgrade | Original fake CDP returns typed `Cancelled` in 59 ms after acceptance; direct tests require under 500 ms, and capture including teardown under one second |
+| Fragmented handshake | Valid headers separated by two gaps longer than 500 ms succeed within the overall deadline; expiry is separately tested |
+| Native X11 visual/input check | Passed under Xvfb with Lavapipe: frames visible, hiding the selected device selects the visible alternative, all-hidden state has no input target, hidden sidebar selection is ignored, and a held key does not repeat into a re-shown device |
+| `scripts/desktop-smoke.sh` | Passed: live close exit 0 in 718 ms; static close during held request exit 0 in 667 ms; both went from 15 browser processes to 0 with no owned profiles remaining |
+
+Link authorization now requires a trusted isolated-world candidate and confirmation
+before unload, a per-activation ID, a positive registered main-frame context ID,
+and the matching requested URL and committing loader (ADR 0006). The old
+recent-keypress heuristic and URL truncation are gone. Redirects to a different
+final destination are deliberately not mirrored.
+
+The X11 test used a separate virtual display; signed Xvfb, xdotool and software
+Vulkan packages were extracted into a temporary directory without installation or
+desktop configuration changes. A fixture logged keyboard callbacks by viewport:
+phone received `a`, then no input while hidden; tablet received `b` and a held `h`;
+after hiding all devices and re-showing the phone while `h` remained physically
+held, the phone received no repeated `h`. After key-up, fresh `d` and `e` reached
+the phone, including after an attempted selection of the still-hidden tablet.
+
+Physical Wayland visual/input verification of this revision remains pending because
+the local desktop session was locked. X11 software rendering is not a physical-GPU
+or latency qualification. Normal Wayland frame display and close were observed on
+the earlier PR revision during review. The System Design DOCX snapshot remains
+older than the Markdown ADRs.
+
+Keyboard suppression is conservative until a matching key-up. GPUI 0.2.2 exposes
+logical names rather than physical keycodes, so unusual layout symbol changes or
+key-ups lost outside the application still need platform qualification. These
+limits do not permit forwarding input to a hidden device.
+
 ## M1 live frames, 24 September 2026 (cloud container)
 
 Same environment and runtimes as M0 below. Live frames are CDP screencast JPEGs

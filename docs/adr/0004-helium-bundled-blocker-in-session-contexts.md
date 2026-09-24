@@ -40,6 +40,9 @@ remove the blocker: Helium adds it with the always-loaded session components.
 - Captures fail closed if any extension background page or service worker runs
   inside a Broxser session context. This capability gate turns a future Helium
   change into an explicit qualification failure instead of intermittent reloads.
+  ADR 0006 adds bounded retention of discovery events that precede the context
+  creation response; the context is rechecked before page targets are opened,
+  including when the observed extension target has already been destroyed.
 - Navigation errors report a superseding navigation and whether the page or the
   browser started it. Broxser never retries a navigation automatically.
 - Crash dumps go to the private profile through `BREAKPAD_DUMP_LOCATION`;
