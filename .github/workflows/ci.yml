@@ -22,8 +22,10 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
-      - name: Compile GPUI desktop
-        run: cargo check --locked -p broxser-desktop -j 2
+      - name: Check GPUI desktop and input regression tests
+        run: |
+          cargo clippy --locked -p broxser-desktop --all-targets -j 2 -- -D warnings
+          cargo test --locked -p broxser-desktop -j 2
       - name: Pinned Helium integration
         run: |
           bash scripts/fetch-helium.sh

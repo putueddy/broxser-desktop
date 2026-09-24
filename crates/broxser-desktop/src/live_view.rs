@@ -271,10 +271,10 @@ impl LiveView {
             if !self.release_keys() {
                 return;
             }
-            if let Some(previous) = self.selected {
-                if !self.release_buttons(previous) {
-                    return;
-                }
+            if let Some(previous) = self.selected
+                && !self.release_buttons(previous)
+            {
+                return;
             }
         }
         self.selected = Some(index);
@@ -294,10 +294,8 @@ impl LiveView {
 
     fn toggle_hidden(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let visible = self.devices[index].hidden;
-        if !visible {
-            if !self.release_keys_for(index) || !self.release_buttons(index) {
-                return;
-            }
+        if !visible && (!self.release_keys_for(index) || !self.release_buttons(index)) {
+            return;
         }
         if !self.send(Command::SetVisible {
             device: index,
@@ -317,17 +315,16 @@ impl LiveView {
         let selected = selected_after_visibility_change(self.selected, &hidden);
         if selected != self.selected {
             self.selected = selected;
-            if let Some(index) = selected {
-                if let Some(url) = self
+            if let Some(index) = selected
+                && let Some(url) = self
                     .status
                     .devices
                     .get(index)
                     .map(|device| device.url.clone())
                     .filter(|url| !url.is_empty())
-                {
-                    self.url
-                        .update(cx, |input, cx| input.show(&url, window, cx));
-                }
+            {
+                self.url
+                    .update(cx, |input, cx| input.show(&url, window, cx));
             }
         }
         cx.notify();

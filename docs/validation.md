@@ -11,7 +11,7 @@ reproducers were rebuilt against the updated engine as an additional check.
 
 | Check | Result |
 | --- | --- |
-| `bash scripts/check.sh` | Passed: 36 default tests (8 core + 28 engine), strict Clippy and desktop check |
+| `bash scripts/check.sh` | Passed: 36 default tests (8 core + 28 engine), 4 desktop tests and strict Clippy for default members and desktop; CI now runs the desktop regression tests too |
 | Desktop unit tests | Passed: 4, covering visible selection, all-hidden state, X11-style repeats and shifted ASCII key identity |
 | Native desktop build | Passed |
 | Whole live Helium suite | Passed: 14 tests, two test threads, including six slow-page runs with no foreign navigations or session extensions |
@@ -25,6 +25,7 @@ reproducers were rebuilt against the updated engine as an additional check.
 | Fragmented handshake | Valid headers separated by two gaps longer than 500 ms succeed within the overall deadline; expiry is separately tested |
 | Native X11 visual/input check | Passed under Xvfb with Lavapipe: frames visible, hiding the selected device selects the visible alternative, all-hidden state has no input target, hidden sidebar selection is ignored, and a held key does not repeat into a re-shown device |
 | `scripts/desktop-smoke.sh` | Passed: live close exit 0 in 718 ms; static close during held request exit 0 in 667 ms; both went from 15 browser processes to 0 with no owned profiles remaining |
+| Integration with dependency PRs 1–3 | Scratch merge clean; 36 default tests and 3 live link-sync regression tests passed with tungstenite 0.30 and base64 0.23 |
 
 Link authorization now requires a trusted isolated-world candidate and confirmation
 before unload, a per-activation ID, a positive registered main-frame context ID,
