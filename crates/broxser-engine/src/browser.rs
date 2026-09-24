@@ -105,6 +105,8 @@ impl BrowserProcess {
         if seed {
             seed_profile(profile.path())?;
         }
+        #[cfg(unix)]
+        disable_core_dumps()?;
         let child = Command::new(&options.executable)
             .args(launch_args(profile.path(), options.headless))
             // Chromium keeps its crash database under the default user data
@@ -225,6 +227,27 @@ fn launch_args(profile: &Path, headless: bool) -> Vec<OsString> {
         args.push("--headless=new".into());
     }
     args
+}
+
+/// Keeps the kernel from writing core dumps of the browser, which inherits the
+/// limit. Renderer memory holds cookies and page content that a crash collector
+/// such as apport or systemd-coredump would store outside the private profile.
+/// Streaming a renderer's 20+ GB mostly empty dump to such a collector also held
+/// the dying renderer, and `Target.targetCrashed`, for more than 45 seconds.
+/// Crashpad reports still go to the profile. std has no safe per-child hook, so
+/// this lowers the soft limit of the Broxser process itself.
+#[cfg(unix)]
+fn disable_core_dumps() -> Result<()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Core);
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: limit.maximum,
+        },
+    )
+    .context("disable core dumps before launching the browser")
 }
 
 /// Preferences written into the new private profile before the first launch.
@@ -445,6 +468,43 @@ mod tests {
             preferences["extensions"]["settings"][HELIUM_UBLOCK_ID]["incognito"],
             false
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_starts_without_core_dumps() {
+        use crate::test_support::{FakeBrowser, fake_browser, profile_root};
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        // Enable core dumps first where the hard limit allows it, so the check
+        // does not pass merely because the host default is already zero.
+        let limit = getrlimit(Resource::Core);
+        setrlimit(
+            Resource::Core,
+            Rlimit {
+                current: limit.maximum,
+                ..limit
+            },
+        )
+        .unwrap();
+        let root = profile_root();
+        let browser = BrowserProcess::start(
+            &BrowserOptions {
+                executable: fake_browser(FakeBrowser::NeverReady),
+                headless: true,
+                profile_root: Some(root.path().to_owned()),
+                cancel: Cancellation::new(),
+            },
+            true,
+        )
+        .unwrap();
+        let limits = fs::read_to_string(format!("/proc/{}/limits", browser.child.id())).unwrap();
+        let core = limits
+            .lines()
+            .find(|line| line.starts_with("Max core file size"))
+            .unwrap();
+        // Columns: name (4 words), soft limit, hard limit, unit.
+        assert_eq!(core.split_whitespace().nth(4), Some("0"), "{core}");
+        browser.shutdown().unwrap();
     }
 
     #[cfg(target_os = "linux")]

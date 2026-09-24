@@ -238,6 +238,48 @@ impl Live {
     }
 }
 
+/// Kernel crash handling and the state of each browser process. Before Broxser
+/// disabled core dumps, a renderer on the CI runner stayed in the kernel's core
+/// dump path (state `I`, wait channel `do_exit`) for more than 45 seconds.
+fn crash_diagnostics(root: &Path) -> String {
+    let read = |path: &str| {
+        std::fs::read(path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .unwrap_or_default()
+    };
+    let mut text = format!(
+        "core_pattern={:?} suid_dumpable={}\n",
+        read("/proc/sys/kernel/core_pattern"),
+        read("/proc/sys/fs/suid_dumpable")
+    );
+    for process in browser::referencing(root) {
+        let file = |name: &str| read(&format!("/proc/{}/{name}", process.pid));
+        let stat = file("stat");
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim().chars().next())
+            .unwrap_or('?');
+        let limits = file("limits");
+        let core = limits
+            .lines()
+            .find(|line| line.starts_with("Max core file size"))
+            .and_then(|line| line.split_whitespace().nth(4))
+            .unwrap_or("?");
+        // Chromium rewrites its process title and joins arguments with spaces.
+        let cmdline = file("cmdline");
+        let kind = cmdline
+            .split(['\0', ' '])
+            .find(|arg| arg.starts_with("--type="))
+            .unwrap_or("browser");
+        text += &format!(
+            "pid={} state={state} wchan={} core_limit={core} {kind}\n",
+            process.pid,
+            file("wchan")
+        );
+    }
+    text
+}
+
 fn assert_gone(root: &Path, processes: &[ProcessIdentity]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while processes.iter().any(browser::is_running) {
@@ -623,31 +665,11 @@ fn live_session_reports_crashes_and_browser_exit() {
         {
             break status;
         }
-        if crashed_at.elapsed() > Duration::from_secs(45) {
-            // Evidence for hosts where crash reporting stalls (seen once on the
-            // Ubuntu 24.04 CI runner): which browser processes remain and where.
-            for process in browser::referencing(live.root.path()) {
-                let read = |file: &str| {
-                    std::fs::read(format!("/proc/{}/{file}", process.pid)).unwrap_or_default()
-                };
-                let stat = String::from_utf8_lossy(&read("stat")).into_owned();
-                let state = stat
-                    .rsplit_once(')')
-                    .map_or("?", |(_, rest)| rest.trim())
-                    .chars()
-                    .next();
-                let cmdline = String::from_utf8_lossy(&read("cmdline")).into_owned();
-                let kind = cmdline
-                    .split('\0')
-                    .find(|arg| arg.starts_with("--type="))
-                    .unwrap_or("browser");
-                println!(
-                    "pid={} state={state:?} wchan={} {kind}",
-                    process.pid,
-                    String::from_utf8_lossy(&read("wchan"))
-                );
-            }
-            panic!("renderer crash not reported within 45 s: {status:#?}");
+        if crashed_at.elapsed() > Duration::from_secs(15) {
+            panic!(
+                "renderer crash not reported within 15 s: {status:#?}\n{}",
+                crash_diagnostics(live.root.path())
+            );
         }
         thread::sleep(Duration::from_millis(20));
     };
