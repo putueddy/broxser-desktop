@@ -239,8 +239,9 @@ impl Live {
 }
 
 /// Kernel crash handling and the state of each browser process. Before Broxser
-/// disabled core dumps, a renderer on the CI runner stayed in the kernel's core
-/// dump path (state `I`, wait channel `do_exit`) for more than 45 seconds.
+/// kept memory out of core dumps, a renderer on the CI runner stayed in the
+/// kernel's core dump path (state `I`, wait channel `do_exit`) for more than 45
+/// seconds.
 fn crash_diagnostics(root: &Path) -> String {
     let read = |path: &str| {
         std::fs::read(path)
@@ -272,9 +273,10 @@ fn crash_diagnostics(root: &Path) -> String {
             .find(|arg| arg.starts_with("--type="))
             .unwrap_or("browser");
         text += &format!(
-            "pid={} state={state} wchan={} core_limit={core} {kind}\n",
+            "pid={} state={state} wchan={} core_limit={core} coredump_filter={} {kind}\n",
             process.pid,
-            file("wchan")
+            file("wchan"),
+            file("coredump_filter")
         );
     }
     text

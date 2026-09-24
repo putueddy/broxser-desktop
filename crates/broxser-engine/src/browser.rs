@@ -106,7 +106,7 @@ impl BrowserProcess {
             seed_profile(profile.path())?;
         }
         #[cfg(unix)]
-        disable_core_dumps()?;
+        restrict_core_dumps()?;
         let child = Command::new(&options.executable)
             .args(launch_args(profile.path(), options.headless))
             // Chromium keeps its crash database under the default user data
@@ -229,15 +229,17 @@ fn launch_args(profile: &Path, headless: bool) -> Vec<OsString> {
     args
 }
 
-/// Keeps the kernel from writing core dumps of the browser, which inherits the
-/// limit. Renderer memory holds cookies and page content that a crash collector
-/// such as apport or systemd-coredump would store outside the private profile.
-/// Streaming a renderer's 20+ GB mostly empty dump to such a collector also held
-/// the dying renderer, and `Target.targetCrashed`, for more than 45 seconds.
-/// Crashpad reports still go to the profile. std has no safe per-child hook, so
-/// this lowers the soft limit of the Broxser process itself.
+/// Keeps browser memory out of kernel core dumps. Renderer memory holds cookies
+/// and page content that a crash collector such as systemd-coredump or apport
+/// would store outside the private profile, and streaming a renderer's 20+ GB,
+/// mostly empty dump held the dying renderer, and `Target.targetCrashed`, for
+/// more than 45 seconds. A zero soft `RLIMIT_CORE` suppresses dumps where it is
+/// honored; systemd's default `core_pattern` passes a fixed unlimited value
+/// instead, so a zero `coredump_filter` also leaves every memory mapping out of
+/// the dump. The browser inherits both. std has no safe per-child hook, so they
+/// apply to the Broxser process itself. Crashpad reports still go to the profile.
 #[cfg(unix)]
-fn disable_core_dumps() -> Result<()> {
+fn restrict_core_dumps() -> Result<()> {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     let limit = getrlimit(Resource::Core);
     setrlimit(
@@ -247,7 +249,11 @@ fn disable_core_dumps() -> Result<()> {
             maximum: limit.maximum,
         },
     )
-    .context("disable core dumps before launching the browser")
+    .context("disable core dumps before launching the browser")?;
+    #[cfg(target_os = "linux")]
+    fs::write("/proc/self/coredump_filter", "0")
+        .context("keep memory out of core dumps before launching the browser")?;
+    Ok(())
 }
 
 /// Preferences written into the new private profile before the first launch.
@@ -475,8 +481,9 @@ mod tests {
     fn browser_starts_without_core_dumps() {
         use crate::test_support::{FakeBrowser, fake_browser, profile_root};
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-        // Enable core dumps first where the hard limit allows it, so the check
-        // does not pass merely because the host default is already zero.
+        // Enable core dumps with the kernel's default filter first (where the
+        // hard limit allows it), so the checks do not pass merely because this
+        // process already has zero values.
         let limit = getrlimit(Resource::Core);
         setrlimit(
             Resource::Core,
@@ -486,6 +493,7 @@ mod tests {
             },
         )
         .unwrap();
+        fs::write("/proc/self/coredump_filter", "0x33").unwrap();
         let root = profile_root();
         let browser = BrowserProcess::start(
             &BrowserOptions {
@@ -504,6 +512,9 @@ mod tests {
             .unwrap();
         // Columns: name (4 words), soft limit, hard limit, unit.
         assert_eq!(core.split_whitespace().nth(4), Some("0"), "{core}");
+        let filter =
+            fs::read_to_string(format!("/proc/{}/coredump_filter", browser.child.id())).unwrap();
+        assert_eq!(filter.trim(), "00000000");
         browser.shutdown().unwrap();
     }
 
