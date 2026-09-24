@@ -69,7 +69,9 @@ fn rejects_unsafe_urls() {
         let mut workspace = Workspace::demo();
         workspace.url = url.into();
         assert!(workspace.validate().is_err(), "accepted {url:?}");
+        assert!(broxser_core::validate_url(url).is_err(), "accepted {url:?}");
     }
+    broxser_core::validate_url("http://localhost:3000/path?q=1").unwrap();
 }
 
 #[test]

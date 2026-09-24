@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use tungstenite::protocol::{Message, WebSocketConfig};
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGE: usize = 128 * 1024 * 1024;
 const MAX_PENDING_RESPONSES: usize = 16;
+const MAX_DETACHED: usize = 256;
 const MAX_QUEUED_EVENTS: usize = 1024;
 
 /// Cooperative cancellation shared with a worker thread. Blocking engine calls
@@ -108,6 +109,12 @@ impl Cdp {
         })
     }
 
+    /// Shortens the read timeout for interactive loops that also poll a UI queue.
+    pub(crate) fn set_poll_interval(&mut self, interval: Duration) -> Result<()> {
+        self.socket.get_ref().set_read_timeout(Some(interval))?;
+        Ok(())
+    }
+
     pub(crate) fn send(
         &mut self,
         method: &str,
@@ -125,6 +132,26 @@ impl Cdp {
             .send(Message::Text(request.to_string().into()))
             .with_context(|| format!("send CDP {method}"))?;
         Ok(id)
+    }
+
+    /// Sends a command whose result is not needed. Its response is discarded on
+    /// arrival; a protocol error is kept for [`Cdp::take_detached_error`].
+    pub(crate) fn send_detached(
+        &mut self,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+    ) -> Result<()> {
+        if self.inbox.detached.len() >= MAX_DETACHED {
+            bail!("too many unanswered CDP commands");
+        }
+        let id = self.send(method, params, session)?;
+        self.inbox.detached.insert(id);
+        Ok(())
+    }
+
+    pub(crate) fn take_detached_error(&mut self) -> Option<String> {
+        self.inbox.detached_error.take()
     }
 
     pub(crate) fn take_response(&mut self, id: u64) -> Option<Value> {
@@ -168,6 +195,8 @@ impl Cdp {
 #[derive(Default)]
 struct Inbox {
     responses: HashMap<u64, Value>,
+    detached: HashSet<u64>,
+    detached_error: Option<String>,
     events: VecDeque<Event>,
 }
 
@@ -177,6 +206,16 @@ impl Inbox {
             bail!("CDP message is not an object");
         };
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if self.detached.remove(&id) {
+                if let Some(error) = message
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    self.detached_error = Some(error.chars().take(200).collect());
+                }
+                return Ok(());
+            }
             if self.responses.len() >= MAX_PENDING_RESPONSES {
                 bail!("CDP pending response limit exceeded");
             }
@@ -259,6 +298,21 @@ mod tests {
         assert!(inbox.accept(json!([1, 2])).is_err());
         inbox.accept(json!({"unrelated": true})).unwrap();
         assert!(inbox.events.is_empty() && inbox.responses.is_empty());
+    }
+
+    #[test]
+    fn detached_responses_are_dropped_but_errors_kept() {
+        let mut inbox = Inbox::default();
+        inbox.detached.extend([3, 4]);
+        inbox.accept(json!({"id":3,"result":{}})).unwrap();
+        inbox
+            .accept(json!({"id":4,"error":{"message":"No target with given id"}}))
+            .unwrap();
+        assert!(inbox.responses.is_empty() && inbox.detached.is_empty());
+        assert_eq!(
+            inbox.detached_error.as_deref(),
+            Some("No target with given id")
+        );
     }
 
     #[test]

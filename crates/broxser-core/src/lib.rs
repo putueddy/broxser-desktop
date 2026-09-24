@@ -272,6 +272,12 @@ fn validate_name(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates a URL that Broxser may open: absolute HTTP or HTTPS with a host and
+/// without userinfo or control characters. This is input hygiene, not an allowlist.
+pub fn validate_url(value: &str) -> Result<()> {
+    validate_http_url(value)
+}
+
 fn validate_http_url(value: &str) -> Result<()> {
     if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
         return Err(Error::Invalid(
