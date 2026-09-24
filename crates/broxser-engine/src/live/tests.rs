@@ -1,8 +1,9 @@
 use super::*;
 use crate::browser::{self, ProcessIdentity};
-use crate::test_support::{Fixture, Reply, profile_root, test_browser};
+use crate::test_support::{FakeBrowser, Fixture, Reply, fake_browser, profile_root, test_browser};
 use broxser_core::{Device, Session};
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -76,6 +77,19 @@ fn modifiers_use_cdp_bits() {
 }
 
 #[test]
+fn old_confirmation_cannot_confirm_a_later_activation_of_the_same_url() {
+    let url = "https://example.test/next";
+    assert!(same_link_activation(42, url, 42, url));
+    assert!(!same_link_activation(43, url, 42, url));
+    assert!(!same_link_activation(
+        42,
+        url,
+        42,
+        "https://example.test/other"
+    ));
+}
+
+#[test]
 fn viewport_mapping_handles_scale_offset_and_bounds() {
     // A 390x844 CSS viewport shown at half size, offset inside the window.
     let image = (100.0, 50.0, 195.0, 422.0);
@@ -101,6 +115,91 @@ fn viewport_mapping_handles_scale_offset_and_bounds() {
     );
 }
 
+#[test]
+fn early_extension_event_rejects_live_before_navigation() {
+    for method in ["Target.targetCreated", "Target.targetInfoChanged"] {
+        let root = profile_root();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(
+            root.path().join("fake-cdp-port"),
+            listener.local_addr().unwrap().port().to_string(),
+        )
+        .unwrap();
+        let navigations = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&navigations);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            while let Ok(tungstenite::Message::Text(text)) = socket.read() {
+                let request: Value = serde_json::from_str(text.as_str()).unwrap();
+                let command = request["method"].as_str().unwrap();
+                if command == "Page.navigate" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                if command == "Target.createBrowserContext" {
+                    for event in [
+                        json!({"method": method, "params": {"targetInfo": {
+                            "type":"background_page", "targetId":"EXT1", "browserContextId":"CTX1",
+                            "url":"chrome-extension://blockjmkbacgjkknlgpkjjiijinjdanf/background.html"
+                        }}}),
+                        json!({"method":"Target.targetDestroyed", "params":{"targetId":"EXT1"}}),
+                    ] {
+                        socket
+                            .send(tungstenite::Message::Text(event.to_string().into()))
+                            .unwrap();
+                    }
+                }
+                let result = match command {
+                    "Browser.getVersion" => json!({"product":"Fake/1.0", "protocolVersion":"1.3"}),
+                    "Target.createBrowserContext" => json!({"browserContextId":"CTX1"}),
+                    _ => json!({}),
+                };
+                let reply = json!({"id":request["id"],"result":result});
+                if socket
+                    .send(tungstenite::Message::Text(reply.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let live = LiveSession::start(
+            workspace("http://127.0.0.1:4173/".into()),
+            BrowserOptions {
+                executable: fake_browser(FakeBrowser::LoopbackEndpoint),
+                headless: true,
+                profile_root: Some(root.path().to_owned()),
+                cancel: Cancellation::new(),
+            },
+            || {},
+        )
+        .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            let status = live.status();
+            if matches!(status.runtime, RuntimeState::Stopped { .. }) {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "fake live runtime did not stop"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let RuntimeState::Stopped { error: Some(error) } = status.runtime else {
+            panic!("expected runtime error")
+        };
+        assert!(
+            error.contains("browser runtime not qualified"),
+            "{method}: {error}"
+        );
+        assert_eq!(navigations.load(Ordering::SeqCst), 0, "{method}");
+        drop(live);
+        server.join().unwrap();
+        assert_eq!(fs_entries(root.path()), ["fake-cdp-port"]);
+    }
+}
+
 // Live tests: BROXSER_TEST_BROWSER=/path/to/helium cargo test -p broxser-engine -- --ignored
 
 const PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
@@ -123,6 +222,20 @@ fn fixture() -> Fixture {
         let path = request.path.split('?').next().unwrap_or("/");
         let body = match path {
             "/event" => String::new(),
+            "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
+            "/script-pointer" => PAGE.replace("AUTO", "document.body.addEventListener('click', e => { if (!e.target.closest('a')) setTimeout(() => document.getElementById('link').click(), 100); });"),
+            "/forged" => PAGE.replace("AUTO", "if (innerWidth === 360) setTimeout(() => { window.__broxserTrustedLink?.(location.origin + '/next'); document.getElementById('link').click(); }, 300);"),
+            "/prevent" => PAGE.replace("AUTO", "document.getElementById('link').addEventListener('click', e => { e.preventDefault(); const a = document.createElement('a'); a.href = '/prevent-b'; a.click(); });"),
+            "/prevent-same" => PAGE.replace("AUTO", "document.getElementById('link').addEventListener('click', e => { if (e.isTrusted) { e.preventDefault(); document.getElementById('link').click(); } });"),
+            "/prevent-clear" => PAGE.replace("AUTO", "document.getElementById('link').addEventListener('click', e => { if (e.isTrusted) { e.preventDefault(); for(let i=0;i<10000;i++) clearTimeout(i); document.getElementById('link').click(); } });"),
+            "/nested-input" => "<a href=/next><input id=i style='width:160px;height:40px'></a><script>i.focus(); i.addEventListener('keydown', e => { if(e.key==='Enter') document.querySelector('a').click(); });</script>".into(),
+            "/editable-link" => "<a id=a contenteditable=true href=/next style='display:block;width:160px;height:40px'>edit</a><a id=hidden href=/next style='display:none'>hidden</a><script>a.addEventListener('click',e=>{if(e.isTrusted)hidden.click()});</script>".into(),
+            "/parent-editable" => "<div contenteditable=true><a id=a href=/next style='display:block;width:160px;height:40px'>edit</a></div><a id=hidden href=/next style='display:none'>hidden</a><script>a.addEventListener('click',e=>{if(e.isTrusted)hidden.click()});</script>".into(),
+            "/nested-button" => "<a href=/next style='display:block;width:160px;height:40px'><button id=b style='width:160px;height:40px'>button</button></a><script>b.addEventListener('click',e=>{if(e.isTrusted)document.querySelector('a').click()});</script>".into(),
+            "/keyboard" => PAGE.replace("AUTO", "document.getElementById('link').href = '/keyboard-dest'; document.getElementById('link').focus();"),
+            "/slowstart" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow';"),
+            "/supersede" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow'; document.getElementById('link').addEventListener('click', () => setTimeout(() => location.href = '/supersede-dest', 100));"),
+            "/longstart" => PAGE.replace("AUTO", &format!("document.getElementById('link').href = '/long?token={}';", "x".repeat(2300))),
             // A page that follows its own link without any user gesture.
             "/auto" => PAGE.replace(
                 "AUTO",
@@ -132,7 +245,11 @@ fn fixture() -> Fixture {
         };
         Reply::Html {
             body,
-            delay: Duration::ZERO,
+            delay: if path == "/slow" {
+                Duration::from_secs(3)
+            } else {
+                Duration::ZERO
+            },
             cookie: None,
         }
     })
@@ -533,6 +650,7 @@ fn live_session_sync_stays_in_session_without_loops_or_replay() {
         |status| {
             status.devices[0].url == next
                 && status.devices[1].url == next
+                && !status.devices[0].loading
                 && !status.devices[1].loading
         },
     );
@@ -548,12 +666,17 @@ fn live_session_sync_stays_in_session_without_loops_or_replay() {
         delta_x: 0.0,
         delta_y: 400.0,
     });
-    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
-        let scrolls = events(fixture, "scroll");
-        ["360", "600"]
-            .iter()
-            .all(|width| scrolls.iter().any(|event| event["w"] == *width))
-    }));
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| {
+            let scrolls = events(fixture, "scroll");
+            ["360", "600"]
+                .iter()
+                .all(|width| scrolls.iter().any(|event| event["w"] == *width))
+        }),
+        "scrolls={:?} status={:?}",
+        events(&fixture, "scroll"),
+        live.session().status()
+    );
     thread::sleep(Duration::from_millis(500));
     assert!(
         events(&fixture, "scroll")
@@ -591,6 +714,348 @@ fn live_session_sync_stays_in_session_without_loops_or_replay() {
     assert_eq!(count(&fixture, "/next"), 2);
     assert_eq!(count(&fixture, "/after-auto"), 3);
     restarted.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_link_sync_requires_a_trusted_link_activation() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/script-key")));
+    live.wait("script-key pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/script-key")
+    });
+    live.send(Command::SetSync(SyncSettings {
+        navigation: true,
+        scroll: false,
+    }));
+    live.wait("sync on", Duration::from_secs(5), |s| s.sync.navigation);
+    click(&live, 0, 50.0, 210.0);
+    live.send(Command::Key {
+        device: 0,
+        key: KeyInput::from_key("a", Some("a"), Modifiers::default(), true).unwrap(),
+    });
+    live.wait(
+        "script click navigates source",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == fixture.url("/next"),
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/script-key")
+    );
+    assert_eq!(count(&fixture, "/next"), 1);
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/script-pointer"),
+    });
+    live.wait("script-pointer pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/script-pointer")
+    });
+    click(&live, 0, 50.0, 300.0);
+    live.wait(
+        "nonlink click's script navigates source",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == fixture.url("/next"),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/script-pointer")
+    );
+    assert_eq!(count(&fixture, "/next"), 2);
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/forged"),
+    });
+    live.wait(
+        "forged page only navigates source",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == fixture.url("/next") && s.devices[1].url == fixture.url("/forged"),
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        count(&fixture, "/next"),
+        3,
+        "main-world binding call must not authorize sync"
+    );
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/prevent"),
+    });
+    live.wait("prevent pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/prevent")
+    });
+    click(&live, 0, 100.0, 120.0);
+    live.wait(
+        "canceled link led to synthetic link",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == fixture.url("/prevent-b"),
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/prevent")
+    );
+    assert_eq!(count(&fixture, "/prevent-b"), 1);
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/prevent-same"),
+    });
+    live.wait("same-href prevent pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/prevent-same")
+    });
+    click(&live, 0, 100.0, 120.0);
+    live.wait(
+        "canceled link followed synthetically",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == fixture.url("/next"),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/prevent-same")
+    );
+    assert_eq!(count(&fixture, "/next"), 4);
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/keyboard"),
+    });
+    live.wait("keyboard pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/keyboard")
+    });
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("enter", None, Modifiers::default(), down).unwrap(),
+        });
+    }
+    live.wait(
+        "Enter on focused anchor synchronizes",
+        Duration::from_secs(10),
+        |s| {
+            s.devices[0].url == fixture.url("/keyboard-dest")
+                && s.devices[1].url == fixture.url("/keyboard-dest")
+        },
+    );
+    assert_eq!(count(&fixture, "/keyboard-dest"), 2);
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_link_sync_binds_slow_commit_and_preserves_long_url() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/slowstart")));
+    live.wait("slow pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/slowstart")
+    });
+    live.send(Command::SetSync(SyncSettings {
+        navigation: true,
+        scroll: false,
+    }));
+    live.wait("sync on", Duration::from_secs(5), |s| s.sync.navigation);
+    click(&live, 0, 100.0, 120.0);
+    live.wait("slow response synchronized", Duration::from_secs(15), |s| {
+        s.devices[0].url == fixture.url("/slow")
+            && s.devices[1].url == fixture.url("/slow")
+            && !s.devices[1].loading
+    });
+    assert_eq!(count(&fixture, "/slow"), 2);
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/supersede"),
+    });
+    live.wait("supersede pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/supersede")
+    });
+    click(&live, 0, 100.0, 120.0);
+    live.wait(
+        "later script navigation supersedes slow link",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == fixture.url("/supersede-dest"),
+    );
+    thread::sleep(Duration::from_millis(3500));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/supersede")
+    );
+    assert_eq!(count(&fixture, "/supersede-dest"), 1);
+
+    live.send(Command::NavigateAll {
+        url: fixture.url("/longstart"),
+    });
+    live.wait("long pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/longstart")
+    });
+    click(&live, 0, 100.0, 120.0);
+    live.wait("full long URL on source", Duration::from_secs(10), |s| {
+        s.devices[0].url.contains("/long?token=")
+    });
+    thread::sleep(Duration::from_millis(500));
+    let status = live.session().status();
+    assert!(
+        status.devices[0].url.len() > 2300,
+        "observed URL was truncated"
+    );
+    assert_eq!(status.devices[1].url, fixture.url("/longstart"));
+    assert_eq!(
+        fixture
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/long?token="))
+            .count(),
+        1,
+        "overlong URL must never be truncated into a peer request"
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_link_sync_rejects_canceled_and_nested_activations() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/")
+    });
+    live.send(Command::SetSync(SyncSettings {
+        navigation: true,
+        scroll: false,
+    }));
+    live.wait("sync on", Duration::from_secs(5), |s| s.sync.navigation);
+    for path in [
+        "/prevent-clear",
+        "/nested-input",
+        "/editable-link",
+        "/parent-editable",
+        "/nested-button",
+    ] {
+        live.send(Command::NavigateAll {
+            url: fixture.url(path),
+        });
+        live.wait("adversarial pages", Duration::from_secs(10), |s| {
+            loaded(s, &fixture, path)
+        });
+        let before = count(&fixture, "/next");
+        if path == "/nested-input" {
+            for down in [true, false] {
+                live.send(Command::Key {
+                    device: 0,
+                    key: KeyInput::from_key("enter", None, Modifiers::default(), down).unwrap(),
+                });
+            }
+        } else {
+            let y = if path == "/prevent-clear" {
+                120.0
+            } else {
+                20.0
+            };
+            click(&live, 0, 50.0, y);
+        }
+        live.wait(
+            "source follows synthetic link",
+            Duration::from_secs(10),
+            |s| s.devices[0].url == fixture.url("/next"),
+        );
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            live.session().status().devices[1].url,
+            fixture.url(path),
+            "{path} synchronized"
+        );
+        if path != "/nested-button" {
+            assert_eq!(
+                count(&fixture, "/next"),
+                before + 1,
+                "{path} sent an extra document request"
+            );
+        }
+    }
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn hidden_devices_reject_input_and_sync_without_replay() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/")
+    });
+    live.send(Command::SetSync(SyncSettings {
+        navigation: true,
+        scroll: true,
+    }));
+    live.wait("sync on", Duration::from_secs(5), |s| {
+        s.sync.navigation && s.sync.scroll
+    });
+    click(&live, 0, 40.0, 210.0);
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: false,
+    });
+    live.wait("phone hidden", Duration::from_secs(5), |s| {
+        !s.devices[0].streaming
+    });
+    let input_before = events(&fixture, "input").len();
+    let scroll_before = events(&fixture, "scroll").len();
+    live.send(Command::Key {
+        device: 0,
+        key: KeyInput::from_key("z", Some("z"), Modifiers::default(), true).unwrap(),
+    });
+    click(&live, 0, 100.0, 120.0);
+    live.send(Command::Wheel {
+        device: 0,
+        x: 100.0,
+        y: 300.0,
+        delta_x: 0.0,
+        delta_y: 400.0,
+    });
+    live.send(Command::Reload { device: 0 });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(events(&fixture, "input").len(), input_before);
+    assert_eq!(events(&fixture, "scroll").len(), scroll_before);
+    assert_eq!(count(&fixture, "/next"), 0);
+    assert_eq!(
+        count(&fixture, "/"),
+        3,
+        "hidden reload must not request a document"
+    );
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: true,
+    });
+    live.wait("phone visible", Duration::from_secs(5), |s| {
+        s.devices[0].streaming
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(events(&fixture, "input").len(), input_before);
+    assert_eq!(count(&fixture, "/next"), 0);
+
+    live.send(Command::SetVisible {
+        device: 1,
+        visible: false,
+    });
+    live.wait("tablet hidden", Duration::from_secs(5), |s| {
+        !s.devices[1].streaming
+    });
+    click(&live, 0, 100.0, 120.0);
+    live.wait("phone navigates", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/next")
+    });
+    assert_eq!(live.session().status().devices[1].url, fixture.url("/"));
+    live.send(Command::SetVisible {
+        device: 1,
+        visible: true,
+    });
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/"),
+        "showing a hidden peer must not replay navigation"
+    );
+    live.close();
 }
 
 #[test]

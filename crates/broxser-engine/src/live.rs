@@ -8,7 +8,7 @@
 use crate::Limits;
 use crate::browser::{BrowserOptions, BrowserProcess};
 use crate::cdp::{Cancellation, Cancelled, Cdp, Event, parse_response, required_str};
-use crate::device::{Commands, extension_in_context, setup_target};
+use crate::device::{Commands, ExtensionObservations, extension_in_context, setup_target};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use broxser_core::{SyncAction, SyncEvent, SyncRouter, Workspace, validate_url};
@@ -25,13 +25,42 @@ const COMMANDS_PER_TURN: usize = 64;
 const LIVE_POLL: Duration = Duration::from_millis(8);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING: usize = 256;
-const MAX_URL: usize = 2048;
+const MAX_LINK_INTENT_BYTES: usize = 8192;
+const LINK_INTENT_WINDOW: Duration = Duration::from_secs(1);
+const LINK_WORLD: &str = "broxser_link_observer";
+const LINK_BINDING: &str = "__broxserTrustedLink";
+const LINK_OBSERVER: &str = r#"(() => {
+  let next = 0;
+  let pending = null;
+  const report = event => {
+    pending = null;
+    if (!event.isTrusted || event.defaultPrevented || event.button !== 0 ||
+        event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const target = event.target;
+    const anchor = target instanceof Element && target.closest('a[href],area[href]');
+    if (!anchor || anchor.hasAttribute('download') ||
+        (anchor.target && anchor.target.toLowerCase() !== '_self')) return;
+    const nestedControl = target.closest('input,textarea,select,button,option,label,[role="button"]');
+    if (target.isContentEditable || anchor.isContentEditable ||
+        (nestedControl && anchor.contains(nestedControl))) return;
+    const href = anchor.href;
+    if (href.length > 8192 || !/^https?:\/\//i.test(href)) return;
+    next = (next + 1) >>> 0;
+    pending = {event, href, id: next};
+    __broxserTrustedLink(JSON.stringify({phase: 'C', id: next, url: href}));
+  };
+  addEventListener('pointerdown', event => { if (event.isTrusted) pending = null; }, true);
+  addEventListener('keydown', event => { if (event.isTrusted) pending = null; }, true);
+  addEventListener('click', report, true);
+  addEventListener('beforeunload', event => {
+    if (event.isTrusted && pending && !pending.event.defaultPrevented)
+      __broxserTrustedLink(JSON.stringify({phase: 'Y', id: pending.id, url: pending.href}));
+    pending = null;
+  }, true);
+})();"#;
 const JPEG_QUALITY: u32 = 80;
 /// Largest frame edge requested before the UI reports its display size.
 const DEFAULT_FRAME_EDGE: u32 = 2048;
-/// A navigation is synchronized only when Broxser forwarded a click or key to
-/// that device this recently; script or timer navigations never synchronize.
-const GESTURE_WINDOW: Duration = Duration::from_secs(2);
 
 /// UI-owned handle to a running live workspace. Dropping it stops the browser and
 /// waits for cleanup, so drop it off the UI thread.
@@ -435,10 +464,36 @@ struct Controller<'a> {
     workspace: &'a Workspace,
     shared: &'a Shared,
     contexts: HashSet<String>,
+    extensions: ExtensionObservations,
     devices: Vec<LiveDevice>,
     router: SyncRouter,
     sync: SyncSettings,
     pending: HashMap<u64, Pending>,
+}
+
+struct LinkIntent {
+    url: String,
+    id: u64,
+    at: Instant,
+    generation: u64,
+    confirmed: bool,
+}
+
+struct LinkCandidate {
+    url: String,
+    id: u64,
+    confirmed: bool,
+}
+
+struct LinkNavigation {
+    url: String,
+    id: u64,
+    loader: String,
+    confirmed: bool,
+}
+
+fn same_link_activation(expected_id: u64, expected_url: &str, id: u64, url: &str) -> bool {
+    expected_id == id && expected_url == url
 }
 
 struct LiveDevice {
@@ -450,9 +505,10 @@ struct LiveDevice {
     limit: (u32, u32),
     /// Increments on every committed cross-document navigation.
     generation: u64,
-    /// Reason and time of the latest navigation the page itself requested.
-    requested: Option<(String, Instant)>,
-    last_gesture: Option<Instant>,
+    link_context: Option<i64>,
+    link_intent: Option<LinkIntent>,
+    requested_link: Option<LinkCandidate>,
+    link_navigation: Option<LinkNavigation>,
     /// Sequence of sync events originating here.
     sequence: u64,
     frame_sequence: u64,
@@ -499,6 +555,7 @@ impl<'a> Controller<'a> {
             workspace,
             shared,
             contexts: HashSet::new(),
+            extensions: ExtensionObservations::default(),
             devices: Vec::new(),
             router: SyncRouter::new(workspace).map_err(|error| anyhow!("{error}"))?,
             sync: SyncSettings::default(),
@@ -538,6 +595,11 @@ impl<'a> Controller<'a> {
             let response = self.command("Target.createBrowserContext", json!({}), None)?;
             let context = required_str(&response, "browserContextId")?.to_owned();
             self.contexts.insert(context.clone());
+            if let Some(extension) = self.extensions.in_context(&context) {
+                bail!(
+                    "browser runtime not qualified: extension {extension} runs inside a Broxser session context (ADR 0004)"
+                );
+            }
             contexts.insert(session.id.as_str(), context);
         }
         for device in &workspace.devices {
@@ -570,8 +632,10 @@ impl<'a> Controller<'a> {
                 streaming: false,
                 limit: (physical(device.width), physical(device.height)),
                 generation: 0,
-                requested: None,
-                last_gesture: None,
+                link_context: None,
+                link_intent: None,
+                requested_link: None,
+                link_navigation: None,
                 sequence: 0,
                 frame_sequence: 0,
                 wheel: None,
@@ -579,6 +643,21 @@ impl<'a> Controller<'a> {
                 pointer_move: None,
                 move_in_flight: false,
             });
+            self.command(
+                "Runtime.enable",
+                json!({}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
+            self.command(
+                "Runtime.addBinding",
+                json!({"name": LINK_BINDING, "executionContextName": LINK_WORLD}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
+            self.command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": LINK_OBSERVER, "worldName": LINK_WORLD, "runImmediately": true}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
         }
         self.cdp.set_poll_interval(LIVE_POLL)?;
         self.shared
@@ -608,7 +687,7 @@ impl<'a> Controller<'a> {
                     self.navigate(index, &url)?;
                 }
             }
-            Command::Reload { device } if device < count => {
+            Command::Reload { device } if device < count && self.devices[device].visible => {
                 let session = self.devices[device].session.clone();
                 let id = self.cdp.send("Page.reload", json!({}), Some(&session))?;
                 self.track(id, Pending::Navigate { device })?;
@@ -629,8 +708,24 @@ impl<'a> Controller<'a> {
             Command::SetVisible { device, visible } if device < count => {
                 self.devices[device].visible = visible;
                 if visible {
+                    self.cdp.send_detached(
+                        "Input.setIgnoreInputEvents",
+                        json!({"ignore": false}),
+                        Some(&self.devices[device].session.clone()),
+                    )?;
                     self.start_stream(device)?;
                 } else {
+                    let state = &mut self.devices[device];
+                    state.pointer_move = None;
+                    state.wheel = None;
+                    state.link_intent = None;
+                    state.requested_link = None;
+                    state.link_navigation = None;
+                    self.cdp.send_detached(
+                        "Input.setIgnoreInputEvents",
+                        json!({"ignore": true}),
+                        Some(&state.session.clone()),
+                    )?;
                     self.stop_stream(device)?;
                 }
             }
@@ -667,7 +762,9 @@ impl<'a> Controller<'a> {
         let device = &mut self.devices[index];
         device.wheel = None;
         device.pointer_move = None;
-        device.requested = None;
+        device.link_intent = None;
+        device.requested_link = None;
+        device.link_navigation = None;
         let session = device.session.clone();
         let id = self
             .cdp
@@ -690,13 +787,15 @@ impl<'a> Controller<'a> {
 
     fn pointer(&mut self, index: usize, event: PointerEvent) -> Result<()> {
         let device = &mut self.devices[index];
+        if !device.visible {
+            return Ok(());
+        }
         if event.kind == PointerKind::Move {
             // Coalesce moves: only the newest one waits while another is in flight.
             device.pointer_move = Some(event);
             return Ok(());
         }
         device.pointer_move = None;
-        device.last_gesture = Some(Instant::now());
         let session = device.session.clone();
         let params = mouse_params(event, device.css);
         self.cdp
@@ -704,6 +803,9 @@ impl<'a> Controller<'a> {
     }
 
     fn wheel(&mut self, index: usize, x: f64, y: f64, delta_x: f64, delta_y: f64) {
+        if !self.devices[index].visible {
+            return;
+        }
         self.queue_wheel(index, x, y, delta_x, delta_y);
         if !self.sync.scroll {
             return;
@@ -729,6 +831,9 @@ impl<'a> Controller<'a> {
                 self.index_of(&delivery.destination_device),
                 &delivery.event.action,
             ) {
+                if !self.devices[target].visible {
+                    continue;
+                }
                 let (width, height) = self.devices[target].css;
                 self.queue_wheel(
                     target,
@@ -764,6 +869,9 @@ impl<'a> Controller<'a> {
     }
 
     fn key(&mut self, index: usize, key: &KeyInput) -> Result<()> {
+        if !self.devices[index].visible {
+            return Ok(());
+        }
         if key.key.is_empty()
             || key.key.chars().count() > 32
             || key.code.len() > 32
@@ -793,9 +901,6 @@ impl<'a> Controller<'a> {
             params["unmodifiedText"] = json!(text);
         }
         let device = &mut self.devices[index];
-        if key.down {
-            device.last_gesture = Some(Instant::now());
-        }
         let session = device.session.clone();
         self.cdp
             .send_detached("Input.dispatchKeyEvent", params, Some(&session))
@@ -805,6 +910,11 @@ impl<'a> Controller<'a> {
     fn flush_input(&mut self) -> Result<()> {
         for index in 0..self.devices.len() {
             let device = &mut self.devices[index];
+            if !device.visible {
+                device.pointer_move = None;
+                device.wheel = None;
+                continue;
+            }
             if !device.move_in_flight
                 && let Some(event) = device.pointer_move.take()
             {
@@ -894,6 +1004,13 @@ impl<'a> Controller<'a> {
             }
         }
         self.sync = settings;
+        if !settings.navigation {
+            for device in &mut self.devices {
+                device.link_intent = None;
+                device.requested_link = None;
+                device.link_navigation = None;
+            }
+        }
         self.shared.update(|status| status.sync = settings);
         Ok(())
     }
@@ -947,6 +1064,7 @@ impl<'a> Controller<'a> {
                 let Some(info) = params.get("targetInfo") else {
                     return Ok(());
                 };
+                self.extensions.observe(info)?;
                 if let Some(extension) = extension_in_context(info, &self.contexts) {
                     bail!(
                         "browser runtime not qualified: extension {extension} runs inside a Broxser \
@@ -995,6 +1113,84 @@ impl<'a> Controller<'a> {
             return Ok(());
         };
         match event.method.as_str() {
+            "Runtime.executionContextCreated" => {
+                if let Some(context) = params.get("context")
+                    && context.get("name").and_then(Value::as_str) == Some(LINK_WORLD)
+                    && context.pointer("/auxData/frameId").and_then(Value::as_str)
+                        == Some(self.devices[index].target_id.as_str())
+                    && context.pointer("/auxData/type").and_then(Value::as_str) == Some("isolated")
+                {
+                    self.devices[index].link_context = context
+                        .get("id")
+                        .and_then(Value::as_i64)
+                        .filter(|id| *id > 0);
+                }
+            }
+            "Runtime.executionContextDestroyed" => {
+                if self.devices[index].link_context.is_some_and(|id| {
+                    params.get("executionContextId").and_then(Value::as_i64) == Some(id)
+                }) {
+                    self.devices[index].link_context = None;
+                    self.devices[index].link_intent = None;
+                }
+            }
+            "Runtime.executionContextsCleared" => {
+                self.devices[index].link_context = None;
+                self.devices[index].link_intent = None;
+            }
+            "Runtime.bindingCalled"
+                if text("name") == Some(LINK_BINDING)
+                    && self.devices[index].link_context.is_some_and(|id| {
+                        params.get("executionContextId").and_then(Value::as_i64) == Some(id)
+                    })
+                    && self.devices[index].visible =>
+            {
+                let device = &mut self.devices[index];
+                if let Some(payload) = text("payload")
+                    && payload.len() <= MAX_LINK_INTENT_BYTES + 128
+                    && let Ok(message) = serde_json::from_str::<Value>(payload)
+                    && let (Some(kind), Some(id), Some(url)) = (
+                        message.get("phase").and_then(Value::as_str),
+                        message.get("id").and_then(Value::as_u64),
+                        message.get("url").and_then(Value::as_str),
+                    )
+                    && id <= u32::MAX as u64
+                    && url.len() <= MAX_LINK_INTENT_BYTES
+                    && validate_url(url).is_ok()
+                {
+                    match kind {
+                        "C" => {
+                            device.link_intent = Some(LinkIntent {
+                                url: url.to_owned(),
+                                id,
+                                at: Instant::now(),
+                                generation: device.generation,
+                                confirmed: false,
+                            });
+                        }
+                        "Y" => {
+                            if let Some(intent) = &mut device.link_intent
+                                && same_link_activation(intent.id, &intent.url, id, url)
+                                && intent.generation == device.generation
+                                && intent.at.elapsed() <= LINK_INTENT_WINDOW
+                            {
+                                intent.confirmed = true;
+                            }
+                            if let Some(requested) = &mut device.requested_link
+                                && same_link_activation(requested.id, &requested.url, id, url)
+                            {
+                                requested.confirmed = true;
+                            }
+                            if let Some(navigation) = &mut device.link_navigation
+                                && same_link_activation(navigation.id, &navigation.url, id, url)
+                            {
+                                navigation.confirmed = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             "Page.screencastFrame" => self.frame(index, params)?,
             "Page.frameStartedLoading" | "Page.frameStoppedLoading"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
@@ -1005,23 +1201,53 @@ impl<'a> Controller<'a> {
             "Page.frameRequestedNavigation"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
-                let reason: String = text("reason")
-                    .unwrap_or_default()
-                    .chars()
-                    .take(64)
-                    .collect();
-                let same_tab =
-                    text("disposition").is_none_or(|disposition| disposition == "currentTab");
-                self.devices[index].requested = same_tab.then(|| (reason, Instant::now()));
+                let sync_navigation = self.sync.navigation;
+                let device = &mut self.devices[index];
+                let url = text("url");
+                device.requested_link = device.link_intent.as_ref().and_then(|intent| {
+                    (sync_navigation
+                        && device.visible
+                        && text("reason") == Some("anchorClick")
+                        && text("disposition").is_none_or(|value| value == "currentTab")
+                        && url == Some(intent.url.as_str())
+                        && intent.generation == device.generation
+                        && intent.at.elapsed() <= LINK_INTENT_WINDOW)
+                        .then(|| LinkCandidate {
+                            url: intent.url.clone(),
+                            id: intent.id,
+                            confirmed: intent.confirmed,
+                        })
+                });
+                device.link_intent = None;
+                device.link_navigation = None;
+            }
+            "Page.frameStartedNavigating"
+                if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
+            {
+                let device = &mut self.devices[index];
+                device.link_navigation =
+                    match (device.requested_link.take(), text("url"), text("loaderId")) {
+                        (Some(expected), Some(url), Some(loader))
+                            if expected.url == url && !loader.is_empty() =>
+                        {
+                            Some(LinkNavigation {
+                                url: expected.url,
+                                id: expected.id,
+                                loader: loader.to_owned(),
+                                confirmed: expected.confirmed,
+                            })
+                        }
+                        _ => None,
+                    };
+                device.link_intent = None;
             }
             "Page.navigatedWithinDocument"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
-                let url: String = text("url")
-                    .unwrap_or_default()
-                    .chars()
-                    .take(MAX_URL)
-                    .collect();
+                let url = text("url").unwrap_or_default().to_owned();
+                self.devices[index].link_intent = None;
+                self.devices[index].requested_link = None;
+                self.devices[index].link_navigation = None;
                 self.shared.device(index, |device| device.url = url);
             }
             "Page.frameNavigated" => {
@@ -1034,23 +1260,22 @@ impl<'a> Controller<'a> {
                 {
                     return Ok(());
                 }
-                let url: String = frame
+                let url = frame
                     .get("url")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .chars()
-                    .take(MAX_URL)
-                    .collect();
+                    .to_owned();
                 let device = &mut self.devices[index];
                 device.generation += 1;
                 device.wheel = None;
-                let gesture = device
-                    .last_gesture
-                    .take()
-                    .is_some_and(|at| at.elapsed() < GESTURE_WINDOW);
-                let link = device.requested.take().is_some_and(|(reason, at)| {
-                    reason == "anchorClick" && at.elapsed() < GESTURE_WINDOW
+                let link = device.link_navigation.take().is_some_and(|link| {
+                    link.confirmed
+                        && frame.get("loaderId").and_then(Value::as_str)
+                            == Some(link.loader.as_str())
+                        && url == link.url
                 });
+                device.link_intent = None;
+                device.requested_link = None;
                 if device.visible && !device.streaming {
                     // A crashed renderer is replaced on navigation; resume its stream.
                     self.start_stream(index)?;
@@ -1059,7 +1284,7 @@ impl<'a> Controller<'a> {
                     device.url = url.clone();
                     device.error = None;
                 });
-                if self.sync.navigation && gesture && link {
+                if self.sync.navigation && link && self.devices[index].visible {
                     self.sync_navigation(index, url)?;
                 }
             }
@@ -1142,7 +1367,8 @@ impl<'a> Controller<'a> {
             if let (Some(target), SyncAction::Navigate { url }) = (
                 self.index_of(&delivery.destination_device),
                 &delivery.event.action,
-            ) {
+            ) && self.devices[target].visible
+            {
                 self.navigate(target, url)?;
             }
         }
