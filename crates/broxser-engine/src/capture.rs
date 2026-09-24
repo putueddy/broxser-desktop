@@ -4,7 +4,7 @@
 use crate::Limits;
 use crate::browser::{BrowserOptions, BrowserProcess, ProcessIdentity};
 use crate::cdp::{Cdp, Event, parse_response, required_str};
-use crate::device::{Commands, extension_in_context, setup_target};
+use crate::device::{Commands, ExtensionObservations, extension_in_context, setup_target};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use broxser_core::Workspace;
@@ -151,6 +151,7 @@ fn run_with(
             extension_guard: plan.extension_guard,
             diagnostics: &mut *diagnostics,
             contexts: HashSet::new(),
+            extensions: ExtensionObservations::default(),
             targets: Vec::new(),
             loaded: HashSet::new(),
         }
@@ -178,6 +179,7 @@ struct Capture<'a> {
     extension_guard: bool,
     diagnostics: &'a mut Diagnostics,
     contexts: HashSet<String>,
+    extensions: ExtensionObservations,
     targets: Vec<Target>,
     loaded: HashSet<(String, String)>,
 }
@@ -214,6 +216,8 @@ impl Capture<'_> {
             let response = self.command("Target.createBrowserContext", json!({}), None)?;
             let context = required_str(&response, "browserContextId")?.to_owned();
             self.contexts.insert(context.clone());
+            self.record_extension_in_context(&context);
+            self.check_extension_guard()?;
             contexts.insert(session.id.as_str(), context);
         }
         for device in &workspace.devices {
@@ -434,6 +438,11 @@ impl Capture<'_> {
         while let Some(event) = self.cdp.pop_event() {
             self.observe(event)?;
         }
+        self.check_extension_guard()?;
+        Ok(read)
+    }
+
+    fn check_extension_guard(&self) -> Result<()> {
         if self.extension_guard && !self.diagnostics.extension_targets.is_empty() {
             bail!(
                 "browser runtime not qualified: extension {} runs inside a Broxser session \
@@ -446,7 +455,17 @@ impl Capture<'_> {
                     .join(", ")
             );
         }
-        Ok(read)
+        Ok(())
+    }
+
+    fn record_extension_in_context(&mut self, context: &str) {
+        if let Some(extension) = self.extensions.in_context(context)
+            && self.diagnostics.extension_targets.len() < MAX_EXTENSION_IDS
+        {
+            self.diagnostics
+                .extension_targets
+                .insert(extension.to_owned());
+        }
     }
 
     fn observe(&mut self, event: Event) -> Result<()> {
@@ -454,12 +473,13 @@ impl Capture<'_> {
         let text = |field: &str| params.get(field).and_then(Value::as_str);
         match event.method.as_str() {
             "Target.targetCreated" | "Target.targetInfoChanged" => {
-                if let Some(extension) = params
-                    .get("targetInfo")
-                    .and_then(|info| extension_in_context(info, &self.contexts))
-                    && self.diagnostics.extension_targets.len() < MAX_EXTENSION_IDS
-                {
-                    self.diagnostics.extension_targets.insert(extension);
+                if let Some(info) = params.get("targetInfo") {
+                    self.extensions.observe(info)?;
+                    if let Some(extension) = extension_in_context(info, &self.contexts)
+                        && self.diagnostics.extension_targets.len() < MAX_EXTENSION_IDS
+                    {
+                        self.diagnostics.extension_targets.insert(extension);
+                    }
                 }
             }
             "Target.targetCrashed" | "Target.detachedFromTarget" => {

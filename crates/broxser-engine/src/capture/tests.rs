@@ -5,8 +5,10 @@ use crate::test_support::{
     FakeBrowser, FakeCdp, Fixture, Reply, assert_cleaned_up, fake_browser, fake_cdp, profile_root,
     test_browser,
 };
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 
 fn options(executable: PathBuf, root: &Path) -> BrowserOptions {
@@ -134,6 +136,122 @@ fn websocket_handshake_may_outlast_the_poll_interval() {
     browser.shutdown().unwrap();
     server.join().unwrap();
     assert_cleaned_up(root.path(), &processes);
+}
+
+#[test]
+fn stalled_websocket_upgrade_cancels_and_cleans_up() {
+    let root = profile_root();
+    let output = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(
+        root.path().join("fake-cdp-port"),
+        listener.local_addr().unwrap().port().to_string(),
+    )
+    .unwrap();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        thread::sleep(Duration::from_secs(2));
+        drop(stream);
+    });
+    let options = options(fake_browser(FakeBrowser::LoopbackEndpoint), root.path());
+    let cancel = options.cancel.clone();
+    let worker = thread::spawn(move || {
+        run(
+            &Workspace::demo(),
+            &options,
+            output.path(),
+            plan(Limits {
+                command: Duration::from_secs(15),
+                ..fast_limits()
+            }),
+        )
+    });
+    accepted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let cancelled_at = Instant::now();
+    cancel.cancel();
+    let outcome = worker.join().unwrap();
+    assert!(
+        outcome.result.as_ref().unwrap_err().is::<Cancelled>(),
+        "{}",
+        error_text(&outcome)
+    );
+    // Includes browser-process teardown and profile removal after the CDP
+    // transport has returned its typed cancellation.
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(1),
+        "cancellation and cleanup took {:?}",
+        cancelled_at.elapsed()
+    );
+    assert_cleaned_up(root.path(), &outcome.diagnostics.processes);
+    server.join().unwrap();
+}
+
+#[test]
+fn early_extension_event_rejects_capture_before_navigation() {
+    for method in ["Target.targetCreated", "Target.targetInfoChanged"] {
+        let root = profile_root();
+        let output = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        fs::write(
+            root.path().join("fake-cdp-port"),
+            listener.local_addr().unwrap().port().to_string(),
+        )
+        .unwrap();
+        let navigations = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&navigations);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            while let Ok(tungstenite::Message::Text(text)) = socket.read() {
+                let request: Value = serde_json::from_str(text.as_str()).unwrap();
+                let command = request["method"].as_str().unwrap();
+                if command == "Page.navigate" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                if command == "Target.createBrowserContext" {
+                    for event in [
+                        json!({"method": method, "params": {"targetInfo": {
+                            "type":"background_page", "targetId":"EXT1", "browserContextId":"CTX1",
+                            "url":"chrome-extension://blockjmkbacgjkknlgpkjjiijinjdanf/background.html"
+                        }}}),
+                        json!({"method":"Target.targetDestroyed", "params":{"targetId":"EXT1"}}),
+                    ] {
+                        socket
+                            .send(tungstenite::Message::Text(event.to_string().into()))
+                            .unwrap();
+                    }
+                }
+                let result = match command {
+                    "Browser.getVersion" => json!({"product":"Fake/1.0", "protocolVersion":"1.3"}),
+                    "Target.createBrowserContext" => json!({"browserContextId":"CTX1"}),
+                    _ => json!({}),
+                };
+                let reply = json!({"id":request["id"],"result":result});
+                if socket
+                    .send(tungstenite::Message::Text(reply.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let outcome = run(
+            &Workspace::demo(),
+            &options(fake_browser(FakeBrowser::LoopbackEndpoint), root.path()),
+            output.path(),
+            plan(fast_limits()),
+        );
+        assert!(
+            error_text(&outcome).contains("browser runtime not qualified"),
+            "{method}: {}",
+            error_text(&outcome)
+        );
+        assert_eq!(navigations.load(Ordering::SeqCst), 0, "{method}");
+        server.join().unwrap();
+        assert_cleaned_up(root.path(), &outcome.diagnostics.processes);
+    }
 }
 
 #[test]

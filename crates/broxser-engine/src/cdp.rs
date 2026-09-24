@@ -10,9 +10,11 @@ use std::fmt;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::WebSocket;
 use tungstenite::client::client_with_config;
+use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::{Message, WebSocketConfig};
 
 /// Socket read timeout once the websocket is established. It bounds how late a
@@ -84,23 +86,54 @@ impl Cdp {
         handshake_timeout: Duration,
         cancel: Cancellation,
     ) -> Result<Self> {
-        let stream = TcpStream::connect_timeout(
+        cancel.check()?;
+        if handshake_timeout.is_zero() {
+            bail!("CDP websocket handshake timed out");
+        }
+        let deadline = Instant::now() + handshake_timeout;
+        let connected = TcpStream::connect_timeout(
             &SocketAddr::from(([127, 0, 0, 1], port)),
-            handshake_timeout,
-        )
-        .context("connect to owned browser CDP endpoint")?;
-        // The browser may still be initializing its GPU when it publishes the port.
-        // Use the command deadline for HTTP upgrade; short polling timeouts are only
-        // safe after tungstenite owns a fully established websocket.
-        stream.set_read_timeout(Some(handshake_timeout))?;
-        stream.set_write_timeout(Some(handshake_timeout))?;
+            handshake_timeout.min(POLL_INTERVAL),
+        );
+        cancel.check()?;
+        let stream = connected.context("connect to owned browser CDP endpoint")?;
+        if Instant::now() >= deadline {
+            bail!("CDP websocket handshake timed out");
+        }
+        // Tungstenite retains partial HTTP reads/writes in MidHandshake. A
+        // nonblocking socket lets each interrupted attempt check cancellation
+        // without resending the upgrade request or discarding partial headers.
+        stream.set_nonblocking(true)?;
         let address = format!("ws://127.0.0.1:{port}{path}");
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(MAX_MESSAGE);
         config.max_frame_size = Some(MAX_MESSAGE);
-        let (socket, _) = client_with_config(address, stream, Some(config))
-            .map_err(|error| anyhow!("CDP websocket handshake: {error}"))?;
+        let mut attempted = client_with_config(address, stream, Some(config));
+        let mut socket = loop {
+            cancel.check()?;
+            if Instant::now() >= deadline {
+                bail!("CDP websocket handshake timed out");
+            }
+            match attempted {
+                Ok((socket, _)) => break socket,
+                Err(HandshakeError::Interrupted(mid)) => {
+                    thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    attempted = mid.handshake();
+                }
+                Err(HandshakeError::Failure(error)) => {
+                    return Err(anyhow!("CDP websocket handshake: {error}"));
+                }
+            }
+        };
+        cancel.check()?;
+        socket.get_mut().set_nonblocking(false)?;
         socket.get_ref().set_read_timeout(Some(POLL_INTERVAL))?;
+        socket
+            .get_ref()
+            .set_write_timeout(Some(handshake_timeout))?;
         Ok(Self {
             socket,
             next_id: 1,
@@ -269,6 +302,9 @@ pub(crate) fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
 
     #[test]
     fn responses_events_and_errors_are_separated() {
@@ -347,5 +383,114 @@ mod tests {
         other.cancel();
         let error = cancel.check().unwrap_err().context("waiting for browser");
         assert!(error.is::<Cancelled>());
+    }
+
+    #[test]
+    fn split_upgrade_response_preserves_partial_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !head.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                head.extend_from_slice(&chunk[..count]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let key = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                        .then_some(value.trim())
+                })
+                .unwrap();
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\n")
+                .unwrap();
+            thread::sleep(POLL_INTERVAL + Duration::from_millis(200));
+            stream.write_all(b"Upgrade: websocket\r\n").unwrap();
+            thread::sleep(POLL_INTERVAL + Duration::from_millis(200));
+            stream
+                .write_all(
+                    format!("Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+        });
+        let socket = Cdp::connect(
+            port,
+            "/devtools/browser/test",
+            Duration::from_secs(3),
+            Cancellation::new(),
+        )
+        .unwrap();
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn upgrade_timeout_is_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(600));
+            drop(stream);
+        });
+        let started = Instant::now();
+        let error = Cdp::connect(
+            port,
+            "/devtools/browser/test",
+            Duration::from_millis(250),
+            Cancellation::new(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("handshake timed out"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_upgrade_cancels_with_typed_error_under_half_second() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !head.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                head.extend_from_slice(&chunk[..count]);
+            }
+            request_tx.send(()).unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+        let cancel = Cancellation::new();
+        let worker_cancel = cancel.clone();
+        let worker = thread::spawn(move || {
+            Cdp::connect(
+                port,
+                "/devtools/browser/test",
+                Duration::from_secs(15),
+                worker_cancel,
+            )
+        });
+        request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let error = worker.join().unwrap().err().unwrap();
+        assert!(error.is::<Cancelled>(), "{error:#}");
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
     }
 }
