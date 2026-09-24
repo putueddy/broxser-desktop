@@ -19,6 +19,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, Subscription, Window, canvas, div, prelude::*, px, rgb,
 };
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,7 +34,11 @@ pub(crate) struct LiveView {
     session: Option<LiveSession>,
     status: Status,
     devices: Vec<DeviceView>,
-    selected: usize,
+    selected: Option<usize>,
+    /// Keys sent to pages, retained so a release never lands on another device.
+    held_keys: HashMap<String, (usize, KeyInput)>,
+    /// Released keys still physically down. X11 reports repeats with is_held=false.
+    suppressed_keys: HashSet<String>,
     url: Entity<UrlInput>,
     /// Display pixels per CSS pixel.
     scale: f32,
@@ -42,6 +47,7 @@ pub(crate) struct LiveView {
     closing: bool,
     notice: Option<String>,
     _url_events: Subscription,
+    _focus_out: Subscription,
 }
 
 #[derive(Default)]
@@ -69,6 +75,9 @@ impl LiveView {
         });
         let focus = cx.focus_handle();
         focus.focus(window);
+        let focus_out = cx.on_focus_out(&focus, window, |view, _, _, _| {
+            view.release_keys();
+        });
         let entity = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             entity
@@ -85,7 +94,9 @@ impl LiveView {
             browser,
             session: None,
             status: Status::default(),
-            selected: 0,
+            selected: Some(0),
+            held_keys: HashMap::new(),
+            suppressed_keys: HashSet::new(),
             url,
             scale: 0.5,
             sync: SyncSettings::default(),
@@ -93,6 +104,7 @@ impl LiveView {
             closing: false,
             notice: None,
             _url_events: url_events,
+            _focus_out: focus_out,
         };
         view.start(window, cx);
         view
@@ -169,9 +181,9 @@ impl LiveView {
             .filter_map(|index| Some((index, session.take_frame(index)?)))
             .collect();
         if status != self.status {
-            if let Some(url) = status
-                .devices
-                .get(self.selected)
+            if let Some(url) = self
+                .selected
+                .and_then(|index| status.devices.get(index))
                 .map(|device| device.url.clone())
                 .filter(|url| !url.is_empty())
             {
@@ -221,7 +233,7 @@ impl LiveView {
         self.pull(window, cx);
     }
 
-    fn send(&mut self, command: Command) {
+    fn send(&mut self, command: Command) -> bool {
         let accepted = self
             .session
             .as_ref()
@@ -229,6 +241,7 @@ impl LiveView {
         if !accepted {
             self.notice = Some("The live runtime is not accepting commands.".into());
         }
+        accepted
     }
 
     fn navigate(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -249,7 +262,22 @@ impl LiveView {
     }
 
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = index;
+        // A hidden row has its own Show action; selecting its label does not
+        // make it a keyboard target while its page is hidden.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
+            return;
+        }
+        if self.selected != Some(index) {
+            if !self.release_keys() {
+                return;
+            }
+            if let Some(previous) = self.selected {
+                if !self.release_buttons(previous) {
+                    return;
+                }
+            }
+        }
+        self.selected = Some(index);
         self.focus.focus(window);
         if let Some(url) = self
             .status
@@ -265,25 +293,118 @@ impl LiveView {
     }
 
     fn toggle_hidden(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.devices[index].hidden;
+        if !visible {
+            if !self.release_keys_for(index) || !self.release_buttons(index) {
+                return;
+            }
+        }
+        if !self.send(Command::SetVisible {
+            device: index,
+            visible,
+        }) {
+            return;
+        }
         let device = &mut self.devices[index];
-        device.hidden = !device.hidden;
+        device.hidden = !visible;
+        device.bounds.set(None);
         if device.hidden
             && let Some(image) = device.image.take()
         {
             let _ = window.drop_image(image);
         }
-        let visible = !device.hidden;
-        self.send(Command::SetVisible {
-            device: index,
-            visible,
-        });
+        let hidden: Vec<bool> = self.devices.iter().map(|device| device.hidden).collect();
+        let selected = selected_after_visibility_change(self.selected, &hidden);
+        if selected != self.selected {
+            self.selected = selected;
+            if let Some(index) = selected {
+                if let Some(url) = self
+                    .status
+                    .devices
+                    .get(index)
+                    .map(|device| device.url.clone())
+                    .filter(|url| !url.is_empty())
+                {
+                    self.url
+                        .update(cx, |input, cx| input.show(&url, window, cx));
+                }
+            }
+        }
         cx.notify();
+    }
+
+    fn release_keys_for(&mut self, index: usize) -> bool {
+        let keys: Vec<String> = self
+            .held_keys
+            .iter()
+            .filter_map(|(name, (device, _))| (*device == index).then_some(name.clone()))
+            .collect();
+        for name in keys {
+            if let Some((device, mut key)) = self.held_keys.get(&name).cloned() {
+                key.down = false;
+                if !self.send(Command::Key { device, key }) {
+                    return false;
+                }
+                self.held_keys.remove(&name);
+                self.suppressed_keys.insert(name);
+            }
+        }
+        true
+    }
+
+    fn release_keys(&mut self) -> bool {
+        for index in 0..self.devices.len() {
+            if !self.release_keys_for(index) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_buttons(&mut self, index: usize) -> bool {
+        let Some((x, y)) = self.devices[index].last_point else {
+            self.devices[index].buttons = 0;
+            return true;
+        };
+        for (bit, button) in [
+            (1, PointerButton::Left),
+            (2, PointerButton::Right),
+            (4, PointerButton::Middle),
+        ] {
+            if self.devices[index].buttons & bit != 0 {
+                let buttons = self.devices[index].buttons & !bit;
+                if !self.send(Command::Pointer {
+                    device: index,
+                    event: PointerEvent {
+                        kind: PointerKind::Up,
+                        x,
+                        y,
+                        button,
+                        buttons,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                    },
+                }) {
+                    return false;
+                }
+                self.devices[index].buttons = buttons;
+            }
+        }
+        self.devices[index].last_point = None;
+        true
     }
 
     fn set_sync(&mut self, sync: SyncSettings, cx: &mut Context<Self>) {
         self.sync = sync;
         self.send(Command::SetSync(sync));
         cx.notify();
+    }
+
+    fn reload_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(device) = self.selected.filter(|&index| !self.devices[index].hidden) {
+            self.send(Command::Reload { device });
+            cx.notify();
+        }
     }
 
     fn zoom_by(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -312,6 +433,13 @@ impl LiveView {
     }
 
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.suppressed_keys.extend(self.held_keys.keys().cloned());
+        self.held_keys.clear();
+        for device in &mut self.devices {
+            device.buttons = 0;
+            device.last_point = None;
+            device.bounds.set(None);
+        }
         let text = self.url.read(cx).text().to_owned();
         if validate_url(&text).is_ok() {
             self.workspace.url = text;
@@ -392,6 +520,9 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.devices[index].hidden {
+            return;
+        }
         let Some((x, y)) = self.map(index, position) else {
             return;
         };
@@ -401,14 +532,17 @@ impl LiveView {
             Some(MouseButton::Middle) => 4,
             _ => 0,
         };
-        let device = &mut self.devices[index];
-        match kind {
-            PointerKind::Down => device.buttons |= bit,
-            PointerKind::Up => device.buttons &= !bit,
-            PointerKind::Move => {}
+        if kind == PointerKind::Down {
+            self.select(index, window, cx);
+            if self.selected != Some(index) {
+                return;
+            }
         }
-        device.last_point = Some((x, y));
-        let buttons = device.buttons;
+        let buttons = match kind {
+            PointerKind::Down => self.devices[index].buttons | bit,
+            PointerKind::Up => self.devices[index].buttons & !bit,
+            PointerKind::Move => self.devices[index].buttons,
+        };
         let button = match (kind, button) {
             (PointerKind::Move, _) if buttons & 1 != 0 => PointerButton::Left,
             (PointerKind::Move, _) => PointerButton::None,
@@ -417,10 +551,7 @@ impl LiveView {
             (_, Some(MouseButton::Middle)) => PointerButton::Middle,
             _ => PointerButton::None,
         };
-        if kind == PointerKind::Down {
-            self.select(index, window, cx);
-        }
-        self.send(Command::Pointer {
+        if self.send(Command::Pointer {
             device: index,
             event: PointerEvent {
                 kind,
@@ -431,18 +562,23 @@ impl LiveView {
                 click_count: click_count.min(3) as u32,
                 modifiers: modifiers_of(modifiers),
             },
-        });
+        }) {
+            self.devices[index].buttons = buttons;
+            self.devices[index].last_point = Some((x, y));
+        }
     }
 
     /// A button released outside the frame must not stay pressed in the page.
     fn release_outside(&mut self, index: usize, modifiers: &gpui::Modifiers) {
-        let device = &mut self.devices[index];
+        if self.devices[index].hidden {
+            return;
+        }
+        let device = &self.devices[index];
         let Some((x, y)) = device.last_point.filter(|_| device.buttons & 1 != 0) else {
             return;
         };
-        device.buttons &= !1;
-        let buttons = device.buttons;
-        self.send(Command::Pointer {
+        let buttons = device.buttons & !1;
+        if self.send(Command::Pointer {
             device: index,
             event: PointerEvent {
                 kind: PointerKind::Up,
@@ -453,10 +589,15 @@ impl LiveView {
                 click_count: 1,
                 modifiers: modifiers_of(modifiers),
             },
-        });
+        }) {
+            self.devices[index].buttons = buttons;
+        }
     }
 
     fn wheel(&mut self, index: usize, event: &ScrollWheelEvent) {
+        if self.devices[index].hidden {
+            return;
+        }
         let Some((x, y)) = self.map(index, event.position) else {
             return;
         };
@@ -475,15 +616,47 @@ impl LiveView {
         });
     }
 
-    fn key(&mut self, keystroke: &Keystroke, down: bool) {
-        if let Some(key) = KeyInput::from_key(
+    fn key(&mut self, keystroke: &Keystroke, down: bool, is_held: bool) {
+        let Some(key) = KeyInput::from_key(
             &keystroke.key,
             keystroke.key_char.as_deref(),
             modifiers_of(&keystroke.modifiers),
             down,
-        ) {
-            let device = self.selected;
-            self.send(Command::Key { device, key });
+        ) else {
+            return;
+        };
+        let identity = logical_key_identity(keystroke, &key);
+        if !down {
+            // Key-up is observed on the window root, even if focus moved to
+            // the URL bar after the release was sent to the old page.
+            if self.suppressed_keys.remove(&identity) {
+                return;
+            }
+            if let Some((device, mut key)) = self.held_keys.get(&identity).cloned()
+                && !self.devices[device].hidden
+            {
+                key.down = false;
+                if self.send(Command::Key { device, key }) {
+                    self.held_keys.remove(&identity);
+                }
+            }
+            return;
+        }
+        let Some(device) = key_down_target(
+            self.selected,
+            |index| self.devices.get(index).is_some_and(|device| !device.hidden),
+            &identity,
+            is_held,
+            &self.held_keys,
+            &self.suppressed_keys,
+        ) else {
+            return;
+        };
+        if self.send(Command::Key {
+            device,
+            key: key.clone(),
+        }) {
+            self.held_keys.insert(identity, (device, key));
         }
     }
 
@@ -517,7 +690,7 @@ impl LiveView {
             .flex_col()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(if index == self.selected {
+            .border_color(rgb(if Some(index) == self.selected {
                 ACCENT
             } else {
                 BORDER
@@ -701,11 +874,8 @@ impl LiveView {
                     })),
             )
             .child(
-                button("reload", "Reload").on_click(cx.listener(|view, _, _, cx| {
-                    let device = view.selected;
-                    view.send(Command::Reload { device });
-                    cx.notify();
-                })),
+                button("reload", "Reload")
+                    .on_click(cx.listener(|view, _, _, cx| view.reload_selected(cx))),
             )
             .child(
                 toggle("sync-navigation", "Sync links", sync.navigation).on_click(cx.listener(
@@ -771,7 +941,7 @@ impl LiveView {
                             .pl_3()
                             .py_1()
                             .border_l_2()
-                            .border_color(rgb(if index == self.selected {
+                            .border_color(rgb(if Some(index) == self.selected {
                                 ACCENT
                             } else {
                                 BORDER
@@ -846,6 +1016,11 @@ impl LiveView {
             RuntimeState::Stopped { error: Some(error) } => format!("Stopped: {error}"),
             RuntimeState::Stopped { error: None } => "Stopped".to_owned(),
         };
+        let runtime = if self.selected.is_none() {
+            format!("{runtime} · All devices hidden")
+        } else {
+            runtime
+        };
         let stopped =
             matches!(self.status.runtime, RuntimeState::Stopped { .. }) || self.session.is_none();
         div()
@@ -913,13 +1088,12 @@ impl Render for LiveView {
                     window.remove_window();
                 }
             }))
-            .on_action(cx.listener(|view, _: &Refresh, _, cx| {
-                let device = view.selected;
-                view.send(Command::Reload { device });
-                cx.notify();
-            }))
+            .on_action(cx.listener(|view, _: &Refresh, _, cx| view.reload_selected(cx)))
             .on_action(cx.listener(|view, _: &FocusUrl, window, cx| {
                 view.url.update(cx, |input, cx| input.focus_all(window, cx));
+            }))
+            .on_key_up(cx.listener(|view, event: &KeyUpEvent, _, _| {
+                view.key(&event.keystroke, false, false);
             }))
             .child(self.toolbar(cx))
             .child(
@@ -940,13 +1114,10 @@ impl Render for LiveView {
                                     .track_focus(&self.focus)
                                     .on_key_down(cx.listener(
                                         |view, event: &KeyDownEvent, _, cx| {
-                                            view.key(&event.keystroke, true);
+                                            view.key(&event.keystroke, true, event.is_held);
                                             cx.stop_propagation();
                                         },
                                     ))
-                                    .on_key_up(cx.listener(|view, event: &KeyUpEvent, _, _| {
-                                        view.key(&event.keystroke, false);
-                                    }))
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
@@ -975,6 +1146,70 @@ fn modifiers_of(modifiers: &gpui::Modifiers) -> Modifiers {
     }
 }
 
+/// GPUI does not expose a physical keycode. Normalize the shifted ASCII pairs
+/// whose X11 key names can change before key-up; prefer CDP codes elsewhere.
+fn logical_key_identity(keystroke: &Keystroke, key: &KeyInput) -> String {
+    let shifted_pair = match keystroke.key.as_str() {
+        "1" | "!" => Some("Digit1"),
+        "2" | "@" => Some("Digit2"),
+        "3" | "#" => Some("Digit3"),
+        "4" | "$" => Some("Digit4"),
+        "5" | "%" => Some("Digit5"),
+        "6" | "^" => Some("Digit6"),
+        "7" | "&" => Some("Digit7"),
+        "8" | "*" => Some("Digit8"),
+        "9" | "(" => Some("Digit9"),
+        "0" | ")" => Some("Digit0"),
+        "-" | "_" => Some("Minus"),
+        "=" | "+" => Some("Equal"),
+        "[" | "{" => Some("BracketLeft"),
+        "]" | "}" => Some("BracketRight"),
+        "\\" | "|" => Some("Backslash"),
+        ";" | ":" => Some("Semicolon"),
+        "'" | "\"" => Some("Quote"),
+        "," | "<" => Some("Comma"),
+        "." | ">" => Some("Period"),
+        "/" | "?" => Some("Slash"),
+        "`" | "~" => Some("Backquote"),
+        _ => None,
+    };
+    shifted_pair
+        .or_else(|| (!key.code.is_empty()).then_some(key.code.as_str()))
+        .unwrap_or(&keystroke.key)
+        .to_owned()
+}
+
+fn key_down_target(
+    selected: Option<usize>,
+    visible: impl Fn(usize) -> bool,
+    identity: &str,
+    is_held: bool,
+    held: &HashMap<String, (usize, KeyInput)>,
+    suppressed: &HashSet<String>,
+) -> Option<usize> {
+    let device = selected.filter(|&index| visible(index))?;
+    if suppressed.contains(identity) {
+        return None;
+    }
+    match held.get(identity) {
+        Some((owner, _)) if *owner != device => None,
+        None if is_held => None,
+        _ => Some(device),
+    }
+}
+
+/// Keep the current visible device, otherwise move forward through the sidebar
+/// order with wraparound. No visible device means no page input target.
+fn selected_after_visibility_change(selected: Option<usize>, hidden: &[bool]) -> Option<usize> {
+    if selected.is_some_and(|index| hidden.get(index) == Some(&false)) {
+        return selected;
+    }
+    let start = selected.map_or(0, |index| index.saturating_add(1));
+    (start..hidden.len())
+        .chain(0..start.min(hidden.len()))
+        .find(|&index| !hidden[index])
+}
+
 fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
     let mut pixels = image::load_from_memory_with_format(&frame.jpeg, image::ImageFormat::Jpeg)
         .context("decode live frame")?
@@ -984,4 +1219,95 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
         pixel.swap(0, 2);
     }
     Ok(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{key_down_target, logical_key_identity, selected_after_visibility_change};
+    use broxser_engine::{KeyInput, Modifiers};
+    use gpui::Keystroke;
+    use std::collections::{HashMap, HashSet};
+
+    fn identity(name: &str) -> String {
+        let stroke = Keystroke {
+            key: name.into(),
+            ..Keystroke::default()
+        };
+        let input = KeyInput::from_key(name, None, Modifiers::default(), true).unwrap();
+        logical_key_identity(&stroke, &input)
+    }
+
+    #[test]
+    fn hiding_selected_device_moves_to_next_visible_with_wraparound() {
+        assert_eq!(
+            selected_after_visibility_change(Some(0), &[true, false, false]),
+            Some(1)
+        );
+        assert_eq!(
+            selected_after_visibility_change(Some(1), &[false, true, true]),
+            Some(0)
+        );
+        assert_eq!(
+            selected_after_visibility_change(Some(1), &[false, false, true]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn hiding_every_device_clears_selection_until_one_is_shown() {
+        assert_eq!(
+            selected_after_visibility_change(Some(0), &[true, true]),
+            None
+        );
+        assert_eq!(selected_after_visibility_change(None, &[true, true]), None);
+        assert_eq!(
+            selected_after_visibility_change(None, &[true, false]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_released_key_cannot_repeat_into_the_next_device_even_without_is_held() {
+        let name = identity("a");
+        let input = KeyInput::from_key("a", None, Modifiers::default(), true).unwrap();
+        let mut held = HashMap::from([(name.clone(), (0, input))]);
+        let mut suppressed = HashSet::new();
+        assert_eq!(
+            key_down_target(Some(0), |_| true, &name, false, &held, &suppressed),
+            Some(0)
+        );
+
+        // Hiding device 0 sends keyUp to it, then device 1 becomes selected.
+        held.remove(&name);
+        suppressed.insert(name.clone());
+        assert_eq!(
+            key_down_target(Some(1), |_| true, &name, false, &held, &suppressed),
+            None
+        );
+        assert_eq!(
+            key_down_target(Some(1), |_| true, &name, true, &held, &suppressed),
+            None
+        );
+        // The physical keyUp clears suppression; a fresh press may route.
+        suppressed.remove(&name);
+        assert_eq!(
+            key_down_target(Some(1), |_| true, &name, false, &held, &suppressed),
+            Some(1)
+        );
+        assert_eq!(
+            key_down_target(None, |_| true, &name, false, &held, &suppressed),
+            None
+        );
+        assert_eq!(
+            key_down_target(Some(0), |_| false, &name, false, &held, &suppressed),
+            None
+        );
+    }
+
+    #[test]
+    fn common_shifted_punctuation_matches_the_same_release() {
+        for (plain, shifted) in [("1", "!"), ("/", "?"), ("[", "{"), ("'", "\"")] {
+            assert_eq!(identity(plain), identity(shifted));
+        }
+    }
 }
