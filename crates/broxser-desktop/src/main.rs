@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use broxser_core::{Device, Workspace};
 use broxser_engine::{
-    BrowserOptions, Cancellation, CaptureReport, capture_workspace, discover_browser,
+    BrowserOptions, Cancellation, Cancelled, CaptureReport, capture_workspace, discover_browser,
 };
 use clap::Parser;
 use gpui::{
@@ -11,10 +11,6 @@ use gpui::{
 };
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 use tempfile::TempDir;
 
 const BG: u32 = 0x111514;
@@ -67,10 +63,15 @@ struct Desktop {
     // Keep two generations of PNG paths alive while GPUI loads the current images.
     captures: Vec<TempDir>,
     in_flight: bool,
+    /// Cancels the in-flight capture when the window closes.
+    cancel: Option<Cancellation>,
+    /// GPUI on Linux stops its event loop when the last window is removed, which
+    /// would end the process before the engine stops its browser. A close request
+    /// during a capture cancels it and removes the window after cleanup instead.
+    closing: bool,
     status: String,
     zoom: f32,
     focus: FocusHandle,
-    active_captures: Arc<AtomicUsize>,
 }
 
 impl Desktop {
@@ -88,11 +89,11 @@ impl Desktop {
             .update(cx, |cache, cx| cache.clear(window, cx));
         self.image_cache = RetainAllImageCache::new(cx);
         self.in_flight = true;
-        self.active_captures.fetch_add(1, Ordering::SeqCst);
+        let cancel = Cancellation::new();
+        self.cancel = Some(cancel.clone());
         self.status = "Capturing devices in fresh browser sessions…".into();
         cx.notify();
         let workspace = self.workspace.clone();
-        let active_captures = self.active_captures.clone();
         let job = cx.background_executor().spawn(async move {
             let directory = tempfile::Builder::new()
                 .prefix("broxser-preview-")
@@ -101,15 +102,21 @@ impl Desktop {
                 executable,
                 headless: true,
                 profile_root: None,
-                cancel: Cancellation::new(),
+                cancel,
             };
             let report = capture_workspace(&workspace, &options, directory.path())?;
             Ok::<_, anyhow::Error>((directory, report))
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
-            let _ = this.update(cx, |view, cx| {
+            let _ = this.update_in(cx, |view, window, cx| {
                 view.in_flight = false;
+                view.cancel = None;
+                if view.closing {
+                    // The engine has stopped the browser; any preview is dropped here.
+                    window.remove_window();
+                    return;
+                }
                 match result {
                     Ok((directory, report)) => {
                         view.status = format!(
@@ -124,19 +131,28 @@ impl Desktop {
                         }
                         view.report = Some(report);
                     }
+                    Err(error) if error.is::<Cancelled>() => {
+                        view.status = "Capture cancelled.".into()
+                    }
                     Err(error) => view.status = format!("Capture failed: {error:#}"),
                 }
                 cx.notify();
             });
-            if active_captures.fetch_sub(1, Ordering::SeqCst) == 1 {
-                let _ = cx.update(|app| {
-                    if app.windows().is_empty() {
-                        app.quit();
-                    }
-                });
-            }
         })
         .detach();
+    }
+
+    /// Returns true if the window can close now. Otherwise cancels the capture and
+    /// removes the window once the engine has cleaned up.
+    fn request_close(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(cancel) = &self.cancel else {
+            return true;
+        };
+        cancel.cancel();
+        self.closing = true;
+        self.status = "Closing after the capture browser stops…".into();
+        cx.notify();
+        false
     }
 
     fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -303,6 +319,16 @@ impl Desktop {
     }
 }
 
+impl Drop for Desktop {
+    fn drop(&mut self) {
+        // Closing the window stops an in-flight capture; the engine then kills
+        // its browser and removes the profile before the job reports back.
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+    }
+}
+
 impl Render for Desktop {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cards = self
@@ -313,7 +339,11 @@ impl Render for Desktop {
             .collect::<Vec<_>>();
         div().size_full().flex().flex_col().bg(rgb(BG)).text_color(rgb(TEXT)).font_family("sans-serif")
             .track_focus(&self.focus)
-            .on_action(cx.listener(|_, _: &Quit, window, _| window.remove_window()))
+            .on_action(cx.listener(|view, _: &Quit, window, cx| {
+                if view.request_close(cx) {
+                    window.remove_window();
+                }
+            }))
             .on_action(cx.listener(|view, _: &Refresh, window, cx| view.capture(window, cx)))
             .child(div().h(px(58.)).flex_none().flex().items_center().justify_between()
                 .px_5().border_b_1().border_color(rgb(BORDER))
@@ -372,7 +402,6 @@ fn main() -> Result<()> {
         },
     };
     let start = args.capture_on_start;
-    let active_captures = Arc::new(AtomicUsize::new(0));
     Application::new()
         .with_assets(FileAssets)
         .run(move |cx: &mut App| {
@@ -380,9 +409,8 @@ fn main() -> Result<()> {
                 KeyBinding::new("ctrl-q", Quit, None),
                 KeyBinding::new("ctrl-r", Refresh, None),
             ]);
-            let closing_captures = active_captures.clone();
-            cx.on_window_closed(move |cx| {
-                if cx.windows().is_empty() && closing_captures.load(Ordering::SeqCst) == 0 {
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
                     cx.quit();
                 }
             })
@@ -400,11 +428,15 @@ fn main() -> Result<()> {
                         ..Default::default()
                     },
                     |window, cx| {
-                        let active_captures = active_captures.clone();
                         cx.new(|cx| {
                             let focus = cx.focus_handle();
                             focus.focus(window);
                             window.set_window_title("Broxser");
+                            let view = cx.entity().downgrade();
+                            window.on_window_should_close(cx, move |_, cx| {
+                                view.update(cx, |view: &mut Desktop, cx| view.request_close(cx))
+                                    .unwrap_or(true)
+                            });
                             Desktop {
                                 workspace,
                                 browser,
@@ -412,10 +444,11 @@ fn main() -> Result<()> {
                                 image_cache: RetainAllImageCache::new(cx),
                                 captures: Vec::new(),
                                 in_flight: false,
+                                cancel: None,
+                                closing: false,
                                 status,
                                 zoom: 1.0,
                                 focus,
-                                active_captures,
                             }
                         })
                     },
