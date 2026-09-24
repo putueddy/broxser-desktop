@@ -256,7 +256,10 @@ memindahkan item ke selesai hanya karena implementasinya terlihat masuk akal.
 
 - [x] Foundation repo, initial commit dan upstream tersedia.
 - [x] Rust 1.98.1, GPUI shell, real Helium capture, schema v1, CI dan System Design.
-- [ ] M0 reliability — slow-page cancellation dan lifecycle/cleanup teruji.
+- [x] M0 reliability — slow-page cancellation dan lifecycle/cleanup teruji.
+  Bukti cloud 24 September 2026: penyebab `ERR_ABORTED` (ADR 0004), reproducer,
+  tes lifecycle dan cleanup normal/error di `docs/validation.md`. Masih terbuka:
+  CI remote untuk commit ini dan cleanup saat proses Broxser dibunuh/crash.
 - [ ] M1 — runtime tetap hidup, live frames, input, navigation/scroll sync.
 - [ ] M2 — daily workflows, persistent session, debug/capture dan pilot tim.
 - [ ] M3 — Linux packaging, security updates, rollback dan operational ownership.

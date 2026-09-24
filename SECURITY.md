@@ -10,6 +10,17 @@ that subprocess. Loopback prevents remote network access, but does not authentic
 other processes running locally. Never forward or expose the port, and never reuse
 a personal browser profile. A pipe transport is a planned hardening option.
 
+Broxser seeds only its own new profile: Helium's bundled content blocker is kept
+out of session contexts (ADR 0004), and extension pages inside those contexts stop
+a capture. Crash dumps are redirected into the private profile; without that,
+Chromium writes them next to a personal Helium installation. Chromium still opens
+the user's shared NSS certificate database, which may hold corporate CAs and client
+certificates; whether to isolate it is an open decision.
+
+Cleanup runs on normal close, errors and cancellation. If the Broxser process is
+killed or crashes, the browser keeps running with its loopback CDP port and the
+temporary profile remains until removed; this gate is open.
+
 HTTP and HTTPS are accepted deliberately, including localhost and internal sites.
 This is a developer desktop app, not a public URL-fetching service. Do not expose
 the CLI as an unauthenticated server: that would create an SSRF boundary the current
