@@ -8,7 +8,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -271,39 +271,16 @@ fn hold(stream: &mut TcpStream, shared: &Shared) {
     }
 }
 
-/// A fixed set of fake browser scripts, written once per test process so no
-/// script is being written while another test thread forks a child.
+/// Fake browser scripts checked into `testdata/fake-browser`. Tests never write
+/// them: an executable written while another test thread forks a child can fail
+/// to start with `ETXTBSY` (text file busy).
 pub(crate) fn fake_browser(kind: FakeBrowser) -> PathBuf {
-    static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
-    let directory = DIRECTORY.get_or_init(|| {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::Builder::new()
-            .prefix("broxser-fake-browser-")
-            .tempdir()
-            .unwrap();
-        for (name, script) in [
-            ("never-ready", "exec sleep 60"),
-            (
-                "loopback-endpoint",
-                // Publishes the port that the test wrote next to the profile
-                // directory, like a browser that bound a loopback CDP port.
-                r#"for arg in "$@"; do case "$arg" in --user-data-dir=*) dir=${arg#--user-data-dir=} ;; esac; done
-port=$(cat "$(dirname "$dir")/fake-cdp-port")
-printf '%s\n/devtools/browser/fake-session\n' "$port" > "$dir/DevToolsActivePort.tmp"
-mv "$dir/DevToolsActivePort.tmp" "$dir/DevToolsActivePort"
-exec sleep 60"#,
-            ),
-        ] {
-            let path = directory.path().join(name);
-            fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        directory
-    });
-    directory.path().join(match kind {
-        FakeBrowser::NeverReady => "never-ready",
-        FakeBrowser::LoopbackEndpoint => "loopback-endpoint",
-    })
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/fake-browser")
+        .join(match kind {
+            FakeBrowser::NeverReady => "never-ready",
+            FakeBrowser::LoopbackEndpoint => "loopback-endpoint",
+        })
 }
 
 pub(crate) enum FakeBrowser {

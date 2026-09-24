@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake browser for engine tests: publishes the port that the test wrote next to
+# the profile directory, like a browser that bound a loopback CDP port.
+for arg in "$@"; do case "$arg" in --user-data-dir=*) dir=${arg#--user-data-dir=} ;; esac; done
+port=$(cat "$(dirname "$dir")/fake-cdp-port")
+printf '%s\n/devtools/browser/fake-session\n' "$port" > "$dir/DevToolsActivePort.tmp"
+mv "$dir/DevToolsActivePort.tmp" "$dir/DevToolsActivePort"
+exec sleep 60
