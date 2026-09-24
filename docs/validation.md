@@ -3,6 +3,126 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## M1 live frames, 24 September 2026 (cloud container)
+
+Same environment and runtimes as M0 below. Live frames are CDP screencast JPEGs
+shown in the GPUI window: frame streaming, not an embedded surface (ADR 0005).
+
+### Automated checks
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 27 default tests (8 core + 19 engine), strict Clippy, desktop check |
+| Engine default tests, 25 consecutive runs | 25 passed, after the fake browser scripts moved to `testdata` (below) |
+| `cargo clippy --locked -p broxser-desktop --all-targets -- -D warnings` | Passed |
+| Live session tests, Helium 0.18.1.1 (`live_session -- --ignored`) | 5 passed; whole live suite 10 passed again after each core-dump change |
+| Live session tests, Chromium 141 (explicit) | 5 passed, before and after the core-dump changes |
+| `scripts/desktop-smoke.sh` under Xvfb | Passed three times (before and after each core-dump change): live close exit 0 after 207–210 ms, static close during a held request exit 0 after 307–508 ms; 15 browser processes before, 0 after, no temporary directory left |
+
+| Live session test | What it proves |
+| --- | --- |
+| `live_session_streams_frames_and_cleans_up` | A page that ticks every 100 ms produces new frames on three devices without a capture action; one document request per device; drop removes browser and profile |
+| `live_session_input_reaches_the_right_device` | Clicks at CSS (40, 300) on a DPR2 device and (50, 315) on a DPR1 device arrive with those `clientX/Y`; the wheel scrolls only the tablet; typed `ab` reaches only the desktop input |
+| `live_session_sync_stays_in_session_without_loops_or_replay` | A link click on the phone navigates the same-session tablet once and not the other session; wheel sync mirrors inside the session; script-driven link clicks never synchronize; a restart loads `/` once and replays nothing |
+| `live_session_bounds_frames_and_pauses_hidden_devices` | Unread frames are replaced and still acknowledged (frames keep flowing), at most one pending frame; a hidden device stops streaming and resumes |
+| `live_session_reports_crashes_and_browser_exit` | A renderer crash is reported for one device and recovers only after an explicit reload; killing the browser stops the runtime with an error and removes processes and profile |
+
+Headless screencasts delivered DPR2 viewports at CSS resolution (360×640 for a
+360×640 DPR2 device) on both Helium and Chromium. Static capture keeps physical
+pixels.
+
+### Renderer crash reporting and core dumps
+
+CI runs #10 and #11 (GitHub Ubuntu 24.04 runner) failed only
+`live_session_reports_crashes_and_browser_exit`: after `Page.crash` the tablet
+stopped producing frames, but `Target.targetCrashed` did not arrive within 10 s
+(run #10) or 45 s (run #11). Run #11 listed the browser processes: the crashed
+renderer's main thread was in state `I` with wait channel `do_exit`, where a thread
+waits while another thread of its process writes a core dump. Locally the crash was
+reported in about 60 ms: this container has `core_pattern=core`,
+`suid_dumpable=0` and a zero core limit, so no dump is written.
+
+Local reproduction on the VM kernel (6.18), test user, `suid_dumpable=2` and a
+`core_pattern` pipe helper that skips the dump when its limit argument is 0 and
+otherwise reads it. With `%c` as that argument (like apport) and
+`ulimit -c unlimited`, the renderer (crashing thread `Chrome_ChildIOT`) streamed a
+23,547,559,936-byte, mostly empty dump for 45.2 s and the test failed as on CI;
+with `ulimit -c 0` the helper skipped the dump and the crash was reported after
+60 ms.
+
+First fix (`76f5d26`): the engine lowers the soft `RLIMIT_CORE` to 0 before
+launching a browser. It passed locally with the `%c` helper, but CI run #12 failed
+the same way and printed the runner's pattern:
+`|/usr/lib/systemd/systemd-coredump %P %u %g %s %t 9223372036854775808 %h %d`.
+systemd passes a fixed unlimited value instead of `%c`, so the limit is ignored;
+every browser process had `core_limit=0` and the renderer was again in state `I`,
+`do_exit`. A local helper given the same fixed value reproduced it: 15 s timeout,
+renderer in the dump path.
+
+Second fix (`9e09830`): the engine also writes 0 to `/proc/self/coredump_filter`,
+which is inherited across fork and exec and leaves every memory mapping out of a
+dump. Both settings apply to the Broxser process too (`SECURITY.md`). Results with
+the fixed-value helper: each dump was 143,360 bytes (headers and register notes),
+read in 6–10 ms; the crash was reported after 60–166 ms on Helium and 248 ms on
+Chromium 141; all 10 live tests (Helium) and the 5 live session tests (Chromium)
+passed. With the `%c` helper the zero limit still made it skip the dump (crash
+reported after 72 ms). `browser_starts_without_core_dumps` reads the started
+browser's limit and filter and fails without either change (`unlimited`,
+`00000033`). The VM's kernel settings were restored afterwards. On the runner, with
+its systemd-coredump pattern, CI run #13 passed and reported the crash after 222 ms.
+
+That new test exposed a race in the test helpers: two of three `check.sh` runs
+failed, and the logged failure was `Text file busy` when starting a fake browser
+script that had been written at test time while another test thread forked. The
+scripts are now checked in under `crates/broxser-engine/testdata/fake-browser`.
+
+### X11 window checks
+
+Unprivileged user, Xvfb and Mesa llvmpipe, debug build, `examples/workspace.json`
+and a DPR2 variant, fixture `live.html` from `scripts/serve-fixture.sh`.
+
+| Check | Result |
+| --- | --- |
+| Three live viewports | Shown; two screenshots one second apart differ only in the page's tick counter |
+| Typing into the phone page and saving | Label saved on the phone only; tablet showed it after an explicit Ctrl+R reload (same session) |
+| Wheel down on the phone | Page scrolled down (sign mapping correct) |
+| Sync links and Sync scroll on, click "Page 2" on the phone at 38% | Phone and tablet on `?page=2`, desktop (`admin`) unchanged; scroll followed on the tablet, desktop stayed at 0 px |
+| URL bar (Ctrl+L, text, Enter) | All devices on `?page=3` |
+| DPR2 phone, clicks at 50% and 75% scale | Link under the pointer followed each time; tablet click at 75% went to the tablet only |
+| Browser killed externally | Status `Stopped: read CDP websocket: … Connection reset …`, frames paused, 0 browser processes and profiles left; **Restart runtime** loaded the URL bar URL once and restored sync settings |
+| Ctrl+Q and `WM_DELETE_WINDOW` with a live session | Exit after 293 ms and 245 ms, 15 browser processes before, 0 after, no profile left |
+| `--static --capture-on-start` | Static previews still captured and closed cleanly |
+
+### Measurements
+
+Debug build under software rendering, three devices, `live.html` updating four
+times per second. These are not hardware or release-build results.
+
+| Measure | Result |
+| --- | --- |
+| Desktop RSS over 60 s | 221.5–227.0 MB, no growth (replaced frames are released) |
+| Sum of Helium process RSS | About 1.4 GB (shared pages counted per process) |
+| Desktop CPU, decoder unoptimized | About 3.2 cores: 1.5 JPEG decode, 1.2 llvmpipe, 0.4 GPUI main thread |
+| Desktop CPU, decoder optimized in dev profile | About 2 cores: 0.25 decode, 1.25 llvmpipe, 0.5 GPUI main thread |
+| Live runtime worker thread | About 2% of one core |
+| Frames replaced before display (sync check, unoptimized decoder) | Phone 45 of 236, tablet 48 of 234, desktop 0 of 175; the latest frame is always shown |
+
+Input latency and frame smoothness were not measured.
+
+### Manual desktop checklist (not possible in this environment)
+
+Run on the developer's Wayland (Hyprland) session and on an X11 desktop with a
+physical GPU, release build, `live.html` and a representative company app:
+
+- [ ] Window opens and draws without extra events; resize and move keep input mapping correct.
+- [ ] HiDPI and fractional scaling: frame sharpness, especially DPR>1 devices; click accuracy.
+- [ ] Input latency (target p95 below 50 ms) and CPU/GPU use with 3 and 8 devices.
+- [ ] Keyboard layouts, shortcuts (Ctrl+L/R/Q not reaching pages), IME (not supported yet).
+- [ ] Touch devices with mouse input; text selection and drag inside pages.
+- [ ] Popups, downloads, permissions, file upload, JavaScript dialogs (unsupported, must fail visibly).
+- [ ] Close, window-manager close and `scripts/desktop-smoke.sh` on that desktop.
+- [ ] Hours-long session memory and multi-monitor scale changes.
+
 ## M0 reliability, 24 September 2026 (cloud container)
 
 ### Environment
@@ -150,9 +270,27 @@ reports, unbounded GPUI image retention and Ubuntu 24.04 AppArmor setup.
 The System Design DOCX was rendered and inspected at that time. It has not been
 re-rendered since; see the note at the top of `system-design.md`.
 
+## Remote CI
+
+GitHub Actions (Ubuntu 24.04 runner, sandbox with a path-scoped AppArmor
+profile) runs format, default tests, Clippy, a desktop compile and the whole live
+engine suite with Helium.
+
+| Run | Commit | Result |
+| --- | --- | --- |
+| #9 | `9c14532` (M0) | Passed, including the reproducer with 6 runs and no failure |
+| #10 | `42bb535` (M1 desktop) | Failed: crash not reported within 10 s; the other 9 live tests passed |
+| #11 | `8d1060f` (crash diagnostics) | Failed: crash not reported within 45 s, renderer in the core dump path; the other 9 passed |
+| #12 | `76f5d26` (zero core limit) | Failed: systemd-coredump ignores the limit, crash not reported within 15 s; the other 9 passed |
+| #13 | `9e09830` (zero `coredump_filter`) | Passed: all 10 live tests, crash reported after 222 ms, reproducer 6 runs with no failure |
+
 ## Open gates
 
-- Remote CI has not run for these commits yet.
+- The M1 manual desktop checklist above, on Wayland and a physical GPU.
+- systemd-coredump still records browser crashes with small dumps that hold
+  register state. A browser change that resets the inherited `coredump_filter`
+  would bring back large dumps and delayed crash reports; the live crash test and
+  its diagnostics would show it.
 - If the Broxser process is killed (SIGTERM, SIGKILL, crash), `Drop` does not run:
   the browser keeps running with its loopback CDP port and temporary files remain.
   Candidate fixes: pipe transport, parent-death signal and a stale-profile sweep.

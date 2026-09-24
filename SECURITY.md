@@ -13,13 +13,24 @@ a personal browser profile. A pipe transport is a planned hardening option.
 Broxser seeds only its own new profile: Helium's bundled content blocker is kept
 out of session contexts (ADR 0004), and extension pages inside those contexts stop
 a capture. Crash dumps are redirected into the private profile; without that,
-Chromium writes them next to a personal Helium installation. Chromium still opens
-the user's shared NSS certificate database, which may hold corporate CAs and client
-certificates; whether to isolate it is an open decision.
+Chromium writes them next to a personal Helium installation. Before starting a
+browser, Broxser sets its own soft core-file limit and `coredump_filter` to zero,
+and the browser inherits both. File-based core patterns and apport (for unpackaged
+programs) then write nothing. systemd-coredump ignores the limit and still records
+the crash, but the dump holds only headers and register state, no memory mappings
+with cookies or page content. Chromium still opens the user's shared NSS
+certificate database, which may hold corporate CAs and client certificates;
+whether to isolate it is an open decision.
 
 Cleanup runs on normal close, errors and cancellation. If the Broxser process is
 killed or crashes, the browser keeps running with its loopback CDP port and the
-temporary profile remains until removed; this gate is open.
+temporary profile remains until removed; this gate is open. It matters more in live
+mode, where one browser stays up per open workspace and holds the sessions' cookies
+and storage until the window closes.
+
+Live input is forwarded only to the device the user targets. Sync never broadcasts
+typing, form submission, clicks or pointer events, never crosses sessions, and a
+restart restores configuration without replaying user actions.
 
 HTTP and HTTPS are accepted deliberately, including localhost and internal sites.
 This is a developer desktop app, not a public URL-fetching service. Do not expose
