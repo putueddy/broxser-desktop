@@ -613,12 +613,48 @@ fn live_session_reports_crashes_and_browser_exit() {
     });
 
     live.send(Command::CrashForTest { device: 1 });
-    let status = live.wait("crash reported", Duration::from_secs(10), |status| {
-        status.devices[1]
+    let crashed_at = Instant::now();
+    let status = loop {
+        let status = live.session().status();
+        if status.devices[1]
             .error
             .as_deref()
             .is_some_and(|error| error.contains("crashed"))
-    });
+        {
+            break status;
+        }
+        if crashed_at.elapsed() > Duration::from_secs(45) {
+            // Evidence for hosts where crash reporting stalls (seen once on the
+            // Ubuntu 24.04 CI runner): which browser processes remain and where.
+            for process in browser::referencing(live.root.path()) {
+                let read = |file: &str| {
+                    std::fs::read(format!("/proc/{}/{file}", process.pid)).unwrap_or_default()
+                };
+                let stat = String::from_utf8_lossy(&read("stat")).into_owned();
+                let state = stat
+                    .rsplit_once(')')
+                    .map_or("?", |(_, rest)| rest.trim())
+                    .chars()
+                    .next();
+                let cmdline = String::from_utf8_lossy(&read("cmdline")).into_owned();
+                let kind = cmdline
+                    .split('\0')
+                    .find(|arg| arg.starts_with("--type="))
+                    .unwrap_or("browser");
+                println!(
+                    "pid={} state={state:?} wchan={} {kind}",
+                    process.pid,
+                    String::from_utf8_lossy(&read("wchan"))
+                );
+            }
+            panic!("renderer crash not reported within 45 s: {status:#?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    println!(
+        "renderer crash reported after {} ms",
+        crashed_at.elapsed().as_millis()
+    );
     assert!(status.devices[0].error.is_none() && status.devices[2].error.is_none());
     live.send(Command::Reload { device: 1 });
     let frames = status.devices[1].frames;
