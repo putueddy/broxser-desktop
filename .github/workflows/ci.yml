@@ -30,6 +30,6 @@ jobs:
           # Permit this exact downloaded binary to create its normal sandbox.
           printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile broxser-helium-ci "%s" flags=(unconfined) {\n  userns,\n}\n' "$PWD/.local/helium/helium" > "$RUNNER_TEMP/broxser-helium.apparmor"
           sudo apparmor_parser -r "$RUNNER_TEMP/broxser-helium.apparmor"
-          BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" cargo test --locked -p broxser-engine live_capture_has_expected_pixels_and_isolated_sessions -- --ignored --nocapture
+          BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" cargo test --locked -p broxser-engine -- --ignored --nocapture
         # Keep Chromium's sandbox enabled. AppArmor/userns restrictions are a
         # runner setup failure, not permission to add --no-sandbox here.
