@@ -1,0 +1,273 @@
+# Broxser System Design
+
+Status: proposed, foundation implemented. Target pertama: Linux x86_64, Wayland
+dan X11. Horizon perawatan: 2026–2036. Tanggal keputusan: 24 September 2026.
+Owner yang diusulkan: Developer Experience, dengan satu maintainer utama dan satu
+backup yang perlu ditunjuk perusahaan. Dokumen ini mengikuti struktur template
+System Design; [versi Word](system-design.docx) adalah snapshot untuk review.
+Perubahan desain selanjutnya harus memperbarui dokumen dan ADR terkait.
+
+## 1. Abstract
+
+Broxser membantu developer memeriksa satu aplikasi web pada beberapa viewport dan
+session dalam satu workspace lokal. Implementasi dimulai sebagai modular monolith
+Rust: GPUI menampilkan UI native, domain mengatur konfigurasi dan aturan sinkronisasi,
+sedangkan adapter CDP mengendalikan proses Helium milik aplikasi. Engine dapat
+diganti tanpa mengubah format workspace maupun model domain.
+
+Fondasi saat ini menghasilkan **capture PNG statis** dari browser sungguhan. Ini
+belum merupakan browser interaktif tertanam dan belum menggantikan seluruh workflow
+Sizzy. Keberhasilan tahap berikutnya ditentukan oleh bukti input, rendering,
+accessibility, keamanan, dan biaya perawatan; kesamaan tampilan saja tidak cukup.
+
+## 2. Goals and non-goals
+
+| Sasaran | Kriteria penerimaan |
+| --- | --- |
+| Pemeriksaan responsif lokal | URL yang sama ditangkap pada 3 viewport dan dimensinya benar |
+| Pemisahan identitas | Session berbeda tidak berbagi cookie; device dengan session sama dapat berbagi |
+| Stack yang diminta | UI GPUI nyata dan smoke test binary Helium Linux yang diketahui versinya |
+| Data dapat dipindahkan | Workspace JSON v1 bisa ditinjau di Git, tanpa cookie atau password |
+| Perawatan berkelanjutan | Runtime versioned, adapter terpisah, owner update, contract test dan rollback |
+
+Rilis awal tidak mencakup engine web baru, fork Chromium besar, cloud sync,
+collaborative browsing, terminal, AI agent, API client, extension marketplace,
+rekaman video, persistent login, atau kemampuan menguji Safari hanya dengan
+mengganti ukuran layar. macOS disiapkan melalui batas modul, tetapi belum didukung
+atau diuji sebagai target rilis. Windows belum menjadi komitmen.
+
+## 3. Background and problem statement
+
+Tim ingin mengurangi biaya subscription dan perpindahan alat ketika membangun web.
+[Sizzy](https://sizzy.co/) menjadi referensi kebutuhan: beberapa device, session,
+workspace, debugging dan screenshot. Prioritas awal dipersempit ke loop responsif
+yang dapat dibuktikan dan dirawat oleh tim internal.
+
+[GPUI](https://gpui.rs/) menyediakan UI native Rust. [Helium](https://helium.computer/)
+adalah browser berbasis Chromium. Pada dokumentasi/repository yang ditinjau, tidak
+ditemukan SDK embedding Helium publik. Ini hasil penelusuran, bukan jaminan upstream.
+Menghubungkan hasil CDP ke gambar GPUI adalah jalur proof yang konkret; menganggap
+Helium sebagai widget webview siap pakai akan menyembunyikan pekerjaan terbesar.
+
+File `Sizzy-75.5.0-arm64.dmg` milik pengguna merupakan distribusi macOS, sedangkan
+host pengembangan Linux. Referensi kebutuhan berasal dari situs publik. Tidak ada
+source, aset, atau mekanisme lisensi Sizzy yang diambil ke repo.
+
+## 4. Proposed architecture
+
+```mermaid
+flowchart TB
+  User[Developer] --> UI[GPUI desktop]
+  User --> CLI[CLI dan CI]
+  UI --> Domain[broxser-core\nWorkspace v1 dan aturan sync]
+  CLI --> Domain
+  Config[(Workspace JSON)] --> Domain
+  UI --> Worker[Background capture job]
+  CLI --> Adapter[broxser-engine\nCDP adapter dan process owner]
+  Worker --> Adapter
+  Adapter -->|Loopback CDP, random port| Browser[Owned Helium subprocess\nPrivate temporary profile]
+  Browser --> Guest[BrowserContext guest]
+  Browser --> Admin[BrowserContext admin]
+  Guest --> Devices[Targets dan viewport emulation]
+  Admin --> Devices
+  Devices --> PNG[PNG capture dan metadata]
+  PNG --> UI
+  PNG --> Export[(Explicit CLI export)]
+```
+
+| Komponen | Tanggung jawab dan batas | Kegagalan |
+| --- | --- | --- |
+| `broxser-core` | Validasi, workspace v1, pure sync routing; tanpa UI/network | Input ditolak sebelum browser dimulai |
+| `broxser-engine` | Proses browser, CDP, emulasi dan capture | Error terbatas waktu; child miliknya dihentikan |
+| `broxser-desktop` | State UI, canvas, job background | Tampilkan status, pertahankan UI responsif |
+| `broxser-cli` | Validasi, bootstrap config, capture untuk otomasi | Exit nonzero; tidak menyatakan capture sukses |
+| Helium | Network, DOM/CSS/JS, storage, sandbox Chromium | Hentikan job; jangan replay aksi pengguna |
+
+Satu proses browser per capture job, satu BrowserContext per session, satu target
+per device. Device dengan session sama sengaja berbagi konteks. Label `Admin`
+hanyalah nama session; tidak memberi hak akses atau melakukan login.
+
+GPUI tidak mengimpor tipe CDP. Domain tidak mengimpor GPUI atau adapter. Lapisan
+adapter saat ini berupa API fungsi Rust; trait generik baru ditambahkan jika ada
+adapter kedua yang nyata. Tidak ada service jaringan perusahaan yang harus hidup
+agar fitur lokal bekerja.
+
+## 5. Request lifecycle
+
+1. Muat workspace maksimum 1 MiB, parse JSON, lalu validasi versi, URL, identitas,
+   referensi session, viewport dan anggaran piksel.
+2. Ambil executable Helium dari `BROXSER_HELIUM_BIN` atau PATH. `--browser` menerima
+   pilihan eksplisit untuk pengujian. Jangan diam-diam beralih ke Chromium.
+3. UI menjalankan capture di background, maksimal satu job aktif. Buat profil
+   sementara privat dan child browser milik job dengan sandbox tetap aktif.
+4. Baca `DevToolsActivePort` dari profil tersebut. Validasi port dan path, lalu
+   hubungkan hanya ke `127.0.0.1`. Catat `Browser.getVersion` dan versi protokol.
+5. Buat konteks session dan target, atur emulasi, navigasi, tunggu lifecycle load
+   yang sesuai dengan navigation loader, lalu ambil PNG. `load` bukan bukti SPA
+   telah tenang; readiness selector dan network-idle adalah pengembangan lanjutan.
+6. Kembalikan file capture dan metadata. UI menampilkan preview statis; CLI
+   mengekspor PNG dan `report.json`. Hentikan browser dan hapus profil sementara.
+
+Startup dibatasi 15 detik, setiap command 15 detik dan load 30 detik. Ini deadline
+per operasi, bukan SLA total job. Maksimal 8 device berarti kegagalan berurutan
+masih dapat memakan waktu; cancellation dan deadline global merupakan gate pilot.
+Tidak ada retry otomatis untuk navigasi atau aksi yang mungkin memberi efek samping.
+
+## 6. API and data contracts
+
+| Kontrak | Makna |
+| --- | --- |
+| `Workspace.schema_version` | Harus 1; versi masa depan ditolak |
+| `name`, `url` | Nama manusia; URL HTTP/HTTPS tanpa userinfo |
+| `sessions[]` | ID slug unik dan label; 1–8 session |
+| `devices[]` | ID unik, dimensi CSS, DPR, mobile/touch dan referensi session |
+| `capture_workspace` | Blocking Rust API; menerima workspace tervalidasi, executable, direktori output |
+| `CaptureReport` | Browser product, protocol version, daftar file dan ukuran PNG aktual |
+| `SyncRouter` | Aturan pure opt-in untuk scope dan pencegahan replay; belum dihubungkan ke browser |
+
+Schema contoh: [examples/workspace.json](../examples/workspace.json). Definisi
+otoritatif berikut validasinya berada di
+[broxser-core](../crates/broxser-core/src/lib.rs). Viewport 200–4096 per sumbu,
+DPR 0.5–4 yang finite, maksimal 8 device, total maksimum 24 juta piksel fisik.
+Ukuran PNG berbeda dari CSS pixel ketika DPR bukan 1. User agent tidak otomatis
+diubah menjadi iPhone: mobile emulation bukan simulasi Safari maupun hardware.
+
+Konfigurasi tidak memuat cookies, headers rahasia, token atau profil browser.
+Writer memakai file sementara di direktori yang sama dan rename; import versi baru
+memerlukan migrasi eksplisit dengan backup dan validasi. Saat ini hanya v1 tersedia;
+belum ada migrasi historis. Untuk state aplikasi yang berkembang, evaluasi SQLite
+setelah kebutuhan query/transaksi nyata muncul, tetap sediakan ekspor JSON.
+
+## 7. Consistency idempotency and replay
+
+Satu capture menggunakan snapshot workspace yang tetap. Refresh berikutnya membuat
+browser dan session baru; login tidak bertahan. Gambar adalah hasil pengamatan,
+bukan salinan state aplikasi web yang bisa dipulihkan.
+
+| Kejadian | Perilaku yang disyaratkan |
+| --- | --- |
+| Event sync duplikat/out-of-order | Tolak sequence lama pada origin; replay tidak disiarkan lagi |
+| Session tujuan berbeda | Jangan kirim event tanpa keputusan produk dan izin baru |
+| Job capture gagal sebagian | Laporkan gagal; file yang sempat dibuat bukan report sukses baru |
+| Browser restart | Pulihkan konfigurasi; minta aksi pengguna untuk aktivitas yang dapat mengubah data |
+| Config berubah saat capture | Selesaikan snapshot aktif, pakai perubahan pada job berikutnya |
+
+Pure router awal memerlukan opt-in, memeriksa source session/device, dan tidak
+mengaktifkan click/typing secara default. Integrasi live perlu bounded event queue,
+scroll coalescing, navigation generation, frame/input mapping, serta tests dengan
+DOM berbeda. Jangan memakai klaim exactly-once untuk aksi web; side effect di server
+tidak bisa dibatalkan oleh router lokal.
+
+## 8. Security and privacy considerations
+
+Halaman web adalah input tidak tepercaya; jangan beri akses filesystem, shell,
+native app atau credential melalui bridge. CDP memiliki hak penuh atas browser
+child; loopback mengurangi paparan jaringan, tetapi tidak mengautentikasi proses
+lokal lain. Evaluasi transport pipe sebelum rollout luas. Profil pribadi pengguna
+tidak boleh dipakai. Jangan menambahkan `--no-sandbox`, wildcard debug origins,
+atau mengabaikan sertifikat untuk memudahkan test.
+
+HTTP localhost dan jaringan internal sengaja didukung. Validasi URL awal bukan
+allowlist redirect; CLI bukan layanan URL-fetch publik. Upstream browser tetap
+menentukan permission dan network behavior. Capture bisa berisi data sensitif;
+ekspor dipicu pengguna dan tidak diunggah otomatis. Git mengabaikan profil, capture,
+runtime dan `.env`. Tidak ada endpoint analytics aplikasi.
+
+Helium memiliki privacy/filter defaults yang dapat memengaruhi aplikasi uji.
+Perbedaan itu harus ditandai dan diuji sebelum dipakai sebagai browser QA utama;
+headless tidak boleh diasumsikan identik dengan mode interaktif/extension.
+Review lisensi dilakukan sebelum packaging; [NOTICE.md](../NOTICE.md) merangkum
+status tanpa menganggap pemisahan proses menghapus kewajiban distribusi.
+
+## 9. Operational readiness and ten year stewardship
+
+Sepuluh tahun adalah horizon kepemilikan produk, bukan janji umur API GPUI/Helium.
+Pertahankan core dan kontrak data yang kecil, serta kemampuan mengganti adapter.
+
+| Area | Target usulan dan gate | Owner yang harus ditunjuk |
+| --- | --- | --- |
+| Browser security | Triage advisory 1 hari kerja; critical update 72 jam setelah upstream layak | Engine maintainer + backup |
+| Update normal | Review mingguan; kualifikasi runtime bulanan; UI/deps per kuartal | Maintainer |
+| Correctness | Viewport, cookie/storage isolation, lifecycle dan cleanup lulus | QA/engine |
+| UI latency | p95 respons input <50 ms pada laptop referensi | UI maintainer |
+| Capture | 3 fixture viewport <5 detik warm sebagai target | Engine maintainer |
+| Memory | Tambahan UI idle <150 MB; total fixture <1.5 GB sebagai target | UI/engine |
+| Release | Checksum, inventory lisensi, SBOM, signing dan rollback teruji | Release owner |
+
+Angka performa adalah target awal, **belum hasil benchmark**. Definisikan laptop
+16 GB, distro/GPU/driver, 3 viewport DPR1 dan fixture yang sama sebelum mengukur.
+Browser halaman dunia nyata bisa memakai jauh lebih banyak memori; batas piksel
+bukan hard memory limit. Stop/adaptive suspension perlu dibuktikan sebelum 8 device
+dipakai sebagai fitur production.
+
+Cargo.lock, Rust toolchain, GPUI exact version dan checksum Helium memberi baseline
+yang dapat direproduksi. Dependabot membantu Rust/action; pembaruan browser tetap
+pekerjaan owner dengan contract test. CI memeriksa compile dan headless integration;
+matrix GPU Wayland/X11, fractional scale, IME dan accessibility memerlukan test
+desktop nyata sebelum rilis.
+
+Canary awal: 5 developer selama 2 minggu, setelah fungsionalitas hariannya tersedia.
+Promosi membutuhkan tidak ada bug kehilangan data/isolation, capture/navigation
+workflow yang teruji, update engine dan rollback yang pernah dipraktikkan. Jangan
+rollback ke runtime yang punya kerentanan kritis tanpa containment; perbaikan maju
+dapat lebih aman. Simpan config backup sebelum migrasi, jangan downgrade profile
+browser lintas versi sembarangan.
+
+Tahun 1 fokus loop inti dan release discipline; tahun 2–3 hardening dan pengurangan
+support load; tahun 4–6 evaluasi ulang API renderer, kebutuhan platform dan format
+data; tahun 7–10 ganti komponen yang usang melalui kontrak yang sama. Review desain
+tahunan berdasarkan penggunaan dan biaya, bukan roadmap sepuluh tahun yang kaku.
+
+TCO tahunan = jam engineering × loaded cost + CI/signing/storage/support.
+Penghematan kotor = jumlah seat × harga subscription tahunan aktual.
+Jumlah seat, tarif tim dan biaya vendor belum diberikan; belum ada klaim bahwa
+build sendiri pasti lebih murah. Putuskan scale-up setelah pilot mengukur waktu
+yang dihemat dan beban maintenance.
+
+## 10. Alternatives considered
+
+| Alternatif | Tradeoff dan keputusan |
+| --- | --- |
+| GPUI + external Helium CDP | Dipilih untuk proof; batas runtime jelas, input/native integration masih perlu kerja |
+| Fork penuh UI/Chromium Helium | Integrasi surface lebih langsung, tetapi merge/security/build ownership jauh lebih besar; tunda |
+| CEF atau hostable Chromium surface | Kandidat spike embedding jika CDP gagal memenuhi UX; bukan identik dengan runtime Helium |
+| Tauri/system webview | Lebih mudah untuk aplikasi biasa; tidak memenuhi pilihan GPUI dan engine konsisten yang diminta |
+| Electron/Playwright frontend | Ekosistem matang untuk otomasi; bukan stack produk yang dipilih |
+| Tetap memakai Sizzy | Tetap opsi ekonomi saat maintenance internal melebihi penghematan |
+
+## 11. Open questions
+
+- Siapa primary/backup owner dengan kapasitas maintenance nyata, dan berapa seat tim?
+- Distro, GPU, fractional scaling, accessibility dan aplikasi perusahaan apa yang wajib lulus?
+- Apakah kebutuhan utama preview responsif atau interaksi web lengkap? Gate ini
+  menentukan apakah CDP cukup atau perlu investasi embedding terpisah.
+- Apakah Helium filtering/fingerprinting behavior dapat dikonfigurasi agar hasil QA representatif?
+- Bagaimana secret store, persistent session, signed package dan distribusi internal akan dikelola?
+
+## 12. Decision and next steps
+
+| Milestone | Hasil | Exit criteria |
+| --- | --- | --- |
+| M0 foundation | Repo, GPUI shell, validasi, real Helium capture, dokumentasi | Compile/test dan bukti Linux capture/isolation; status keterbatasan jelas |
+| M1 interactive spike | Frame transport, navigation/scroll sync, coordinate/input mapping | Resize/DPR/IME/clipboard/popups/a11y dan latency memenuhi gate; ADR lanjut atau ganti integrasi |
+| M2 daily workflow pilot | Persistent session aman, console, capture/export, crash recovery | 5 developer 2 minggu, update/rollback rehearsal dan tidak ada isolation/data-loss bug |
+| M3 Linux rollout | Packaging/signing/support, resource control dan release ownership | Workflow pengganti Sizzy diverifikasi tim; biaya maintenance terukur |
+| M4 optional platforms | macOS lalu target lain sesuai permintaan | Test/packaging platform tersendiri, tanpa klaim dukungan dari kompilasi saja |
+
+Keputusan saat ini: lanjutkan foundation dan bukti integrasi, pertahankan runtime
+eksternal dan konfigurasi portabel. Full embedding perlu keputusan baru berdasarkan
+hasil M1. Penonaktifan subscription Sizzy sebaiknya mengikuti bukti workflow M2,
+bukan hanya keberhasilan build starter.
+
+## Sources
+
+Ditinjau 24 September 2026. Dokumen upstream dapat berubah; versi implementation
+dikunci di repo dan runtime manifest.
+
+- [Sizzy capabilities](https://sizzy.co/)
+- [GPUI introduction](https://gpui.rs/) dan [published 0.2.2](https://crates.io/crates/gpui/0.2.2)
+- [Helium source and license](https://github.com/imputnet/helium)
+- [Helium Linux baseline 0.18.1.1](https://github.com/imputnet/helium-linux/releases/tag/0.18.1.1)
+- [Chrome headless](https://developer.chrome.com/docs/automation-and-testing/headless)
+- [Remote debugging and private profiles](https://developer.chrome.com/blog/remote-debugging-port)
+- [CDP Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/) dan [CDP Page](https://chromedevtools.github.io/devtools-protocol/tot/Page/)

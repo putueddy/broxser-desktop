@@ -1,0 +1,10 @@
+/target/
+/artifacts/
+/.local/
+/.env
+/.env.*
+*.dmg
+*.AppImage
+*.core
+__pycache__/
+*.pyc

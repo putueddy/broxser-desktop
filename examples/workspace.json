@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "Demo workspace",
+  "url": "http://127.0.0.1:4173",
+  "sessions": [
+    { "id": "guest", "name": "Guest" },
+    { "id": "admin", "name": "Admin" }
+  ],
+  "devices": [
+    { "id": "phone", "name": "Phone", "width": 390, "height": 844, "device_scale_factor": 1.0, "mobile": true, "touch": true, "session": "guest" },
+    { "id": "tablet", "name": "Tablet", "width": 768, "height": 1024, "device_scale_factor": 1.0, "mobile": true, "touch": true, "session": "guest" },
+    { "id": "desktop", "name": "Desktop", "width": 1440, "height": 900, "device_scale_factor": 1.0, "mobile": false, "touch": false, "session": "admin" }
+  ]
+}

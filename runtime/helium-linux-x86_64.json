@@ -1,0 +1,10 @@
+{
+  "platform": "linux-x86_64",
+  "version": "0.18.1.1",
+  "chromium_version": "154.0.8037.57",
+  "release_url": "https://github.com/imputnet/helium-linux/releases/tag/0.18.1.1",
+  "url": "https://github.com/imputnet/helium-linux/releases/download/0.18.1.1/helium-0.18.1.1-x86_64_linux.tar.xz",
+  "sha256": "9f4d35239eea18b290846221874265ac2a8637adff954df69fdef77d6b15042c",
+  "reviewed_on": "2026-09-24",
+  "purpose": "Reproducible integration baseline; review and rotate for security updates"
+}
