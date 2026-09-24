@@ -15,7 +15,9 @@ broxser-engine = { path = "crates/broxser-engine" }
 anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
+futures = "0.3"
 gpui = "=0.2.2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
@@ -31,6 +33,14 @@ dbg_macro = "deny"
 
 [profile.dev]
 debug = 1
+
+# Live frames are JPEG-decoded on every page update. Unoptimized decoders cost
+# whole cores in the documented `cargo run` workflow.
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

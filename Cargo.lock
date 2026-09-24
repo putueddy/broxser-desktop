@@ -731,7 +731,9 @@ dependencies = [
  "broxser-core",
  "broxser-engine",
  "clap",
+ "futures",
  "gpui",
+ "image",
  "tempfile",
 ]
 

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Broxser live fixture</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; color: #17312b; background: #f4f6ee; font: 16px/1.5 system-ui, sans-serif; }
+  header { position: sticky; top: 0; display: flex; justify-content: space-between; gap: 12px; padding: 14px 6%; background: #17312b; color: #f4f6ee; }
+  header b { letter-spacing: -.04em; }
+  main { max-width: 900px; margin: auto; padding: 28px 6% 80px; }
+  nav { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+  nav a { padding: 8px 14px; border-radius: 6px; background: #d9ec95; color: #17312b; text-decoration: none; }
+  section { margin: 18px 0; padding: 22px; border: 1px solid #d3ddcc; border-radius: 12px; background: #fffef8; min-height: 260px; }
+  section strong { display: block; font-size: 42px; letter-spacing: -.04em; }
+  input { width: 180px; padding: 8px; border-radius: 6px; border: 1px solid #b9c7b3; font: inherit; }
+  button { border: 0; border-radius: 6px; padding: 8px 14px; background: #17312b; color: #f4f6ee; font: inherit; }
+</style>
+<header><b>broxser / live</b><span id="ticks">tick 0</span></header>
+<main>
+  <p>Local fixture for live frames. The tick counter changes four times per second,
+  so new frames arrive without any capture action. No external assets.</p>
+  <p id="where"></p>
+  <nav><a href="live.html?page=1">Page 1</a><a href="live.html?page=2">Page 2</a><a href="live.html?page=3">Page 3</a></nav>
+  <p><input id="label" aria-label="Session label" placeholder="Session label">
+  <button id="save">Save locally</button> <span id="saved">No saved label</span></p>
+  <section><strong>1</strong>Scroll position: <span class="scroll">0</span> px</section>
+  <section><strong>2</strong>Scroll position: <span class="scroll">0</span> px</section>
+  <section><strong>3</strong>Scroll position: <span class="scroll">0</span> px</section>
+  <section><strong>4</strong>Scroll position: <span class="scroll">0</span> px</section>
+  <section><strong>5</strong>End of fixture.</section>
+</main>
+<script>
+  let ticks = 0;
+  setInterval(() => { document.querySelector('#ticks').textContent = 'tick ' + ++ticks; }, 250);
+  const page = new URLSearchParams(location.search).get('page') || 'home';
+  document.querySelector('#where').textContent =
+    `Page ${page} · ${innerWidth} CSS px wide · ${devicePixelRatio}× device pixel ratio`;
+  addEventListener('scroll', () => {
+    for (const span of document.querySelectorAll('.scroll')) span.textContent = Math.round(scrollY);
+  });
+  document.querySelector('#saved').textContent = localStorage.getItem('label') || 'No saved label';
+  document.querySelector('#save').onclick = () => {
+    const value = document.querySelector('#label').value;
+    localStorage.setItem('label', value);
+    document.querySelector('#saved').textContent = value || 'No saved label';
+  };
+</script>
+</html>
