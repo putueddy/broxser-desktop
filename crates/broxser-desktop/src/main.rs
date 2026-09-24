@@ -1,6 +1,8 @@
 use anyhow::{Context as _, Result};
 use broxser_core::{Device, Workspace};
-use broxser_engine::{CaptureOptions, CaptureReport, capture_workspace, discover_browser};
+use broxser_engine::{
+    BrowserOptions, Cancellation, CaptureReport, capture_workspace, discover_browser,
+};
 use clap::Parser;
 use gpui::{
     App, Application, AssetSource, Bounds, Context, Entity, FocusHandle, KeyBinding,
@@ -95,9 +97,11 @@ impl Desktop {
             let directory = tempfile::Builder::new()
                 .prefix("broxser-preview-")
                 .tempdir()?;
-            let options = CaptureOptions {
+            let options = BrowserOptions {
                 executable,
                 headless: true,
+                profile_root: None,
+                cancel: Cancellation::new(),
             };
             let report = capture_workspace(&workspace, &options, directory.path())?;
             Ok::<_, anyhow::Error>((directory, report))
