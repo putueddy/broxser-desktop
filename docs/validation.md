@@ -3,6 +3,69 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.1 live command and navigation deadlines, 25 September 2026 (cloud container)
+
+Same container and toolchain as P0 below, restarted before this work: Rust 1.98.1,
+Helium 0.18.1.1 (`Chrome/154.0.8037.57`), browser tests as the unprivileged user
+`broxsertest` with the sandbox enabled. The audit and the decision are in
+[ADR 0008](adr/0008-live-command-and-navigation-deadlines.md).
+
+### Before the change
+
+Reproducers on `main` at `035b6fe`. The fake CDP peer answers setup like a browser
+and withholds chosen answers.
+
+| Reproducer | Result |
+| --- | --- |
+| Fake peer: the phone never answers input; 300 key events to it, then one key press to the desktop | Runtime stopped with `too many unanswered CDP commands`; the desktop's key events never arrived |
+| Fake peer: the phone's navigation is never answered | 35 s later `loading: true`, `error: None` |
+| Fake peer: the phone's first navigation hangs, Go starts a second, then the first fails late with `net::ERR_ABORTED` | The phone showed `Navigation failed: net::ERR_ABORTED; not retried` and `loading: false` while the second navigation ran |
+| Helium: the desktop page blocks its main thread for 4 s on its first key; 300 key events to it | The runtime had stopped with the same error when checked 3.0 s later; the phone got no new frames and a click on it never arrived |
+| Helium: the fixture holds the phone's reload | 35 s later `loading: true`, `error: None`, the request still open; the other devices kept streaming |
+
+A scratch probe (not committed) measured how Helium answers: `Page.navigate` at
+commit (24 ms) and not within 4 s while the fixture held the request;
+`Page.reload` 4 ms after the reload started, then no event while it hung;
+`Page.stopLoading` within 3 ms, which ended loading and closed the held requests.
+A deadline on the reload's answer alone would therefore never fire, which the
+first Helium run of the new test showed; the final design follows the reload
+until the main frame commits or stops.
+
+### After the change
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 52 engine and 4 desktop tests; strict Clippy for default members and desktop; 20 live tests ignored by default |
+| New default tests (fake peer) | Passed; the flood, navigation and superseded cases failed before the change as listed above, the single-click and reload cases were not run before |
+| Whole live Helium suite | Passed 20 of 20 in each of four runs: two with two test threads (55.1–55.3 s) and two with four, as CI runs it (42.3–42.7 s) |
+| Default engine tests, 25 consecutive runs as the unprivileged user | 25 passed |
+| `scripts/desktop-smoke.sh` under Xvfb | Passed all five runs: Ctrl+Q after 160 ms, static close after 507 ms, and SIGKILL, Ctrl+C and SIGTERM without a browser process or profile left (the known preview directory after SIGTERM) |
+
+| Scenario | Measured |
+| --- | --- |
+| Fake peer: 300 key events to a phone that never answers | The runtime kept running; 32 events reached the peer and the rest were dropped; the desktop's input and a Go for all devices arrived; after the phone answered, its next key press arrived and none of the dropped ones did |
+| Fake peer: one unanswered click, command limit 1 s | "Not responding" after 1026 ms; later keys dropped |
+| Fake peer: navigation and reload without an end, load limit 0.5 s | Stopped and reported at the deadline, `Page.stopLoading` sent once, nothing sent again; a later Go was sent once |
+| Fake peer: superseded navigation fails late | The new navigation's status stayed without error |
+| Helium: the fixture holds the phone's reload, load limit 3 s | Stopped and reported 3010–3027 ms after the reload was sent; the held request closed, the phone kept its page, the others kept streaming; four document requests, then a fifth only for the explicit reload |
+| Desktop window under Xvfb against a server that accepts connections and never answers | After 30 s the device cards showed "Navigation got no response within 30 seconds; loading stopped…" in the warning color (truncated on the narrow phone card at 50% zoom); the runtime stayed live; SIGTERM afterwards left no browser process or profile |
+| Helium: the desktop page blocks its main thread for 4 s; 300 key events | Runtime kept running and reported the desktop as not responding; a phone click arrived 80–244 ms after the flood and phone frames continued; after the page answered, the field held 16 characters, not 150, and the next key press was typed |
+
+Findings and limits:
+
+- Chromium can place devices of one session and site in one renderer process;
+  the busy-page test therefore blocks the desktop, which is alone in its session.
+  Blocking a phone page can stall the tablet in the same session as well.
+- Input sent before the page stopped answering (at most 32 events) still arrives
+  when it recovers; dropped releases can leave a key or button held in that page.
+- Page-initiated navigations that hang are not stopped, and live mode has no load
+  deadline after commit. A browser that stops answering is noticed only while a
+  command is outstanding. Capture keeps per-operation limits without a job deadline.
+- `xwd` captured the lavapipe-rendered desktop window as black until the pointer
+  moved over it, so the window check above moved the pointer before capturing.
+- Not checked: Wayland, a physical GPU, other distros and kernels, real slow dev
+  servers, and how often long tasks on real applications reach the 15 s limit.
+
 ## P0 cleanup after owner death, 25 September 2026 (cloud container)
 
 Ubuntu 24.04.4 container, kernel 6.18, x86_64, 4 vCPU, 15 GB RAM, `pid_max` 32768,

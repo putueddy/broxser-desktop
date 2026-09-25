@@ -106,7 +106,7 @@ Selesaikan milestone ini sebagai PR pertama. Jika muncul batas upstream/platform
 yang nyata, sertakan reproducer dan keputusan yang konkret, lalu lanjutkan bagian
 independen yang dapat diselesaikan. Jangan menandai pekerjaan blocked sebagai done.
 
-**Status P0 (25 September 2026, menunggu review PR):** guardian per browser, lease
+**Status P0 (25 September 2026, merged melalui PR #6):** guardian per browser, lease
 profil dan recovery stale profile diimplementasikan menurut
 [ADR 0007](docs/adr/0007-browser-ownership-after-owner-death.md). Reproducer
 subprocess (fake browser dan Helium), tes CLI dan smoke X11 membuktikan cleanup
@@ -141,6 +141,18 @@ Untuk P1.1/P1.2, konfirmasi masalah melalui kode dan reproducer sebelum mengubah
 kontrak: per-operation timeout pada bootstrap/capture bukan jaminan deadline pada
 semua command live atau keseluruhan job. Respons yang hilang juga tidak membuktikan
 bahwa aksi web belum berjalan. Jangan mengirim ulang aksi demi membuat tes lulus.
+
+**Status P1.1 (25 September 2026, menunggu review PR):** audit dan keputusan ada di
+[ADR 0008](docs/adr/0008-live-command-and-navigation-deadlines.md). Reproducer fake
+CDP dan Helium membuktikan bahwa satu halaman yang tidak menjawab input menghentikan
+seluruh runtime, navigasi/reload yang ditahan server tidak pernah berakhir, dan
+jawaban navigasi yang sudah digantikan tampil sebagai error. Kini setiap command live
+berdeadline dan terikat device: navigasi yang dimulai Broxser dihentikan dan
+dilaporkan setelah 30 detik tanpa retry, device yang tidak menjawab input ditandai
+*not responding* dan input barunya dibuang, bukan diantrekan, dan device lain tetap
+berjalan. Sisa di luar lingkup: navigasi yang dimulai halaman tidak dihentikan,
+tidak ada deadline load setelah commit di live, heartbeat browser, dan deadline job
+capture.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -221,8 +233,9 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
 - [x] Frame live, input dasar, trusted link/scroll sync dan keenam perbaikan review.
 - [x] Gabungan source diuji: 40 tes lokal, 14 tes live Helium; bukti X11/Wayland tersedia.
 - [x] P0 — cleanup browser/CDP/profil ketika induk mati, serta stale-profile recovery
-  (ADR 0007; PR menunggu review; sisa temp dir non-profil tercatat di status P0).
-- [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates.
+  (ADR 0007; merged melalui PR #6; sisa temp dir non-profil tercatat di status P0).
+- [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates
+  (P1.1 deadline command dan navigasi live: ADR 0008, PR menunggu review).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

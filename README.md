@@ -65,6 +65,13 @@ deterministik untuk capture statis.
 | **Restart runtime** | Muncul setelah browser berhenti; memulihkan konfigurasi, tidak memutar ulang aksi |
 | `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus |
 
+Go, Reload, sync atau membuka workspace yang tidak mendapat respons dalam 30 detik
+dihentikan seperti tombol Stop dan dilaporkan pada device itu; navigasinya tidak
+diulang. Halaman yang tidak menjawab input selama 15 detik, atau meninggalkan 32
+event tak terjawab, ditandai *not responding*: input baru untuk device itu dibuang,
+bukan diantrekan, sampai halaman menjawab lagi. Device lain tetap berjalan. Lihat
+[ADR 0008](docs/adr/0008-live-command-and-navigation-deadlines.md).
+
 Mode statis: tambahkan `--static`, lalu **Capture previews** atau `Ctrl+R`; opsi
 `--capture-on-start` hanya untuk mode ini. Menutup window saat capture berjalan
 membatalkannya dan menunggu cleanup (sekitar setengah detik). URL dapat diganti
@@ -156,7 +163,8 @@ BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" \
 Suite live mencakup piksel/isolasi session, load timeout, cancel saat request aktif,
 kegagalan parsial tanpa retry, `live_slow_page_reproducer`, serta live session: frame,
 input per device, sync dalam session tanpa loop/replay, batas frame, crash dan exit
-browser. Reproducer dapat diulang dengan `BROXSER_REPRO_ITERATIONS`,
+browser, reload yang ditahan server, dan halaman yang memblokir main thread-nya.
+Tes default memakai fake CDP peer untuk input dan navigasi yang tidak pernah dijawab. Reproducer dapat diulang dengan `BROXSER_REPRO_ITERATIONS`,
 `BROXSER_REPRO_DELAY_MS`, dan `BROXSER_REPRO_BASELINE=1` untuk membandingkan perilaku
 sebelum perbaikan.
 
@@ -199,9 +207,10 @@ engine yang dapat diganti, format data portabel, update rutin serta maintainer u
 dan backup; bukan janji bahwa API framework hari ini akan tetap sama sampai 2036.
 
 Handoff dan backlog aktif untuk Claude Code ada di [GOALS.md](GOALS.md). Cleanup
-ketika proses induk mati (P0) diimplementasikan melalui guardian dan lease profil;
-prioritas berikutnya ialah deadline/restart runtime, kualifikasi input dan resource,
-serta workflow harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
+ketika proses induk mati (P0) diimplementasikan melalui guardian dan lease profil,
+deadline command dan navigasi live (P1.1) melalui ADR 0008; prioritas berikutnya
+ialah transisi restart runtime, kualifikasi input dan resource, serta workflow
+harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
 hardware dan pengukuran performa lebih luas masih diperlukan sebelum pilot dan
 evaluasi penggantian subscription.
 Biaya maintenance internal perlu dibandingkan dengan penghematan seat berdasarkan
