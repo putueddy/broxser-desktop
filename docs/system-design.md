@@ -124,8 +124,9 @@ agar fitur lokal bekerja.
    pengembangan lanjutan.
 6. Kembalikan file capture dan metadata. UI menampilkan preview statis; CLI
    mengekspor PNG dan `report.json`. Hentikan browser, tunggu seluruh prosesnya
-   keluar (identitas PID dan waktu mulai), hapus profil sementara (lease terakhir),
-   lalu lepaskan guardian.
+   keluar (identitas PID dan waktu mulai) sampai tidak ada proses yang masih
+   menyebut profil, termasuk helper yang baru muncul saat browser berhenti, hapus
+   profil sementara (lease terakhir), lalu lepaskan guardian.
 
 Bila proses Broxser mati di langkah mana pun (SIGKILL, SIGTERM, crash), pipe ke
 guardian tertutup oleh kernel. Guardian di session sendiri menghentikan browser

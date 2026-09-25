@@ -43,10 +43,10 @@ other local users; `Default/` was 0700. Profiles are now created with mode 0700.
 
 | Check | Result |
 | --- | --- |
-| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 45 engine (one is the libtest entry point for re-executed roles) and 4 desktop tests; strict Clippy for default members and desktop; 18 live tests ignored by default |
-| Default engine tests, 25 consecutive runs as the unprivileged user | 25 passed, repeated after the last test changes |
-| Whole live Helium suite, two test threads | Passed 18 of 18 in 46 s: the 14 earlier tests (slow-page reproducer six runs without failure, renderer crash reported after 40 ms) and 4 new ones |
-| `scripts/desktop-smoke.sh` under Xvfb | Passed all five runs, below |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 47 engine (one is the libtest entry point for re-executed roles) and 4 desktop tests; strict Clippy for default members and desktop; 18 live tests ignored by default |
+| Default engine tests, 25 consecutive runs as the unprivileged user | 25 passed, repeated after the CI fix below |
+| Whole live Helium suite | Passed 18 of 18 in 46 s with two test threads: the 14 earlier tests (slow-page reproducer six runs without failure, renderer crash reported after 40 ms) and 4 new ones. After the CI fix: 18 of 18 in 46.6 s with two threads, and in four of four runs with four threads as CI runs it (37.6–38.7 s each) |
+| `scripts/desktop-smoke.sh` under Xvfb | Passed all five runs, before and after the CI fix; below |
 
 Measured from owner death until every process of that instance (browser tree,
 detached helpers and guardian) had exited and its profile was gone, over several
@@ -64,6 +64,12 @@ document request was replayed.
 | Helium, live teardown | `abort()` before the kill or before profile removal | 53–70 ms |
 | Real `broxser` CLI during a capture | SIGKILL | 26 ms |
 | Helium orphan: owner and guardian killed, browser left running | Next browser start in the same root | 56–60 ms for 15 processes |
+| Fake browser whose helper writes into the profile 0.3 s after the browser exits (added with the CI fix) | SIGKILL | 334–357 ms |
+
+After the CI fix, a run with two test threads measured 66–97 ms for the held
+request, 43–105 ms for live frames, 63–80 ms for live teardown and 60 ms for the
+orphan. With four test threads, as CI runs the suite, the Helium cleanups took
+60–240 ms and the orphan 73–83 ms.
 
 | Desktop smoke run | Result |
 | --- | --- |
@@ -72,6 +78,11 @@ document request was replayed.
 | Live, SIGKILL | Exit 137; 0 browser processes and profiles when checked 69–71 ms later; window gone |
 | Live, SIGINT to its process group (Ctrl+C) | Exit 130; 0 processes and profiles when checked 134 ms later; window gone |
 | Static, SIGTERM during a held request | Exit 143; 0 processes and profiles after 68 ms; one preview directory left (below) |
+
+After the CI fix all five runs passed again: Ctrl+Q exited after 104 ms, the
+static close after 405 ms, and the SIGKILL, Ctrl+C and SIGTERM runs left no
+browser process or profile when checked 69–71 ms after the kill (the same preview
+directory remained after SIGTERM).
 
 Guardian cost: one process per browser, not per frame, with one thread and 12.3 MB
 VmRSS under the debug desktop binary (2.7 MB anonymous, the rest shared file
@@ -98,6 +109,37 @@ Findings and limits:
 - Not checked: the kill scenarios on Wayland or a physical GPU, other distros and
   kernels, and macOS (unsupported; guardians need Linux 5.3+ pidfds). The System
   Design DOCX was not re-rendered.
+
+### Profile written again after removal (CI run #29)
+
+The first push of this change failed CI run #29. In
+`live_next_start_stops_an_orphaned_browser_and_recovers_its_profile`, the next
+browser's `shutdown()` returned success, yet its profile existed again when the
+test listed the root (`profiles left: ["broxser-cdp-hNdglp"]`); the other 17 live
+tests passed, and the pull-request run of the same commit passed. Seven whole-suite
+runs here, three of them limited to two CPUs, and 90 shutdowns 0–120 ms after
+startup did not reproduce it.
+
+The owner's shutdown, its drop fallback, the guardian and recovery recorded the
+browser's processes once, before the kill, and removed the profile as soon as
+those had exited. Helium's processes, the crash handlers included, call `mkdir`
+for `Default/` and `Crash Reports/*` when they write there (`strace`). A scratch
+experiment that SIGKILLed the main browser 0.02–2 s after launch and deleted the
+profile at once found it re-created about 200 ms later in 6 of 48 runs
+(`Crash Reports/*` or `Default/Network Persistent State`); after waiting for every
+process that descended from the browser or named the profile, in 0 of 56. Every
+Helium process, including both detached crash handlers, carries the profile path
+in its command line. A helper started after the record was never waited for; that
+is the likely cause of the CI failure, which was not reproduced here.
+
+All four paths now delete the profile only after the recorded processes have
+exited and no running process names the profile, re-scanning until then within
+the same five seconds; they never signal the processes found this way. Two new
+tests use a fake browser whose helper, once the browser has exited, starts a new
+process that writes `Default/Late` 0.3 s later. Before the change, the owner's
+shutdown and the guardian (owner SIGKILLed) both left `Default/` behind in 8 of 8
+runs; after it, 10 of 10 runs passed, the guardian finishing 334–357 ms after the
+owner died.
 
 ## PR 4 review fixes 25 September 2026
 

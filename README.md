@@ -72,7 +72,7 @@ lewat `--url http://localhost:3000` atau file workspace.
 
 Jika proses Broxser dibunuh (SIGKILL, SIGTERM, Ctrl+C) atau crash, **guardian**
 kecil milik setiap browser menghentikan browser itu beserta helper-nya, menutup
-endpoint CDP dan menghapus profilnya; di lingkungan uji selesai 38–99 ms setelah
+endpoint CDP dan menghapus profilnya; di lingkungan uji selesai 38–105 ms setelah
 induk mati (target lima detik). Guardian adalah executable Broxser yang sama dan
 berjalan di session sendiri. Ia hanya menghentikan browser yang dicatat dengan PID
 dan waktu mulai, atau proses yang diluncurkan dengan `--user-data-dir` profil

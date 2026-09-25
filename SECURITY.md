@@ -22,12 +22,14 @@ with cookies or page content. Chromium still opens the user's shared NSS
 certificate database, which may hold corporate CAs and client certificates;
 whether to isolate it is an open decision.
 
-Cleanup runs on normal close, errors and cancellation. If the Broxser process is
+Cleanup runs on normal close, errors and cancellation. Every cleanup path deletes
+the profile only once no running process names it, so a Helium helper that is
+still stopping cannot write profile files back afterwards. If the Broxser process is
 killed (SIGKILL, SIGTERM, Ctrl+C) or crashes, a guardian process started before each
 browser notices that its pipe from Broxser closed, stops that browser (a pidfd plus
 the recorded start time, so a reused PID is never signaled), waits for its helpers
 and deletes the profile if its lease still names the same owner (ADR 0007).
-Measured in tests: browser, CDP endpoint and profile gone 38–99 ms after the
+Measured in tests: browser, CDP endpoint and profile gone 38–105 ms after the
 owner died. The guardian runs in its own session and never signals processes it did
 not record or that do not carry that profile's `--user-data-dir` argument.
 

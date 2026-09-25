@@ -62,10 +62,19 @@ metadata files were readable by other local users; Chromium itself uses 0700.
   browser through a pidfd whose target is re-checked against the recorded start
   time, plus processes carrying the exact `--user-data-dir=<profile>` argument
   (this covers a browser spawned in the microseconds before it was reported);
-  wait up to five seconds for the browser tree and every process naming the
-  profile; then delete the profile if its lease still names the same owner.
-  Other processes are never signaled; `pkill`, executable names and wildcards
-  are not used.
+  wait up to five seconds for the browser tree and until no running process
+  names the profile; then delete the profile if its lease still names the same
+  owner. Other processes are never signaled; `pkill`, executable names and
+  wildcards are not used.
+- **Release before removal.** Every cleanup path (the owner's shutdown, its
+  drop fallback, the guardian and recovery) waits for the processes it recorded
+  and then re-scans until no running process names the profile, before deleting
+  it. Helium helpers write profile files while they stop and create missing
+  directories, and a helper started after the record would otherwise put the
+  profile back after its removal (CI run #29). Every Helium process observed
+  carries the profile path in its command line, so each re-scan also finds
+  processes the helpers start. Waiting never signals: processes that merely name
+  the profile are not killed.
 - **Recovery on the next start.** Before creating a profile, the engine checks
   `broxser-cdp-*` entries in the same root. An entry is stale only when it is a
   real directory owned by the user, with a valid version-1 lease, and either
@@ -113,11 +122,15 @@ running, guardian protocol edge cases (release, EOF, reused PID, unreported
 browser, foreign lease) and stale-profile recovery (dead, zombie and reused
 owners, previous boot, live guardian, symlinks, malformed or future leases,
 other namespaces, profiles still in use, a whole killed tree and an orphaned
-Helium). A CLI test kills the real `broxser` binary during a capture, and the X11
-smoke script kills the real desktop with SIGKILL, Ctrl+C and SIGTERM.
+Helium). A fake browser whose helper starts a new process that writes into the
+profile after the browser is gone checks the release rule for the owner's
+shutdown and for the guardian. A CLI test kills the real `broxser` binary during
+a capture, and the X11 smoke script kills the real desktop with SIGKILL, Ctrl+C
+and SIGTERM.
 
 Measured on 25 September 2026 (`docs/validation.md`): after owner death the
-Helium instance, its CDP endpoint and its profile were gone in 38–99 ms; the
-fake-browser and CLI cases took 5–65 ms; an orphaned Helium was stopped and its
-profile removed 56–60 ms after the next start in the same root. A guardian costs
+Helium instance, its CDP endpoint and its profile were gone in 38–99 ms (43–105
+ms with the release rule, 60–240 ms with four parallel tests); the fake-browser
+and CLI cases took 5–65 ms; an orphaned Helium was stopped and its profile
+removed 56–60 ms after the next start in the same root. A guardian costs
 one thread and about 12 MB RSS, mostly shared pages, and was ready in 4–26 ms.

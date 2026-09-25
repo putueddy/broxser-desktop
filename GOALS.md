@@ -110,8 +110,10 @@ independen yang dapat diselesaikan. Jangan menandai pekerjaan blocked sebagai do
 profil dan recovery stale profile diimplementasikan menurut
 [ADR 0007](docs/adr/0007-browser-ownership-after-owner-death.md). Reproducer
 subprocess (fake browser dan Helium), tes CLI dan smoke X11 membuktikan cleanup
-38–99 ms sesudah SIGKILL, SIGTERM, `abort()` atau Ctrl+C induk, termasuk saat
+38–105 ms sesudah SIGKILL, SIGTERM, `abort()` atau Ctrl+C induk, termasuk saat
 teardown; instance lain dan file workspace tidak berubah. Profil kini mode 0700.
+CI run #29 menemukan helper Helium yang menulis ulang profil sesudah dihapus;
+semua jalur cleanup kini menunggu sampai tidak ada proses yang menyebut profil.
 Bukti dan batas ada di `docs/validation.md`. Sisa di luar lingkup PR itu: direktori
 preview mode statis dan direktori socket `org.chromium.Chromium.*` masih tertinggal
 (yang kedua juga pada close normal), serta kualifikasi skenario kill di Wayland,
