@@ -142,7 +142,7 @@ kontrak: per-operation timeout pada bootstrap/capture bukan jaminan deadline pad
 semua command live atau keseluruhan job. Respons yang hilang juga tidak membuktikan
 bahwa aksi web belum berjalan. Jangan mengirim ulang aksi demi membuat tes lulus.
 
-**Status P1.1 (25 September 2026, menunggu review PR):** audit dan keputusan ada di
+**Status P1.1 (25 September 2026, merged melalui PR #7):** audit dan keputusan ada di
 [ADR 0008](docs/adr/0008-live-command-and-navigation-deadlines.md). Reproducer fake
 CDP dan Helium membuktikan bahwa satu halaman yang tidak menjawab input menghentikan
 seluruh runtime, navigasi/reload yang ditahan server tidak pernah berakhir, dan
@@ -153,6 +153,19 @@ dilaporkan setelah 30 detik tanpa retry, device yang tidak menjawab input ditand
 berjalan. Sisa di luar lingkup: navigasi yang dimulai halaman tidak dihentikan,
 tidak ada deadline load setelah commit di live, heartbeat browser, dan deadline job
 capture.
+
+**Status P1.2 (25 September 2026, menunggu review PR):** keputusan ada di
+[ADR 0009](docs/adr/0009-serialized-live-runtime-transitions.md). Reproducer window
+X11 pada `f947727` membuktikan bahwa Restart yang diklik dua kali meluncurkan dua
+browser dan menghentikan satu lewat drop di thread UI, dan bahwa Restart yang
+langsung diikuti Ctrl+Q meluncurkan browser setelah close diminta. Kini window
+menjalankan satu Restart atau close pada satu waktu dan memberi setiap runtime
+generation: klik selama transisi diabaikan, close saat restart tidak memulai
+browser, dan wake-up serta frame hasil decode dari runtime lama dibuang.
+Frame lama tidak tercapai dari UI pada kecepatan manusia; generation dan unit test
+menjaganya. `scripts/desktop-smoke.sh` kini menguji Restart ganda, dengan dan tanpa
+Ctrl+Q. Sisa di luar lingkup: Restart untuk runtime yang masih berjalan, serta
+pemeriksaan Wayland dan GPU fisik untuk jalur ini.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -235,7 +248,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
 - [x] P0 — cleanup browser/CDP/profil ketika induk mati, serta stale-profile recovery
   (ADR 0007; merged melalui PR #6; sisa temp dir non-profil tercatat di status P0).
 - [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates
-  (P1.1 deadline command dan navigasi live: ADR 0008, PR menunggu review).
+  (P1.1 deadline command dan navigasi live: ADR 0008, merged melalui PR #7; P1.2
+  transisi Restart dan close: ADR 0009, PR menunggu review).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.
