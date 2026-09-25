@@ -62,8 +62,8 @@ deterministik untuk capture statis.
 | **Sync links** / **Sync scroll** | Opt-in, hanya antar-device terlihat dalam session yang sama; link memerlukan aktivasi tepercaya dan navigasi yang cocok |
 | **Hide** di sidebar | Menghentikan stream dan input; memilih device terlihat lain, atau tanpa target keyboard bila semuanya disembunyikan |
 | `+` / `−` | Skala tampilan; frame diminta sebesar ukuran tampilan |
-| **Restart runtime** | Muncul setelah browser berhenti; memulihkan konfigurasi, tidak memutar ulang aksi |
-| `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus |
+| **Restart runtime** | Muncul setelah browser berhenti dan selama tidak ada restart atau close berjalan; memulai satu browser, memulihkan konfigurasi, tidak memutar ulang aksi |
+| `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus; saat restart berjalan, tidak memulai browser baru |
 
 Go, Reload, sync atau membuka workspace yang tidak mendapat respons dalam 30 detik
 dihentikan seperti tombol Stop dan dilaporkan pada device itu; navigasinya tidak
@@ -208,9 +208,9 @@ dan backup; bukan janji bahwa API framework hari ini akan tetap sama sampai 2036
 
 Handoff dan backlog aktif untuk Claude Code ada di [GOALS.md](GOALS.md). Cleanup
 ketika proses induk mati (P0) diimplementasikan melalui guardian dan lease profil,
-deadline command dan navigasi live (P1.1) melalui ADR 0008; prioritas berikutnya
-ialah transisi restart runtime, kualifikasi input dan resource, serta workflow
-harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
+deadline command dan navigasi live (P1.1) melalui ADR 0008, dan transisi restart
+runtime (P1.2) melalui ADR 0009; prioritas berikutnya ialah kualifikasi keyboard,
+IME dan clipboard, resource, serta workflow harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
 hardware dan pengukuran performa lebih luas masih diperlukan sebelum pilot dan
 evaluasi penggantian subscription.
 Biaya maintenance internal perlu dibandingkan dengan penghematan seat berdasarkan

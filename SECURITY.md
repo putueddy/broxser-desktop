@@ -48,7 +48,9 @@ directory, which also remains after a normal close.
 
 Live input is forwarded only to the device the user targets. Sync never broadcasts
 typing, form submission, clicks or pointer events, never crosses sessions, and a
-restart restores configuration without replaying user actions. Once a page stops
+restart restores configuration without replaying user actions. One restart or close
+runs at a time: a restart starts one browser, and none starts once the window is
+closing (ADR 0009). Once a page stops
 answering, new input for it is dropped, not queued, so those clicks and keys cannot
 reach it seconds later; input already sent (at most 32 events) still arrives if
 the page recovers. A navigation Broxser started that gets no response in 30 seconds

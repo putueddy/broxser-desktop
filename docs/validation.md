@@ -3,6 +3,54 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.2 restart and close transitions, 25 September 2026 (cloud container)
+
+Same container and toolchain as P1.1 below: Rust 1.98.1, GPUI 0.2.2, Helium
+0.18.1.1, Xvfb with Mesa lavapipe and xdotool, no window manager. The desktop and
+its browser ran as the unprivileged user `broxsertest` with the sandbox enabled.
+The audit and the decision are in
+[ADR 0009](adr/0009-serialized-live-runtime-transitions.md).
+
+### Before the change
+
+A scratch X11 harness, not committed, ran the debug desktop of `f947727` against
+the fixture, served with `Cache-Control: no-store` so that every document load is
+counted. It killed the desktop's own browser by PID so that Restart appeared, sent
+the action with xdotool, and recorded every profile directory created, one per
+browser launch:
+
+| Action | Runs | Browsers started by the action | Other observations |
+| --- | --- | --- | --- |
+| Restart once | 1 | 1 | 3 document requests, one per device |
+| Restart twice without delay | 4 | 2 in every run, the second 9–113 ms after the clicks | The extra browser was stopped 46 ms after the next one started, by a drop on the UI thread |
+| Restart, then Ctrl+Q | 2 | 1, 80–85 ms after the action, while the window was closing | Stopped with the window after 259–273 ms; the desktop exited after 332–336 ms |
+| Restart twice, then Ctrl+Q | 2 | 2; the second 155 ms after the action, after the first had been stopped for the close | The desktop exited after 223–225 ms |
+| Ctrl+Q, then Restart in the same event batch | 3 | 0 | The button was already hidden |
+
+No stale frame was observed. Restart appears only after the worker has stopped
+the browser and cleared its frames, and in the double Restart runs the replaced
+browser was stopped before its first frame.
+
+### After the change
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 57 engine and 9 desktop tests, 5 of them new transition tests; format and strict Clippy; 22 live tests ignored by default |
+| Same harness, fixed desktop | Restart once: 1 browser and 3 documents. Restart twice: 1 browser and 3 documents in 3 of 3 runs. Restart twice, then Ctrl+Q: no browser, exit after 171–176 ms, 2 of 2. Ctrl+Q, then Restart: no browser, 3 of 3 |
+| Restart, then Ctrl+Q | In 2 of 2 runs the restart had started its browser 8–11 ms after the click, before the close was handled; the close then stopped it like a normal close, and the desktop exited after 222–224 ms |
+| `scripts/desktop-smoke.sh` | Passed all seven runs with the fixed desktop, including the two new Restart runs: 1 browser started, and none with Ctrl+Q; no process, profile or window left. With the `f947727` desktop, the new "Restart clicked twice" run failed with 2 browsers started |
+| Real window after a double Restart | One live runtime (`Live · Chrome/154.0.8037.57 · CDP 1.3`), frames streaming with new counters, no stale notice and no Restart button |
+| Live Helium suite, four test threads | Passed 22 of 22 in 50.6 s; the engine is unchanged |
+
+Limits:
+
+- The "Restarting…" state lasts milliseconds, because Restart is offered only
+  after the previous runtime has stopped; it was not captured on screen.
+- Discarding stale frames and wake-ups is covered by the generation unit tests,
+  not by a reproduced window run.
+- Not checked: Wayland, physical GPUs, window managers, and a restart of a runtime
+  that is still running, which the desktop does not offer.
+
 ## PR #7 reload ownership fixes, 25 September 2026 (local host)
 
 Linux x86_64, Omarchy, kernel `7.2.6-arch2-Watanare-T2-4-t2`, Rust 1.98.1,

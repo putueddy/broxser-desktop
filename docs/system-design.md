@@ -142,6 +142,15 @@ digantikan; device tersembunyi berhenti streaming. Crash renderer, target lepas,
 browser keluar dan error transport menghasilkan state eksplisit. Restart adalah aksi
 pengguna yang memulihkan konfigurasi dan memuat URL sekali (ADR 0005).
 
+Window menjalankan satu transisi runtime pada satu waktu (ADR 0009). Restart hanya
+ditawarkan untuk runtime yang berhenti atau gagal start, dan klik selama restart
+atau close diabaikan, tidak diantrekan. Runtime baru dimulai hanya bila window tidak
+memegang session, sehingga session yang berjalan tidak pernah di-drop di thread UI.
+Close saat restart mengambil alih: runtime lama selesai berhenti di luar thread UI,
+tidak ada browser yang dimulai, lalu window ditutup. Setiap runtime punya
+generation; wake-up dan frame hasil decode dari generation lama dibuang tanpa
+mengubah state runtime baru.
+
 Startup dibatasi 15 detik, setiap command 15 detik dan load 30 detik. Ini deadline
 per operasi, bukan SLA total job. Cancellation dicek paling lambat setiap 500 ms;
 menutup window membatalkan capture dan menunggu cleanup. Deadline global job masih
@@ -201,6 +210,7 @@ bukan salinan state aplikasi web yang bisa dipulihkan.
 | Session tujuan berbeda | Jangan kirim event tanpa keputusan produk dan izin baru |
 | Job capture gagal sebagian | Laporkan gagal; file yang sempat dibuat bukan report sukses baru |
 | Browser restart | Pulihkan konfigurasi; minta aksi pengguna untuk aktivitas yang dapat mengubah data |
+| Restart dan close bersamaan | Satu transisi pada satu waktu; tidak ada browser baru setelah close; hasil runtime lama dibuang (ADR 0009) |
 | Config berubah saat capture | Selesaikan snapshot aktif, pakai perubahan pada job berikutnya |
 
 Router memerlukan opt-in, memeriksa source session/device, dan tidak mengaktifkan

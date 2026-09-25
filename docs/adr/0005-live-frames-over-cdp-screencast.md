@@ -31,9 +31,11 @@ blocking browser I/O stays off the GPUI thread and nothing leaks on close.
 - Crashes, detached targets, browser exit and transport errors end in explicit
   states. A restart is a user action that restores configuration and loads the
   URL once; it never replays clicks, typing or navigations. ADR 0008 adds
-  deadlines per device for navigations and unanswered input.
+  deadlines per device for navigations and unanswered input. ADR 0009 runs one
+  restart or close at a time and discards late results of a replaced runtime.
 - Closing the window waits for the worker to stop the browser and delete its
   profile, because GPUI 0.2.2 ends the process when its last Linux window closes.
+  A close during a restart starts no browser (ADR 0009).
 
 This is frame streaming into a native window, not an embedded browser surface.
 
