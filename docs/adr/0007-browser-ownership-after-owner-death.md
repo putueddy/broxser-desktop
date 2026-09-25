@@ -106,6 +106,10 @@ metadata files were readable by other local users; Chromium itself uses 0700.
   should Broxser then die too, the next start in that root recovers the profile.
 - A process in uninterruptible sleep can outlast the wait; the guardian still
   deletes the profile and exits with a failure status.
+- An unrelated process that keeps naming the profile, such as `tail -f` on a
+  file inside it, makes shutdown and the guardian wait the full five seconds and
+  report an error; they still delete the profile and never signal that process.
+  Recovery leaves such a profile for a later start.
 - The browser's helpers stopping with its main process is measured behavior,
   not a documented upstream guarantee; the live tests re-check it per update.
 - Static-mode preview directories (desktop screenshots) are outside this
