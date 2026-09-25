@@ -4,11 +4,12 @@
 # the request. It then kills the desktop with SIGKILL and with SIGINT to its
 # process group (Ctrl+C) while live frames stream, and with SIGTERM during a held
 # static capture: the browser guardian must stop the browser and remove its
-# profile (ADR 0007). Every run must leave no browser
-# process or profile behind, and the window must be gone. Needs an X11 display
-# (a desktop session or Xvfb), xdotool, python3, BROXSER_HELIUM_BIN and a built
-# desktop binary. It does not check rendering quality, Wayland, IME,
-# accessibility or a physical GPU.
+# profile (ADR 0007). Two runs kill the live browser and click Restart twice,
+# once followed by Ctrl+Q: at most one browser may start (ADR 0009). Every run
+# must leave no browser process or profile behind, and the window must be gone.
+# Needs an X11 display (a desktop session or Xvfb), xdotool, python3,
+# BROXSER_HELIUM_BIN and a built desktop binary. It does not check rendering
+# quality, Wayland, IME, accessibility or a physical GPU.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
 : "${DISPLAY:?set DISPLAY to an X11 display, for example Xvfb :99}"
@@ -18,9 +19,10 @@ binary=${BROXSER_DESKTOP_BIN:-target/debug/broxser-desktop}
 [[ -x $binary ]] || { echo "Build first: cargo build --locked -p broxser-desktop" >&2; exit 1; }
 
 work=$(mktemp -d)
-server=
+server= watcher=
 cleanup() {
   [[ -n $server ]] && kill "$server" 2>/dev/null || true
+  [[ -n $watcher ]] && kill "$watcher" 2>/dev/null || true
   rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -124,9 +126,90 @@ run() {
   esac
 }
 
+# Records the name of every browser profile created from now on, one line per
+# browser launch, in $1. Returns once it is watching.
+watch_profiles() {
+  python3 - "$TMPDIR" "$1" <<'PY' &
+import os, sys, time
+root, out = sys.argv[1], sys.argv[2]
+seen = {name for name in os.listdir(root) if name.startswith("broxser-cdp-")}
+open(out + ".ready", "w").close()
+while True:
+    for name in os.listdir(root):
+        if name.startswith("broxser-cdp-") and name not in seen:
+            seen.add(name)
+            with open(out, "a") as log:
+                log.write(name + "\n")
+    time.sleep(0.002)
+PY
+  watcher=$!
+  for _ in $(seq 100); do [[ -f $1.ready ]] && break; sleep 0.02; done
+}
+
+# Kills the owned browser, as a crash would, so that "Restart runtime" appears,
+# then clicks it twice without delay: one browser must start (ADR 0009). With
+# `quit`, Ctrl+Q follows the clicks at once: at most that browser may start, and
+# the window closes once it and the stopped runtime are gone.
+restart_run() {
+  local label=$1 quit=$2
+  local before app window browser launches loaded left_processes left_profiles code=0
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/live.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1)
+  xdotool windowsize "$window" 1360 861
+  for _ in $(seq 300); do
+    [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /live.html || true) -gt 0 ]] && break
+    sleep 0.1
+  done
+  sleep 1
+  # This instance's main browser is the desktop's child naming a private profile.
+  browser=$(pgrep -P "$app" -f -- "--user-data-dir=$TMPDIR/broxser-cdp-" || true)
+  [[ $(wc -w <<< "$browser") -eq 1 ]] || { echo "$label: expected one browser: $browser" >&2; return 1; }
+  kill -KILL "$browser"
+  # The runtime reports the stop after removing the profile.
+  for _ in $(seq 200); do
+    [[ -z $(find "$TMPDIR" -maxdepth 1 -name 'broxser-cdp-*' -print -quit) ]] && break
+    sleep 0.05
+  done
+  sleep 1
+  rm -f -- "$work/launches" "$work/launches.ready"
+  touch "$work/launches"
+  watch_profiles "$work/launches"
+  before=$(wc -l < "$work/requests")
+  # "Restart runtime" is the last control of the 44 px status bar, 24 px from
+  # the right edge of the 1360 × 861 window.
+  if [[ $quit == quit ]]; then
+    xdotool mousemove --window "$window" 1300 839 click --repeat 2 --delay 0 1 key --delay 0 ctrl+q
+  else
+    xdotool mousemove --window "$window" 1300 839 click --repeat 2 --delay 0 1
+    sleep 3
+    loaded=$(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /live.html || true)
+    [[ $loaded -gt 0 ]] || { echo "$label: the restarted runtime loaded nothing" >&2; return 1; }
+    xdotool mousemove --window "$window" 600 400 key ctrl+q
+  fi
+  timeout 15 tail -s 0.05 --pid="$app" -f /dev/null || { echo "$label: did not exit" >&2; return 1; }
+  wait "$app" || code=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  watcher=
+  launches=$(wc -l < "$work/launches")
+  read -r left_processes left_profiles _ < <(leftovers)
+  echo "$label: $launches browser(s) started by the restart; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]] || return 1
+  if [[ $quit == quit ]]; then [[ $launches -le 1 ]]; else [[ $launches -eq 1 ]]; fi
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
 run "live SIGINT to its process group" "/live.html" INT-group --url "http://127.0.0.1:$port/live.html"
 run "static SIGTERM during held request" "/hang" TERM --static --capture-on-start --url "http://127.0.0.1:$port/hang"
+restart_run "live Restart clicked twice" stay
+restart_run "live Restart clicked twice, then Ctrl+Q" quit
 echo "desktop smoke passed"

@@ -3,6 +3,7 @@
 //! browser surface. Pointer and wheel input go to the device under the pointer
 //! and keys to the selected device, in CSS pixels of that device's viewport.
 
+use crate::lifecycle::{AfterStop, CloseRequest, Lifecycle};
 use crate::url_input::{UrlEvent, UrlInput};
 use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT, WARN};
 use anyhow::{Context as _, Result};
@@ -44,7 +45,8 @@ pub(crate) struct LiveView {
     scale: f32,
     sync: SyncSettings,
     focus: FocusHandle,
-    closing: bool,
+    /// Restart and close, one at a time, and the current runtime's generation.
+    lifecycle: Lifecycle,
     notice: Option<String>,
     _url_events: Subscription,
     _focus_out: Subscription,
@@ -53,7 +55,8 @@ pub(crate) struct LiveView {
 #[derive(Default)]
 struct DeviceView {
     image: Option<Arc<RenderImage>>,
-    decoding: bool,
+    /// Generation of the frame being decoded, if any.
+    decoding: Option<u64>,
     /// Frame bounds from the last paint, used to map pointer positions.
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     hidden: bool,
@@ -101,7 +104,7 @@ impl LiveView {
             scale: 0.5,
             sync: SyncSettings::default(),
             focus,
-            closing: false,
+            lifecycle: Lifecycle::default(),
             notice: None,
             _url_events: url_events,
             _focus_out: focus_out,
@@ -111,7 +114,10 @@ impl LiveView {
     }
 
     /// Starts a browser for the workspace. Opening loads its URL once per device.
+    /// Runs only while no session is held: replacing one would drop a running
+    /// session, and wait for its browser, on the UI thread.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        debug_assert!(self.session.is_none() && self.lifecycle.is_live());
         let Some(executable) = self.browser.clone() else {
             self.notice =
                 Some("Helium not found. Set BROXSER_HELIUM_BIN or pass --browser.".into());
@@ -156,13 +162,19 @@ impl LiveView {
                 visible: false,
             });
         }
+        let generation = self.lifecycle.generation();
         cx.spawn_in(window, async move |this, cx| {
             while wakeups.next().await.is_some() {
                 queued.store(false, Ordering::Release);
-                if this
-                    .update_in(cx, |view, window, cx| view.pull(window, cx))
-                    .is_err()
-                {
+                // Wake-ups of a runtime that a restart or close stopped end here.
+                let current = this.update_in(cx, |view, window, cx| {
+                    let current = view.lifecycle.accepts(generation);
+                    if current {
+                        view.pull(window, cx);
+                    }
+                    current
+                });
+                if !matches!(current, Ok(true)) {
                     break;
                 }
             }
@@ -175,9 +187,10 @@ impl LiveView {
         let Some(session) = &self.session else {
             return;
         };
+        let generation = self.lifecycle.generation();
         let status = session.status();
         let frames: Vec<(usize, Frame)> = (0..self.devices.len())
-            .filter(|&index| !self.devices[index].decoding && !self.devices[index].hidden)
+            .filter(|&index| self.devices[index].decoding.is_none() && !self.devices[index].hidden)
             .filter_map(|index| Some((index, session.take_frame(index)?)))
             .collect();
         if status != self.status {
@@ -194,12 +207,12 @@ impl LiveView {
             cx.notify();
         }
         for (index, frame) in frames {
-            self.devices[index].decoding = true;
+            self.devices[index].decoding = Some(generation);
             let decoded = cx.background_executor().spawn(async move { decode(frame) });
             cx.spawn_in(window, async move |this, cx| {
                 let image = decoded.await;
                 this.update_in(cx, |view, window, cx| {
-                    view.show_frame(index, image, window, cx)
+                    view.show_frame(index, generation, image, window, cx)
                 })
                 .ok();
             })
@@ -210,12 +223,23 @@ impl LiveView {
     fn show_frame(
         &mut self,
         index: usize,
+        generation: u64,
         image: Result<Arc<RenderImage>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let device = &mut self.devices[index];
-        device.decoding = false;
+        if device.decoding == Some(generation) {
+            device.decoding = None;
+        }
+        if !self.lifecycle.accepts(generation) {
+            // A frame of a stopped runtime is released unseen and leaves the
+            // newer runtime's decode alone.
+            if let Ok(image) = image {
+                let _ = window.drop_image(image);
+            }
+            return;
+        }
         match image {
             // Every frame is a new GPUI image; release the previous atlas texture.
             Ok(image) if !device.hidden => {
@@ -429,7 +453,12 @@ impl LiveView {
         }
     }
 
+    /// Replaces a stopped runtime. Runs only while no other restart or close
+    /// runs; otherwise the request is dropped, not queued.
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.lifecycle.begin_restart() {
+            return;
+        }
         self.suppressed_keys.extend(self.held_keys.keys().cloned());
         self.held_keys.clear();
         for device in &mut self.devices {
@@ -445,48 +474,61 @@ impl LiveView {
             if let Some(image) = device.image.take() {
                 let _ = window.drop_image(image);
             }
-            device.decoding = false;
+            device.decoding = None;
         }
+        // Nothing of the previous runtime is shown while it stops.
+        self.status = Status::default();
+        self.notice = None;
         match self.session.take() {
-            Some(previous) => {
-                // Stop the previous browser off the UI thread, then start fresh.
-                let stopped = cx
-                    .background_executor()
-                    .spawn(async move { drop(previous) });
-                cx.spawn_in(window, async move |this, cx| {
-                    stopped.await;
-                    this.update_in(cx, |view, window, cx| {
-                        view.start(window, cx);
-                        cx.notify();
-                    })
-                    .ok();
-                })
-                .detach();
-            }
-            None => self.start(window, cx),
+            Some(previous) => self.stop_then_continue(previous, window, cx),
+            None => self.after_stop(window, cx),
         }
         cx.notify();
     }
 
-    /// Returns true if the window may close now. Otherwise stops the runtime and
-    /// removes the window after its browser and profile are gone: GPUI ends the
-    /// process as soon as the last window closes.
-    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.closing {
-            return false;
-        }
-        let Some(session) = self.session.take() else {
-            return true;
-        };
-        self.closing = true;
-        self.notice = Some("Closing after the live browser stops…".into());
-        cx.notify();
+    /// Stops `session` off the UI thread, then continues the restart or close
+    /// that took it.
+    fn stop_then_continue(
+        &mut self,
+        session: LiveSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let stopped = cx.background_executor().spawn(async move { drop(session) });
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             stopped.await;
-            let _ = cx.update(|window, _| window.remove_window());
+            this.update_in(cx, |view, window, cx| view.after_stop(window, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Starts the next runtime of a restart, or removes the window if a close
+    /// was requested meanwhile: nothing starts after a close.
+    fn after_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.lifecycle.stopped() {
+            AfterStop::Start => self.start(window, cx),
+            AfterStop::Close => window.remove_window(),
+        }
+        cx.notify();
+    }
+
+    /// Returns true if the window may close now. Otherwise stops the runtime, or
+    /// lets a running restart finish stopping the previous one, and removes the
+    /// window once the browser and profile are gone: GPUI ends the process as
+    /// soon as the last window closes.
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let request = self.lifecycle.begin_close(self.session.is_some());
+        if request == CloseRequest::Now {
+            return true;
+        }
+        self.notice = Some("Closing after the live browser stops…".into());
+        cx.notify();
+        if request == CloseRequest::Stop
+            && let Some(session) = self.session.take()
+        {
+            self.stop_then_continue(session, window, cx);
+        }
         false
     }
 
@@ -1006,6 +1048,9 @@ impl LiveView {
 
     fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let runtime = match &self.status.runtime {
+            _ if self.lifecycle.is_restarting() => {
+                "Restarting… stopping the previous browser".to_owned()
+            }
             RuntimeState::Starting => "Starting browser…".to_owned(),
             RuntimeState::Running { product, protocol } => {
                 format!("Live · {product} · CDP {protocol}")
@@ -1050,20 +1095,24 @@ impl LiveView {
                     .clone()
                     .map(|notice| div().text_color(rgb(WARN)).child(notice)),
             )
-            .when(stopped && !self.closing && self.browser.is_some(), |bar| {
-                bar.child(
-                    div()
-                        .id("restart")
-                        .cursor_pointer()
-                        .rounded_md()
-                        .bg(rgb(ACCENT))
-                        .text_color(rgb(BG))
-                        .px_3()
-                        .py_1()
-                        .child("Restart runtime")
-                        .on_click(cx.listener(|view, _, window, cx| view.restart(window, cx))),
-                )
-            })
+            // Offered only while no restart or close runs (ADR 0009).
+            .when(
+                stopped && self.lifecycle.is_live() && self.browser.is_some(),
+                |bar| {
+                    bar.child(
+                        div()
+                            .id("restart")
+                            .cursor_pointer()
+                            .rounded_md()
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(BG))
+                            .px_3()
+                            .py_1()
+                            .child("Restart runtime")
+                            .on_click(cx.listener(|view, _, window, cx| view.restart(window, cx))),
+                    )
+                },
+            )
     }
 }
 

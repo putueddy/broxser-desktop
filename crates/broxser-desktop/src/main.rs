@@ -1,3 +1,4 @@
+mod lifecycle;
 mod live_view;
 mod static_view;
 mod url_input;
