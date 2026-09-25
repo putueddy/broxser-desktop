@@ -171,9 +171,11 @@ Baca [System Design](docs/system-design.md), [dokumen Word](docs/system-design.d
 engine yang dapat diganti, format data portabel, update rutin serta maintainer utama
 dan backup; bukan janji bahwa API framework hari ini akan tetap sama sampai 2036.
 
-Urutan berikutnya: jalankan checklist desktop manual M1 di Wayland dan GPU nyata;
-lengkapi workflow harian dan recovery (M2); jalankan pilot tim; baru evaluasi
-penggantian subscription.
+Handoff dan backlog aktif untuk Claude Code ada di [GOALS.md](GOALS.md). Prioritas
+berikutnya ialah cleanup ketika proses induk mati, lalu deadline/restart runtime,
+kualifikasi input dan resource, serta workflow harian M2. Regresi UI X11 dan
+Wayland 112,5% sudah diperiksa; matriks hardware dan pengukuran performa lebih luas
+masih diperlukan sebelum pilot dan evaluasi penggantian subscription.
 Biaya maintenance internal perlu dibandingkan dengan penghematan seat berdasarkan
 data perusahaan. Tidak ada layanan cloud atau subscription Broxser yang diwajibkan.
 
