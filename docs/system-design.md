@@ -148,6 +148,21 @@ menutup window membatalkan capture dan menunggu cleanup. Deadline global job mas
 gate pilot. Tidak ada retry otomatis untuk navigasi atau aksi yang mungkin memberi
 efek samping.
 
+Di live session setiap command punya deadline dan milik satu device atau browser
+(ADR 0008). Navigasi yang dimulai Broxser (Go, Reload, sync, membuka workspace)
+yang belum commit, gagal atau berhenti dalam 30 detik dihentikan seperti tombol
+Stop dan dilaporkan pada device-nya, tanpa diulang; navigasi baru menggantikan
+yang lama. Reload mengikuti loader main frame: navigasi dokumen baru dengan
+loader berbeda mengakhiri deadline reload lama, sedangkan perubahan URL melalui
+History API tidak membuktikan request reload telah selesai. Device yang
+meninggalkan 32 event input tak terjawab, atau tidak
+menjawab input selama 15 detik, dilaporkan *not responding*; input baru untuknya
+dibuang, tidak diantrekan atau dikirim belakangan, sampai halaman menjawab lagi.
+Batas per device menjumlah ke tabel runtime, sehingga device lain tetap berjalan.
+Command yang dijawab proses browser sendiri harus terjawab dalam 15 detik; bila
+tidak, runtime berhenti dengan error eksplisit. Jawaban command yang tidak lagi
+ditunggu dibuang saat tiba.
+
 ## 6. API and data contracts
 
 | Kontrak | Makna |

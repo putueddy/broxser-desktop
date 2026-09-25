@@ -48,7 +48,11 @@ directory, which also remains after a normal close.
 
 Live input is forwarded only to the device the user targets. Sync never broadcasts
 typing, form submission, clicks or pointer events, never crosses sessions, and a
-restart restores configuration without replaying user actions.
+restart restores configuration without replaying user actions. Once a page stops
+answering, new input for it is dropped, not queued, so those clicks and keys cannot
+reach it seconds later; input already sent (at most 32 events) still arrives if
+the page recovers. A navigation Broxser started that gets no response in 30 seconds
+is stopped and never retried (ADR 0008).
 
 Link sync requires a trusted link report from the device's isolated main-frame
 execution context and the matching browser navigation request/loader. The binding
