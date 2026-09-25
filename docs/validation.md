@@ -24,6 +24,7 @@ reproducers were rebuilt against the updated engine as an additional check.
 | Cancellation during stalled websocket upgrade | Original fake CDP returns typed `Cancelled` in 59 ms after acceptance; direct tests require under 500 ms, and capture including teardown under one second |
 | Fragmented handshake | Valid headers separated by two gaps longer than 500 ms succeed within the overall deadline; expiry is separately tested |
 | Native X11 visual/input check | Passed under Xvfb with Lavapipe: frames visible, hiding the selected device selects the visible alternative, all-hidden state has no input target, hidden sidebar selection is ignored, and a held key does not repeat into a re-shown device |
+| Native Wayland visual/input check | Passed on Hyprland and the physical display at 112.5% scale, with `xwayland: false`: frame display, hide/show, visible selection, all-hidden state, key ownership and ignored hidden-row selection |
 | `scripts/desktop-smoke.sh` | Passed: live close exit 0 in 718 ms; static close during held request exit 0 in 667 ms; both went from 15 browser processes to 0 with no owned profiles remaining |
 | Integration with dependency PRs 1–3 | Scratch merge clean; 36 default tests and 3 live link-sync regression tests passed with tungstenite 0.30 and base64 0.23 |
 
@@ -41,10 +42,16 @@ after hiding all devices and re-showing the phone while `h` remained physically
 held, the phone received no repeated `h`. After key-up, fresh `d` and `e` reached
 the phone, including after an attempted selection of the still-hidden tablet.
 
-Physical Wayland visual/input verification of this revision remains pending because
-the local desktop session was locked. X11 software rendering is not a physical-GPU
-or latency qualification. Normal Wayland frame display and close were observed on
-the earlier PR revision during review. The System Design DOCX snapshot remains
+After the desktop session was unlocked, the updated native binary was rebuilt from
+`d5099fe` and checked on Wayland at 112.5% display scale. The compositor reported a
+native Wayland window (`xwayland: false`). Compositor-generated mouse and keyboard
+input exercised the same two-device fixture: phone logged `a`, tablet logged `b`
+and `bh`, then phone logged only fresh `ad` and `ade` after hide/show and key release.
+No `x` or held `h` reached the hidden/re-shown phone. Clicking the hidden tablet's
+sidebar label did not redirect the subsequent key. All-hidden state was displayed;
+normal window-manager close returned exit 0. Both GitHub CI jobs for `d5099fe`
+were successful. This is a visual/input regression check, not a latency benchmark
+or broad hardware/keyboard qualification. The System Design DOCX snapshot remains
 older than the Markdown ADRs.
 
 Keyboard suppression is conservative until a matching key-up. GPUI 0.2.2 exposes
