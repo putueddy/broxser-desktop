@@ -50,9 +50,14 @@ is answered by the browser process within 3 ms and closes the held request.
   that an action did not run.
 - **Navigation.** Each device follows at most one navigation that Broxser started
   (Go, Reload, sync, opening the workspace); a newer one replaces it, and the
-  older one's answer is discarded. A navigate ends with its answer; a reload ends
-  with the main frame's next commit, stop or same-document navigation after its
-  answer. If it has not ended within the load limit (30 s), Broxser sends
+  older one's answer is discarded. A navigate ends with its answer; a reload
+  follows the main-frame loader that the browser starts for it until commit or
+  loading stops. A matching commit before the reload's answer is remembered.
+  A later cross-document navigation with a different loader supersedes the
+  reload and retires its deadline, including when the page starts the replacement.
+  A navigation request alone, a subframe event or a same-document URL update
+  (including `history.pushState` and `history.replaceState`) does not end the
+  reload. If it has not ended within the load limit (30 s), Broxser sends
   `Page.stopLoading`, like the Stop button, and the device reports "Navigation got
   no response within 30 seconds; loading stopped, not retried". Navigations that
   the page starts itself (links, forms, scripts) keep the browser's behavior.
@@ -96,6 +101,10 @@ Default tests use a fake CDP peer: a flood of unanswered input on one device
 leaves the others running and drops input beyond the limit until the page
 answers; a single unanswered click is reported after the command limit; a
 navigation and a reload without an answer are stopped and not retried; a
-superseded navigation's late answer does not describe the new one. Helium tests
-hold a reload at the fixture and block a page's main thread. See
+superseded navigation's late answer does not describe the new one. Reload tests
+cover queued starts, commits before replies, page replacement before and after
+the reply, and unrelated request/subframe/same-document events. Helium tests
+hold a reload at the fixture, update the old document's URL through both History
+API methods, replace a reload through a trusted link or a script, and block a
+page's main thread. See
 `docs/validation.md` for results.

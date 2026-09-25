@@ -3,6 +3,39 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #7 reload ownership fixes, 25 September 2026 (local host)
+
+Linux x86_64, Omarchy, kernel `7.2.6-arch2-Watanare-T2-4-t2`, Rust 1.98.1,
+Helium 0.18.1.1 (`Chrome/154.0.8037.57`), unprivileged user and browser sandbox
+enabled. Review of PR head `7507b4a` reproduced two deadline bugs in Helium:
+
+| Before the fixes (load limit 2 s, observed after 3 s) | Result |
+| --- | --- |
+| Hold Reload, then follow a trusted link whose request is also held | The old reload's deadline canceled the replacement as well: two abandoned requests and a timeout error |
+| Hold Reload while the old document repeatedly calls `history.replaceState` | The deadline disappeared: `loading: true`, no error and the request remained open |
+
+Reloads now retain their main-frame loader identity. A distinct cross-document
+navigation retires the old deadline; History API updates, subframes and navigation
+requests without a start do not. Buffered starts from older commands cannot erase
+the latest Reload deadline, and late replies cannot restore a retired deadline or
+assign the old error to a replacement. Commit/stop/replacement observed before a
+reply is remembered, including when that reply never arrives.
+
+| Final verification | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI + 8 core + 57 engine + 4 desktop tests, format and strict Clippy; 22 live tests skipped by default |
+| Full live Helium suite with four test threads | Passed 22/22 in 55.30 s, including both new regression tests |
+| Held Reload with repeated `replaceState` / `pushState` | Stopped after 2025 / 2037 ms; request closed once without retry |
+| Held Reload replaced by a trusted link / script navigation | Only the original request canceled; replacement remained loading beyond the old deadline without error; a subsequent explicit Reload got its own deadline |
+| Fake CDP ordering and isolation regressions | Passed: queued reload starts with an interleaved page navigation, stale commit, early/late/missing replies, stale error, main-frame stop, request-only/subframe/same-document events and repeated loader notifications |
+
+One default run failed in the unchanged
+`guardian_waits_for_helpers_started_after_its_owner_died` test at its pre-kill
+process-alive assertion. A full rerun passed without changes to guardian code or
+that test; the intermittent failure's cause was not established. The first two
+Helium reproducers failed on the reviewed head as shown above. No GUI code changed;
+a new window/Wayland/GPU check was not run for these engine fixes.
+
 ## P1.1 live command and navigation deadlines, 25 September 2026 (cloud container)
 
 Same container and toolchain as P0 below, restarted before this work: Rust 1.98.1,

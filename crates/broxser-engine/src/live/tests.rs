@@ -7,6 +7,9 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[path = "navigation_deadlines.rs"]
+mod navigation_deadlines;
+
 #[test]
 fn keys_map_to_dom_values_and_text() {
     let none = Modifiers::default();
@@ -208,14 +211,23 @@ fn early_extension_event_rejects_live_before_navigation() {
 struct FakePeer {
     received: Requests,
     released: Arc<AtomicBool>,
+    events: std::sync::mpsc::Sender<Value>,
     server: Option<thread::JoinHandle<()>>,
 }
 
-/// Method and session of every request, in arrival order.
-type Requests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+/// Method, session and command ID of every request, in arrival order.
+type Requests = Arc<Mutex<Vec<(String, Option<String>, u64)>>>;
 
 impl FakePeer {
     fn start(root: &Path, hold: impl Fn(&str, Option<&str>) -> bool + Send + 'static) -> Self {
+        Self::start_with_events(root, hold, |_, _| Vec::new())
+    }
+
+    fn start_with_events(
+        root: &Path,
+        hold: impl Fn(&str, Option<&str>) -> bool + Send + 'static,
+        before_reply: impl Fn(&str, Option<&str>) -> Vec<Value> + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         std::fs::write(
             root.join("fake-cdp-port"),
@@ -224,6 +236,7 @@ impl FakePeer {
         .unwrap();
         let received = Arc::new(Mutex::new(Vec::new()));
         let released = Arc::new(AtomicBool::new(false));
+        let (events, event_receiver) = std::sync::mpsc::channel::<Value>();
         let (log, release) = (Arc::clone(&received), Arc::clone(&released));
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -235,6 +248,14 @@ impl FakePeer {
             let (mut contexts, mut targets, mut loaders) = (0, 0, 0);
             let mut held = Vec::new();
             loop {
+                for event in event_receiver.try_iter() {
+                    if socket
+                        .send(tungstenite::Message::Text(event.to_string().into()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 if release.load(Ordering::SeqCst) {
                     for reply in held.drain(..) {
                         if socket.send(reply).is_err() {
@@ -259,7 +280,11 @@ impl FakePeer {
                 };
                 let method = request["method"].as_str().unwrap_or_default().to_owned();
                 let session = request["sessionId"].as_str().map(str::to_owned);
-                log.lock().unwrap().push((method.clone(), session.clone()));
+                log.lock().unwrap().push((
+                    method.clone(),
+                    session.clone(),
+                    request["id"].as_u64().unwrap(),
+                ));
                 let result = match method.as_str() {
                     "Browser.getVersion" => json!({"product":"Fake/1.0", "protocolVersion":"1.3"}),
                     "Target.createBrowserContext" => {
@@ -289,6 +314,14 @@ impl FakePeer {
                             .into(),
                     )
                 };
+                for event in before_reply(&method, session.as_deref()) {
+                    if socket
+                        .send(tungstenite::Message::Text(event.to_string().into()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 if hold(&method, session.as_deref()) && !release.load(Ordering::SeqCst) {
                     let mut result = result;
                     if method == "Page.navigate" {
@@ -303,6 +336,7 @@ impl FakePeer {
         Self {
             received,
             released,
+            events,
             server: Some(server),
         }
     }
@@ -313,13 +347,28 @@ impl FakePeer {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(m, s)| m == method && s.as_deref() == Some(session))
+            .filter(|(m, s, _)| m == method && s.as_deref() == Some(session))
             .count()
+    }
+
+    fn last_request_id(&self, method: &str, session: &str) -> u64 {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(m, s, _)| m == method && s.as_deref() == Some(session))
+            .unwrap()
+            .2
     }
 
     /// Sends every held reply and stops holding, as a page that answers again.
     fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
+    }
+
+    fn event(&self, event: Value) {
+        self.events.send(event).unwrap();
     }
 }
 

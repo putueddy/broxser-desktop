@@ -555,9 +555,15 @@ struct Navigation {
     /// The navigate or reload command while its answer is outstanding.
     command: Option<u64>,
     /// `Page.navigate` answers once the navigation commits or fails, but
-    /// `Page.reload` as soon as it starts. A reload therefore ends with the
-    /// main frame's next commit or stop after that answer.
+    /// `Page.reload` as soon as it starts. A reload follows its main-frame
+    /// loader until commit, stop or replacement by another document navigation.
     reload: bool,
+    /// Main-frame loader started by this reload. A later, distinct loader can
+    /// replace it without inheriting its deadline.
+    reload_loader: Option<String>,
+    /// Its document committed, loading stopped or another loader started before the reply.
+    /// A later reload start can still identify this command's own loader.
+    settled_before_reply: bool,
     deadline: Instant,
 }
 
@@ -846,6 +852,8 @@ impl<'a> Controller<'a> {
         self.devices[index].navigation = Some(Navigation {
             command: Some(id),
             reload: method == "Page.reload",
+            reload_loader: None,
+            settled_before_reply: false,
             deadline: Instant::now() + self.limits.load,
         });
         let unresponsive = self.devices[index].unresponsive;
@@ -904,9 +912,9 @@ impl<'a> Controller<'a> {
         device.unresponsive = false;
     }
 
-    /// The main frame of device `index` committed, stopped loading or moved
-    /// within its document. That ends a started reload; a navigate command
-    /// ends with its own answer instead.
+    /// The main frame of device `index` committed or stopped loading. That
+    /// ends an acknowledged reload; a navigate command ends with its answer.
+    /// A History API URL change is not evidence that a pending reload ended.
     fn navigation_settled(&mut self, index: usize) {
         let device = &mut self.devices[index];
         if device
@@ -981,19 +989,28 @@ impl<'a> Controller<'a> {
                 .as_ref()
                 .is_some_and(|navigation| now >= navigation.deadline)
             {
+                let settled_before_reply =
+                    self.devices[index]
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|navigation| {
+                            navigation.command.is_some() && navigation.settled_before_reply
+                        });
                 self.forget_navigation(index);
-                let session = self.devices[index].session.clone();
-                // Like the Stop button: the page keeps its current document.
-                self.cdp
-                    .send_ignored("Page.stopLoading", json!({}), Some(&session))?;
-                let error = format!(
-                    "Navigation got no response within {} seconds; loading stopped, not retried",
-                    self.limits.load.as_secs_f32()
-                );
-                self.shared.device(index, |status| {
-                    status.loading = false;
-                    status.error = Some(error);
-                });
+                if !settled_before_reply {
+                    let session = self.devices[index].session.clone();
+                    // Like the Stop button: the page keeps its current document.
+                    self.cdp
+                        .send_ignored("Page.stopLoading", json!({}), Some(&session))?;
+                    let error = format!(
+                        "Navigation got no response within {} seconds; loading stopped, not retried",
+                        self.limits.load.as_secs_f32()
+                    );
+                    self.shared.device(index, |status| {
+                        status.loading = false;
+                        status.error = Some(error);
+                    });
+                }
             }
             let device = &self.devices[index];
             if !device.unresponsive
@@ -1274,13 +1291,17 @@ impl<'a> Controller<'a> {
                         Err(error) => Some(format!("{error:#}")),
                     };
                     let navigation = &mut self.devices[device].navigation;
+                    let settled_before_reply = navigation
+                        .as_ref()
+                        .is_some_and(|started| started.reload && started.settled_before_reply);
                     match navigation {
+                        Some(_) if settled_before_reply => *navigation = None,
                         Some(started) if started.reload && error.is_none() => {
-                            started.command = None
+                            started.command = None;
                         }
                         _ => *navigation = None,
                     }
-                    if let Some(error) = error {
+                    if let Some(error) = error.filter(|_| !settled_before_reply) {
                         self.shared.device(device, |status| {
                             status.error = Some(error);
                             status.loading = false;
@@ -1453,7 +1474,19 @@ impl<'a> Controller<'a> {
             {
                 let loading = event.method == "Page.frameStartedLoading";
                 if !loading {
-                    self.navigation_settled(index);
+                    let navigation = &mut self.devices[index].navigation;
+                    let reload_started = navigation
+                        .as_ref()
+                        .is_some_and(|started| started.reload && started.reload_loader.is_some());
+                    if reload_started
+                        && let Some(started) = navigation
+                        && started.command.is_some()
+                    {
+                        started.settled_before_reply = true;
+                    }
+                    if reload_started {
+                        self.navigation_settled(index);
+                    }
                 }
                 self.shared.device(index, |device| device.loading = loading);
             }
@@ -1483,6 +1516,55 @@ impl<'a> Controller<'a> {
             "Page.frameStartedNavigating"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
+                if let (Some(loader), Some(kind)) = (
+                    text("loaderId").filter(|loader| !loader.is_empty()),
+                    text("navigationType"),
+                ) {
+                    let replaced_reload = self.devices[index]
+                        .navigation
+                        .as_mut()
+                        .filter(|navigation| navigation.reload)
+                        .is_some_and(|navigation| match kind {
+                            "sameDocument" | "historySameDocument" => false,
+                            "reload" | "reloadBypassingCache" => {
+                                if navigation.command.is_some() {
+                                    // A prior Reload can start after a newer
+                                    // command was sent. The last reload start
+                                    // before this command's reply is its loader.
+                                    if navigation.reload_loader.as_deref() != Some(loader) {
+                                        navigation.settled_before_reply = false;
+                                    }
+                                    navigation.reload_loader = Some(loader.to_owned());
+                                    false
+                                } else if let Some(started) = &navigation.reload_loader {
+                                    started != loader
+                                } else {
+                                    navigation.reload_loader = Some(loader.to_owned());
+                                    false
+                                }
+                            }
+                            "differentDocument"
+                            | "historyDifferentDocument"
+                            | "restore"
+                            | "restoreWithPost" => navigation
+                                .reload_loader
+                                .as_deref()
+                                .is_some_and(|started| started != loader),
+                            _ => false,
+                        });
+                    if replaced_reload {
+                        if let Some(navigation) = &mut self.devices[index].navigation
+                            && navigation.command.is_some()
+                        {
+                            // Another queued Reload can still start before
+                            // this command's reply and take ownership back.
+                            navigation.settled_before_reply = true;
+                        } else {
+                            // The acknowledged reload has been replaced.
+                            self.forget_navigation(index);
+                        }
+                    }
+                }
                 let device = &mut self.devices[index];
                 device.link_navigation =
                     match (device.requested_link.take(), text("url"), text("loaderId")) {
@@ -1504,7 +1586,6 @@ impl<'a> Controller<'a> {
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
                 let url = text("url").unwrap_or_default().to_owned();
-                self.navigation_settled(index);
                 self.devices[index].link_intent = None;
                 self.devices[index].requested_link = None;
                 self.devices[index].link_navigation = None;
@@ -1527,7 +1608,24 @@ impl<'a> Controller<'a> {
                     .to_owned();
                 // A new document answers input again; the old one's is moot.
                 self.forget_input(index);
-                self.navigation_settled(index);
+                let matches_reload =
+                    self.devices[index]
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|started| {
+                            started.reload
+                                && frame.get("loaderId").and_then(Value::as_str).is_some_and(
+                                    |loader| started.reload_loader.as_deref() == Some(loader),
+                                )
+                        });
+                if matches_reload {
+                    if let Some(started) = &mut self.devices[index].navigation
+                        && started.command.is_some()
+                    {
+                        started.settled_before_reply = true;
+                    }
+                    self.navigation_settled(index);
+                }
                 let device = &mut self.devices[index];
                 device.generation += 1;
                 device.wheel = None;
