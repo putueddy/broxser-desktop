@@ -5,10 +5,10 @@ in docs/system-design.md include runtime updates, crash cleanup, recovery,
 permissions, and a pilot with representative company applications.
 
 The browser subprocess keeps Chromium's sandbox enabled, uses a private temporary
-profile, and exposes CDP on a random loopback port. CDP can control every page in
-that subprocess. Loopback prevents remote network access, but does not authenticate
-other processes running locally. Never forward or expose the port, and never reuse
-a personal browser profile. A pipe transport is a planned hardening option.
+profile (mode 0700), and exposes CDP on a random loopback port. CDP can control every
+page in that subprocess. Loopback prevents remote network access, but does not
+authenticate other processes running locally. Never forward or expose the port, and
+never reuse a personal browser profile. A pipe transport is a planned hardening option.
 
 Broxser seeds only its own new profile: Helium's bundled content blocker is kept
 out of session contexts (ADR 0004), and extension pages inside those contexts stop
@@ -22,11 +22,29 @@ with cookies or page content. Chromium still opens the user's shared NSS
 certificate database, which may hold corporate CAs and client certificates;
 whether to isolate it is an open decision.
 
-Cleanup runs on normal close, errors and cancellation. If the Broxser process is
-killed or crashes, the browser keeps running with its loopback CDP port and the
-temporary profile remains until removed; this gate is open. It matters more in live
-mode, where one browser stays up per open workspace and holds the sessions' cookies
-and storage until the window closes.
+Cleanup runs on normal close, errors and cancellation. Every cleanup path deletes
+the profile only once no running process names it, so a Helium helper that is
+still stopping cannot write profile files back afterwards. If the Broxser process is
+killed (SIGKILL, SIGTERM, Ctrl+C) or crashes, a guardian process started before each
+browser notices that its pipe from Broxser closed, stops that browser (a pidfd plus
+the recorded start time, so a reused PID is never signaled), waits for its helpers
+and deletes the profile if its lease still names the same owner (ADR 0007).
+Measured in tests: browser, CDP endpoint and profile gone 38–105 ms after the
+owner died. The guardian runs in its own session and never signals processes it did
+not record or that do not carry that profile's `--user-data-dir` argument.
+
+If the guardian dies together with Broxser, for example when a whole cgroup is
+killed or power is lost, the profile stays until the next browser start in the same
+profile root. That start only removes profiles it can prove stale: a real directory
+owned by the user with a valid lease whose boot ID changed, or whose owner and
+guardian are gone in the same PID namespace. It stops a recorded browser only if that
+process still runs with the profile's argument. Symlinks, other users' directories,
+unleased or unknown-version entries and profiles still named by any process are
+left alone. Neither path replays user actions. Live mode keeps one browser per open
+workspace, holding the sessions' cookies and storage until the window closes.
+Not covered yet: static-mode preview directories (screenshots) after the desktop is
+killed, and Chromium's `org.chromium.Chromium.*` socket directory in the temporary
+directory, which also remains after a normal close.
 
 Live input is forwarded only to the device the user targets. Sync never broadcasts
 typing, form submission, clicks or pointer events, never crosses sessions, and a

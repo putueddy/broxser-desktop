@@ -52,6 +52,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // Browser guardians are this executable started again (ADR 0007).
+    broxser_engine::run_guardian_if_requested();
     match Cli::parse().command {
         Command::Init { path } => {
             let workspace = Workspace::demo();

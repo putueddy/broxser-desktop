@@ -106,6 +106,19 @@ Selesaikan milestone ini sebagai PR pertama. Jika muncul batas upstream/platform
 yang nyata, sertakan reproducer dan keputusan yang konkret, lalu lanjutkan bagian
 independen yang dapat diselesaikan. Jangan menandai pekerjaan blocked sebagai done.
 
+**Status P0 (25 September 2026, menunggu review PR):** guardian per browser, lease
+profil dan recovery stale profile diimplementasikan menurut
+[ADR 0007](docs/adr/0007-browser-ownership-after-owner-death.md). Reproducer
+subprocess (fake browser dan Helium), tes CLI dan smoke X11 membuktikan cleanup
+38–105 ms sesudah SIGKILL, SIGTERM, `abort()` atau Ctrl+C induk, termasuk saat
+teardown; instance lain dan file workspace tidak berubah. Profil kini mode 0700.
+CI run #29 menemukan helper Helium yang menulis ulang profil sesudah dihapus;
+semua jalur cleanup kini menunggu sampai tidak ada proses yang menyebut profil.
+Bukti dan batas ada di `docs/validation.md`. Sisa di luar lingkup PR itu: direktori
+preview mode statis dan direktori socket `org.chromium.Chromium.*` masih tertinggal
+(yang kedua juga pada close normal), serta kualifikasi skenario kill di Wayland,
+GPU fisik, distro dan kernel perusahaan.
+
 ### Backlog sesudah P0
 
 | Urutan | Pekerjaan | Hasil atau gate yang diperlukan |
@@ -207,7 +220,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
 - [x] PR #1–#4 merged; dependency dan implementasi M1 berada di main.
 - [x] Frame live, input dasar, trusted link/scroll sync dan keenam perbaikan review.
 - [x] Gabungan source diuji: 40 tes lokal, 14 tes live Helium; bukti X11/Wayland tersedia.
-- [ ] P0 — cleanup browser/CDP/profil ketika induk mati, serta stale-profile recovery.
+- [x] P0 — cleanup browser/CDP/profil ketika induk mati, serta stale-profile recovery
+  (ADR 0007; PR menunggu review; sisa temp dir non-profil tercatat di status P0).
 - [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates.
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.

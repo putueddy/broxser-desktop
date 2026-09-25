@@ -1,16 +1,59 @@
 //! Test-owned fixtures: an HTTP server on a random loopback port, fake browser
-//! executables, and cleanup assertions scoped to a unique profile root so tests
-//! running in parallel never inspect each other's processes or files.
+//! executables, re-executed test binaries in other roles, and cleanup assertions
+//! scoped to a unique profile root so tests running in parallel never inspect
+//! each other's processes or files.
 
 use crate::browser::{self, ProcessIdentity};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Names the role of a re-executed test binary; see [`subprocess_role`].
+const ROLE: &str = "BROXSER_TEST_ROLE";
+/// Teardown point at which an owner-role process aborts; see [`abort_point`].
+pub(crate) const ABORT_AT: &str = "BROXSER_TEST_ABORT_AT";
+
+/// This test binary again, running only [`subprocess_role`] as `role`. libtest
+/// offers no other entry point, so the role travels in the environment and the
+/// child's stdout starts with libtest's own lines. Production binaries start
+/// their guardian through `run_guardian_if_requested` instead.
+pub(crate) fn role_command(role: &str) -> Command {
+    let mut command = Command::new("/proc/self/exe");
+    command
+        .args([
+            "test_support::subprocess_role",
+            "--exact",
+            "--nocapture",
+            "--quiet",
+            "--test-threads=1",
+        ])
+        .env(ROLE, role);
+    command
+}
+
+/// Entry point of re-executed test binaries; does nothing in an ordinary run.
+#[test]
+fn subprocess_role() {
+    match std::env::var(ROLE).as_deref() {
+        Ok("guardian") => std::process::exit(crate::guardian::main()),
+        Ok("owner") => crate::guardian::tests::owner_role(),
+        _ => {}
+    }
+}
+
+/// Aborts at `point` of browser teardown when an owner-role test asks for it,
+/// as if Broxser crashed halfway through its own cleanup.
+pub(crate) fn abort_point(point: &str) {
+    if std::env::var_os(ABORT_AT).is_some_and(|at| at == point) {
+        std::process::abort();
+    }
+}
 
 /// Browser for `#[ignore]` live tests: Helium, or an explicitly chosen Chromium
 /// for comparison. Chromium refuses to run as root without `--no-sandbox`, which
@@ -280,6 +323,7 @@ pub(crate) fn fake_browser(kind: FakeBrowser) -> PathBuf {
         .join(match kind {
             FakeBrowser::NeverReady => "never-ready",
             FakeBrowser::LoopbackEndpoint => "loopback-endpoint",
+            FakeBrowser::LateHelper => "late-helper",
         })
 }
 
@@ -288,6 +332,9 @@ pub(crate) enum FakeBrowser {
     NeverReady,
     /// Publishes `<profile root>/fake-cdp-port` as its endpoint.
     LoopbackEndpoint,
+    /// Never publishes an endpoint; once it is gone, a process that did not
+    /// exist before writes into the profile for about 0.3 seconds.
+    LateHelper,
 }
 
 /// How a fake CDP websocket peer behaves after its (optionally delayed) handshake.

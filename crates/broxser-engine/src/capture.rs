@@ -93,7 +93,7 @@ pub(crate) struct Diagnostics {
     pub extension_targets: BTreeSet<String>,
     /// (device ID, browser context ID) in workspace order.
     pub contexts: Vec<(String, String)>,
-    /// Browser processes observed just before cleanup.
+    /// Browser processes and their guardian, observed just before cleanup.
     pub processes: Vec<ProcessIdentity>,
 }
 
@@ -159,6 +159,7 @@ fn run_with(
         Err(error) => Err(error),
     };
     diagnostics.processes = browser.processes();
+    diagnostics.processes.extend(browser.guardian());
     let cleanup = browser.shutdown();
     match (captured, cleanup) {
         (Ok(report), Ok(())) => Ok(report),

@@ -67,9 +67,22 @@ deterministik untuk capture statis.
 
 Mode statis: tambahkan `--static`, lalu **Capture previews** atau `Ctrl+R`; opsi
 `--capture-on-start` hanya untuk mode ini. Menutup window saat capture berjalan
-membatalkannya dan menunggu cleanup (sekitar setengah detik). Jika proses Broxser
-dibunuh (SIGTERM/SIGKILL) atau crash, pembersihan tidak berjalan dan browser dapat
-tertinggal. URL dapat diganti lewat `--url http://localhost:3000` atau file workspace.
+membatalkannya dan menunggu cleanup (sekitar setengah detik). URL dapat diganti
+lewat `--url http://localhost:3000` atau file workspace.
+
+Jika proses Broxser dibunuh (SIGKILL, SIGTERM, Ctrl+C) atau crash, **guardian**
+kecil milik setiap browser menghentikan browser itu beserta helper-nya, menutup
+endpoint CDP dan menghapus profilnya; di lingkungan uji selesai 38–105 ms setelah
+induk mati (target lima detik). Guardian adalah executable Broxser yang sama dan
+berjalan di session sendiri. Ia hanya menghentikan browser yang dicatat dengan PID
+dan waktu mulai, atau proses yang diluncurkan dengan `--user-data-dir` profil
+privat itu. Bila guardian ikut mati (misalnya seluruh cgroup dibunuh atau listrik
+padam), profil dinyatakan stale dan dihapus pada start berikutnya di root yang sama;
+browser yatim yang masih memakai profil itu dihentikan. Recovery tidak memutar ulang
+klik, ketikan atau navigasi. Belum tercakup: direktori preview mode statis setelah
+desktop dibunuh, dan direktori socket `org.chromium.Chromium.*` di temp dir yang
+juga tertinggal pada close normal. Lihat
+[ADR 0007](docs/adr/0007-browser-ownership-after-owner-death.md).
 
 Sync link memakai observer terisolasi, bukan asumsi bahwa setiap navigasi setelah
 mengetik berasal dari pengguna. Link lambat tetap dapat tersinkron; URL melebihi
@@ -106,14 +119,18 @@ Session bersifat sementara: dua device dengan ID session sama berbagi cookie dal
 satu capture; refresh membuat session baru. Halaman di session Broxser dirender tanpa
 content blocker bawaan Helium; fitur privasi Helium lain tetap aktif. Core dump
 kernel dari Broxser dan browser-nya tidak memuat isi memori; laporan crash Chromium
-disimpan di profil privat dan ikut terhapus.
+disimpan di profil privat (mode 0700) dan ikut terhapus.
+
+Binary lain yang memakai `broxser-engine` wajib memanggil
+`broxser_engine::run_guardian_if_requested()` di awal `main`; tanpa itu engine
+menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 
 ## Isi repo
 
 | Path | Tanggung jawab |
 | --- | --- |
 | `crates/broxser-core` | Workspace v1, validasi, atomic save dan aturan sync tanpa UI/browser |
-| `crates/broxser-engine` | Owned Helium process, CDP, session context, PNG capture dan live session (screencast, input, sync) |
+| `crates/broxser-engine` | Owned Helium process dan guardian-nya, lease profil, CDP, session context, PNG capture dan live session (screencast, input, sync) |
 | `crates/broxser-desktop` | Shell GPUI: frame live, URL bar, input, sync, status; mode capture statis |
 | `crates/broxser-cli` | Init, validate, doctor dan export capture |
 | `examples/` | Workspace contoh, fixture responsif (`index.html`) dan fixture live (`live.html`) |
@@ -143,9 +160,19 @@ browser. Reproducer dapat diulang dengan `BROXSER_REPRO_ITERATIONS`,
 `BROXSER_REPRO_DELAY_MS`, dan `BROXSER_REPRO_BASELINE=1` untuk membandingkan perilaku
 sebelum perbaikan.
 
+Reproducer kematian induk menjalankan ulang binary tes sebagai "owner" yang memakai
+API engine biasa, lalu membunuhnya dengan SIGKILL, SIGTERM, `abort()` atau SIGTERM ke
+process group-nya saat startup, request tertahan, live frame aktif dan di tengah
+teardown. Tes memeriksa bahwa browser, guardian dan profil owner itu hilang dalam
+lima detik sementara instance lain di root yang sama tetap berjalan. Tes default
+memakai fake browser; varian Helium termasuk dalam suite `--ignored`. Tes CLI
+membunuh binary `broxser` asli saat capture.
+
 Pemeriksaan window X11 (sesi desktop atau Xvfb, perlu `xdotool`) membuka mode live,
-menutupnya, lalu menutup capture statis saat request ditahan, dan gagal bila ada
-proses browser atau profil yang tertinggal:
+menutupnya, lalu menutup capture statis saat request ditahan. Setelah itu desktop
+dibunuh dengan SIGKILL dan dengan SIGINT ke process group-nya (Ctrl+C) saat live,
+serta SIGTERM saat capture statis tertahan. Skrip gagal bila ada proses browser,
+profil atau window yang tertinggal:
 
 ```bash
 cargo build --locked -p broxser-desktop
@@ -171,11 +198,12 @@ Baca [System Design](docs/system-design.md), [dokumen Word](docs/system-design.d
 engine yang dapat diganti, format data portabel, update rutin serta maintainer utama
 dan backup; bukan janji bahwa API framework hari ini akan tetap sama sampai 2036.
 
-Handoff dan backlog aktif untuk Claude Code ada di [GOALS.md](GOALS.md). Prioritas
-berikutnya ialah cleanup ketika proses induk mati, lalu deadline/restart runtime,
-kualifikasi input dan resource, serta workflow harian M2. Regresi UI X11 dan
-Wayland 112,5% sudah diperiksa; matriks hardware dan pengukuran performa lebih luas
-masih diperlukan sebelum pilot dan evaluasi penggantian subscription.
+Handoff dan backlog aktif untuk Claude Code ada di [GOALS.md](GOALS.md). Cleanup
+ketika proses induk mati (P0) diimplementasikan melalui guardian dan lease profil;
+prioritas berikutnya ialah deadline/restart runtime, kualifikasi input dan resource,
+serta workflow harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
+hardware dan pengukuran performa lebih luas masih diperlukan sebelum pilot dan
+evaluasi penggantian subscription.
 Biaya maintenance internal perlu dibandingkan dengan penghematan seat berdasarkan
 data perusahaan. Tidak ada layanan cloud atau subscription Broxser yang diwajibkan.
 
