@@ -1,0 +1,16 @@
+#!/bin/sh
+# Fake browser for engine tests: never publishes a CDP endpoint and starts a
+# helper that names the profile, like Chromium's crash handler. Once the browser
+# has exited (reaped or not), the helper hands over to a new process that writes
+# into the profile, creating missing directories, as Chromium helpers do while
+# shutting down. That writer did not exist when the owner recorded the browser's
+# processes.
+for arg in "$@"; do case "$arg" in --user-data-dir=*) dir=${arg#--user-data-dir=} ;; esac; done
+sh -c '
+  while read -r stat 2>/dev/null < "/proc/$1/stat"; do
+    case "$stat" in *") Z "*) break ;; esac
+    sleep 0.02
+  done
+  sh -c "sleep 0.3; mkdir -p \"\$1/Default\"; echo late > \"\$1/Default/Late\"" late-writer "$2" &
+' late-helper "$$" "$dir" &
+exec sleep 60

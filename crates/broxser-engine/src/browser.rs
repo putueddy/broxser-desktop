@@ -197,12 +197,18 @@ impl BrowserProcess {
         let processes = self.processes();
         let _ = self.child.kill();
         self.child.wait().context("wait for browser exit")?;
-        let survivors = wait_for_exit(&processes, EXIT_TIMEOUT);
+        let survivors = match &self.profile {
+            Some(profile) => wait_for_release(&processes, profile.path(), EXIT_TIMEOUT),
+            None => wait_for_exit(&processes, EXIT_TIMEOUT),
+        };
         #[cfg(test)]
         crate::test_support::abort_point("before-remove");
         let removal = self.profile.take().map_or(Ok(()), OwnedProfile::close);
         if survivors > 0 {
-            bail!("{survivors} browser processes did not exit after the browser was stopped");
+            bail!(
+                "{survivors} processes of the browser or naming its profile did not exit after \
+                 the browser was stopped"
+            );
         }
         removal
     }
@@ -219,7 +225,7 @@ impl Drop for BrowserProcess {
         processes.extend(referencing(profile.path()));
         let _ = self.child.kill();
         let _ = self.child.wait();
-        wait_for_exit(&processes, EXIT_TIMEOUT);
+        wait_for_release(&processes, profile.path(), EXIT_TIMEOUT);
         // Removes the profile, then releases the guardian.
         drop(profile);
     }
@@ -438,6 +444,37 @@ pub(crate) fn referencing(path: &Path) -> Vec<ProcessIdentity> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn referencing(_path: &Path) -> Vec<ProcessIdentity> {
     Vec::new()
+}
+
+/// Waits until none of `processes` runs and no running process names `profile`
+/// any more; only then may the profile be removed. Every Helium process carries
+/// the profile in its command line, including detached helpers and helpers the
+/// browser started after `processes` was recorded, which otherwise re-create
+/// profile directories while they shut down. Once none is left, nothing of that
+/// browser can start another. Returns how many still ran at the deadline.
+pub(crate) fn wait_for_release(
+    processes: &[ProcessIdentity],
+    profile: &Path,
+    timeout: Duration,
+) -> usize {
+    let deadline = Instant::now() + timeout;
+    let mut waiting = processes.to_vec();
+    loop {
+        let running = wait_for_exit(&waiting, deadline.saturating_duration_since(Instant::now()));
+        let naming = referencing(profile);
+        if running == 0 && naming.is_empty() {
+            return 0;
+        }
+        waiting.retain(is_running);
+        for process in naming {
+            if !waiting.contains(&process) {
+                waiting.push(process);
+            }
+        }
+        if Instant::now() >= deadline {
+            return waiting.len();
+        }
+    }
 }
 
 /// Waits until none of `processes` is running. Returns how many still run.

@@ -342,7 +342,7 @@ fn recover(profile: &Path, lease: &Lease, host: &Host) {
         let mut processes = browser::descendants(&orphan);
         processes.extend(browser::referencing(profile));
         let _ = browser::terminate(&orphan);
-        browser::wait_for_exit(&processes, EXIT_TIMEOUT);
+        browser::wait_for_release(&processes, profile, EXIT_TIMEOUT);
     }
     if browser::referencing(profile).is_empty() {
         let _ = remove_profile(profile);

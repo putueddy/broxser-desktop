@@ -436,6 +436,71 @@ fn next_start_recovers_the_profile_of_a_killed_process_tree() {
     assert_cleaned_up(root.path(), &next_processes);
 }
 
+/// Outlasts the late writer of [`FakeBrowser::LateHelper`] and checks that the
+/// removed profile was not written again.
+fn assert_stays_removed(profile: &Path) {
+    thread::sleep(Duration::from_millis(600));
+    assert!(
+        fs::symlink_metadata(profile).is_err(),
+        "the profile was written again after its removal: {:?}",
+        fs::read_dir(profile).map(|entries| entries
+            .filter_map(|entry| Some(entry.ok()?.file_name()))
+            .collect::<Vec<_>>())
+    );
+}
+
+/// Waits until the helper of [`FakeBrowser::LateHelper`] runs. The fake browser
+/// names the profile itself until it execs, so only the helper's own name counts.
+fn wait_for_helper(profile: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !browser::referencing(profile).iter().any(|process| {
+        fs::read(format!("/proc/{}/cmdline", process.pid)).is_ok_and(|cmdline| {
+            cmdline
+                .split(|&byte| byte == 0)
+                .any(|arg| arg == b"late-helper")
+        })
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "the fake browser's helper never started"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn shutdown_waits_for_helpers_started_after_its_snapshot() {
+    let root = profile_root();
+    let browser = BrowserProcess::start(
+        &options(fake_browser(FakeBrowser::LateHelper), root.path()),
+        true,
+    )
+    .unwrap();
+    let profile = leased_to(root.path(), process::id()).unwrap().profile;
+    wait_for_helper(&profile);
+    let mut processes = browser.processes();
+    processes.extend(browser.guardian());
+    browser.shutdown().unwrap();
+    assert_stays_removed(&profile);
+    assert_cleaned_up(root.path(), &processes);
+}
+
+#[test]
+fn guardian_waits_for_helpers_started_after_its_owner_died() {
+    let root = profile_root();
+    let browser = fake_browser(FakeBrowser::LateHelper);
+    let mut owner = Owner::start("capture", &browser, root.path(), None, None);
+    let armed = owner.armed(root.path());
+    wait_for_helper(&armed.profile);
+    let processes = armed.processes();
+    let died = Instant::now();
+    owner.die(Death::Kill);
+    let elapsed = assert_gone("late helper", &processes, &armed.profile, died);
+    println!("owner SIGKILL with a late helper: cleaned up after {elapsed} ms");
+    assert_stays_removed(&armed.profile);
+    assert_cleaned_up(root.path(), &processes);
+}
+
 #[test]
 fn owner_crash_during_teardown_is_finished_by_its_guardian() {
     let browser = fake_browser(FakeBrowser::NeverReady);

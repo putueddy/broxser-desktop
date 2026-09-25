@@ -323,6 +323,7 @@ pub(crate) fn fake_browser(kind: FakeBrowser) -> PathBuf {
         .join(match kind {
             FakeBrowser::NeverReady => "never-ready",
             FakeBrowser::LoopbackEndpoint => "loopback-endpoint",
+            FakeBrowser::LateHelper => "late-helper",
         })
 }
 
@@ -331,6 +332,9 @@ pub(crate) enum FakeBrowser {
     NeverReady,
     /// Publishes `<profile root>/fake-cdp-port` as its endpoint.
     LoopbackEndpoint,
+    /// Never publishes an endpoint; once it is gone, a process that did not
+    /// exist before writes into the profile for about 0.3 seconds.
+    LateHelper,
 }
 
 /// How a fake CDP websocket peer behaves after its (optionally delayed) handshake.

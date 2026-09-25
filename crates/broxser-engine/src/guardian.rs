@@ -277,13 +277,14 @@ fn cleanup(profile: &Path, owner: &ProcessIdentity, reported: Option<ProcessIden
     for browser in &browsers {
         let _ = browser::terminate(browser);
     }
-    let survivors = browser::wait_for_exit(&processes, EXIT_TIMEOUT);
+    let survivors = browser::wait_for_release(&processes, profile, EXIT_TIMEOUT);
     let removed = profile::remove_guarded(profile, owner);
     let mut stderr = io::stderr();
     if survivors > 0 {
         let _ = writeln!(
             stderr,
-            "broxser guardian: {survivors} browser processes did not exit"
+            "broxser guardian: {survivors} processes of the browser or naming its profile did \
+             not exit"
         );
     }
     if let Err(error) = &removed {
