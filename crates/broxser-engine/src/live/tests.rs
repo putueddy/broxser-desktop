@@ -5,7 +5,7 @@ use broxser_core::{Device, Session};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
 fn keys_map_to_dom_values_and_text() {
@@ -200,6 +200,411 @@ fn early_extension_event_rejects_live_before_navigation() {
     }
 }
 
+/// A browser CDP endpoint for fake-browser live tests. It answers setup like a
+/// browser with one target per device (device `n` gets target `Tn` and session
+/// `Sn`) and holds the reply to every request that `hold` selects until
+/// [`FakePeer::release`], like a page or a server that stopped answering. A held
+/// navigation then fails with `net::ERR_ABORTED`, as a canceled one does.
+struct FakePeer {
+    received: Requests,
+    released: Arc<AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
+}
+
+/// Method and session of every request, in arrival order.
+type Requests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+impl FakePeer {
+    fn start(root: &Path, hold: impl Fn(&str, Option<&str>) -> bool + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(
+            root.join("fake-cdp-port"),
+            listener.local_addr().unwrap().port().to_string(),
+        )
+        .unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let released = Arc::new(AtomicBool::new(false));
+        let (log, release) = (Arc::clone(&received), Arc::clone(&released));
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            let (mut contexts, mut targets, mut loaders) = (0, 0, 0);
+            let mut held = Vec::new();
+            loop {
+                if release.load(Ordering::SeqCst) {
+                    for reply in held.drain(..) {
+                        if socket.send(reply).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let request: Value = match socket.read() {
+                    Ok(tungstenite::Message::Text(text)) => {
+                        serde_json::from_str(text.as_str()).unwrap()
+                    }
+                    Ok(_) => continue,
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                let session = request["sessionId"].as_str().map(str::to_owned);
+                log.lock().unwrap().push((method.clone(), session.clone()));
+                let result = match method.as_str() {
+                    "Browser.getVersion" => json!({"product":"Fake/1.0", "protocolVersion":"1.3"}),
+                    "Target.createBrowserContext" => {
+                        contexts += 1;
+                        json!({"browserContextId": format!("CTX{contexts}")})
+                    }
+                    "Target.createTarget" => {
+                        targets += 1;
+                        json!({"targetId": format!("T{}", targets - 1)})
+                    }
+                    "Target.attachToTarget" => json!({
+                        "sessionId": request["params"]["targetId"].as_str().unwrap().replacen('T', "S", 1)
+                    }),
+                    "Page.navigate" => {
+                        loaders += 1;
+                        json!({
+                            "frameId": session.as_deref().unwrap_or_default().replacen('S', "T", 1),
+                            "loaderId": format!("L{loaders}")
+                        })
+                    }
+                    _ => json!({}),
+                };
+                let reply = |result: Value| {
+                    tungstenite::Message::Text(
+                        json!({"id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    )
+                };
+                if hold(&method, session.as_deref()) && !release.load(Ordering::SeqCst) {
+                    let mut result = result;
+                    if method == "Page.navigate" {
+                        result["errorText"] = json!("net::ERR_ABORTED");
+                    }
+                    held.push(reply(result));
+                } else if socket.send(reply(result)).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            received,
+            released,
+            server: Some(server),
+        }
+    }
+
+    /// Requests received so far for `method` on `session`.
+    fn count(&self, method: &str, session: &str) -> usize {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, s)| m == method && s.as_deref() == Some(session))
+            .count()
+    }
+
+    /// Sends every held reply and stops holding, as a page that answers again.
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for FakePeer {
+    fn drop(&mut self) {
+        // The server ends when the live session closes its websocket.
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
+}
+
+fn fake_options(root: &Path) -> BrowserOptions {
+    BrowserOptions {
+        executable: fake_browser(FakeBrowser::LoopbackEndpoint),
+        headless: true,
+        profile_root: Some(root.to_owned()),
+        cancel: Cancellation::new(),
+    }
+}
+
+fn wait_for(
+    live: &LiveSession,
+    what: &str,
+    timeout: Duration,
+    condition: impl Fn(&Status) -> bool,
+) -> Status {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = live.status();
+        if condition(&status) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {status:#?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn key(down: bool) -> KeyInput {
+    KeyInput::from_key("a", Some("a"), Modifiers::default(), down).unwrap()
+}
+
+/// Waits until `peer` has received `count` requests for `method` on `session`.
+fn wait_for_requests(peer: &FakePeer, method: &str, session: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while peer.count(method, session) < count {
+        assert!(
+            Instant::now() < deadline,
+            "{method} on {session}: {} of {count} requests",
+            peer.count(method, session)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn fake_live(root: &Path, limits: Limits) -> LiveSession {
+    let live = LiveSession::start_with(
+        workspace("http://127.0.0.1:4173/".into()),
+        fake_options(root),
+        limits,
+        || {},
+    )
+    .unwrap();
+    wait_for(&live, "the runtime", Duration::from_secs(10), running);
+    live
+}
+
+fn send_keys(live: &LiveSession, device: usize, presses: usize) {
+    for _ in 0..presses {
+        for down in [true, false] {
+            assert!(live.send(Command::Key {
+                device,
+                key: key(down)
+            }));
+        }
+    }
+}
+
+#[test]
+fn unanswered_input_on_one_device_leaves_the_others_running() {
+    let root = profile_root();
+    // The phone's page stops answering input, like a renderer busy in a script.
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method.starts_with("Input.dispatch") && session == Some("S0")
+    });
+    let live = fake_live(root.path(), Limits::default());
+    send_keys(&live, 0, 150);
+    send_keys(&live, 2, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S2", 2);
+    let status = wait_for(
+        &live,
+        "the phone not responding",
+        Duration::from_secs(5),
+        |status| status.devices[0].error.as_deref() == Some(NOT_RESPONDING),
+    );
+    assert!(running(&status), "{status:#?}");
+    assert_eq!(status.devices[2].error, None);
+    // Input beyond the limit was dropped, not queued.
+    assert_eq!(
+        peer.count("Input.dispatchKeyEvent", "S0"),
+        MAX_UNANSWERED_INPUT
+    );
+
+    // Explicit navigation still reaches every device once, the stuck one included.
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into()
+    }));
+    for session in ["S0", "S1", "S2"] {
+        wait_for_requests(&peer, "Page.navigate", session, 2);
+    }
+    send_keys(&live, 0, 5);
+    send_keys(&live, 1, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S1", 2);
+    let status = live.status();
+    assert_eq!(
+        status.devices[0].error.as_deref(),
+        Some(NOT_RESPONDING),
+        "navigating does not prove that the page answers"
+    );
+    assert_eq!(
+        peer.count("Input.dispatchKeyEvent", "S0"),
+        MAX_UNANSWERED_INPUT
+    );
+
+    // Once the page answers, input flows again; what was dropped is never sent.
+    peer.release();
+    wait_for(
+        &live,
+        "the phone answering",
+        Duration::from_secs(5),
+        |status| status.devices[0].error.is_none(),
+    );
+    send_keys(&live, 0, 1);
+    wait_for_requests(
+        &peer,
+        "Input.dispatchKeyEvent",
+        "S0",
+        MAX_UNANSWERED_INPUT + 2,
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        peer.count("Input.dispatchKeyEvent", "S0"),
+        MAX_UNANSWERED_INPUT + 2
+    );
+    assert!(running(&live.status()));
+    drop(live);
+}
+
+#[test]
+fn input_left_unanswered_reports_not_responding_after_the_command_limit() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method.starts_with("Input.dispatch") && session == Some("S0")
+    });
+    let limits = Limits {
+        command: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    // One click, far below the limit, that the page never answers.
+    let sent = Instant::now();
+    for (kind, buttons) in [(PointerKind::Down, 1), (PointerKind::Up, 0)] {
+        assert!(live.send(Command::Pointer {
+            device: 0,
+            event: PointerEvent {
+                kind,
+                x: 10.0,
+                y: 10.0,
+                button: PointerButton::Left,
+                buttons,
+                click_count: 1,
+                modifiers: Modifiers::default(),
+            },
+        }));
+    }
+    wait_for_requests(&peer, "Input.dispatchMouseEvent", "S0", 2);
+    assert_eq!(live.status().devices[0].error, None);
+    let status = wait_for(
+        &live,
+        "the phone not responding",
+        Duration::from_secs(5),
+        |status| status.devices[0].error.as_deref() == Some(NOT_RESPONDING),
+    );
+    let elapsed = sent.elapsed();
+    assert!(elapsed >= limits.command, "reported after {elapsed:?}");
+    println!("unanswered click reported after {} ms", elapsed.as_millis());
+    assert!(
+        status.devices[1..]
+            .iter()
+            .all(|device| device.error.is_none())
+    );
+    send_keys(&live, 0, 3);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Input.dispatchKeyEvent", "S0"), 0, "dropped");
+    drop(live);
+}
+
+#[test]
+fn navigation_without_reply_is_stopped_at_its_deadline_and_not_retried() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.navigate" && session == Some("S0")
+    });
+    let limits = Limits {
+        load: Duration::from_millis(500),
+        ..Limits::default()
+    };
+    let started = Instant::now();
+    let live = fake_live(root.path(), limits);
+    let status = wait_for(
+        &live,
+        "a timeout status",
+        Duration::from_secs(5),
+        |status| status.devices[0].error.is_some(),
+    );
+    assert!(started.elapsed() >= limits.load);
+    let error = status.devices[0].error.as_deref().unwrap();
+    assert!(
+        error.contains("no response within 0.5 seconds") && error.contains("not retried"),
+        "{error}"
+    );
+    assert!(!status.devices[0].loading);
+    assert!(
+        status.devices[1..]
+            .iter()
+            .all(|device| device.error.is_none())
+    );
+    wait_for_requests(&peer, "Page.stopLoading", "S0", 1);
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(peer.count("Page.navigate", "S0"), 1, "not retried");
+    assert_eq!(peer.count("Page.stopLoading", "S0"), 1);
+    assert_eq!(peer.count("Page.stopLoading", "S1"), 0);
+
+    // Go is a new explicit navigation: sent once, and stopped again at its deadline.
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into()
+    }));
+    wait_for_requests(&peer, "Page.stopLoading", "S0", 2);
+    assert_eq!(peer.count("Page.navigate", "S0"), 2);
+
+    // A reload answers as soon as it starts; it must still commit or stop in time.
+    assert!(live.send(Command::Reload { device: 1 }));
+    wait_for_requests(&peer, "Page.stopLoading", "S1", 1);
+    let status = live.status();
+    assert!(
+        status.devices[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("loading stopped")),
+        "{:?}",
+        status.devices[1]
+    );
+    assert_eq!(peer.count("Page.reload", "S1"), 1);
+    assert!(running(&status));
+    drop(live);
+}
+
+#[test]
+fn superseded_navigation_answer_does_not_describe_the_new_one() {
+    let root = profile_root();
+    // Only the phone's first navigation hangs; it fails once released.
+    let navigations = AtomicUsize::new(0);
+    let peer = FakePeer::start(root.path(), move |method, session| {
+        method == "Page.navigate"
+            && session == Some("S0")
+            && navigations.fetch_add(1, Ordering::SeqCst) == 0
+    });
+    let live = fake_live(root.path(), Limits::default());
+    wait_for_requests(&peer, "Page.navigate", "S0", 1);
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into()
+    }));
+    wait_for_requests(&peer, "Page.navigate", "S0", 2);
+    // The browser cancels the first navigation when the second starts.
+    peer.release();
+    thread::sleep(Duration::from_millis(500));
+    let status = live.status();
+    assert_eq!(status.devices[0].error, None, "{:?}", status.devices[0]);
+    assert!(status.devices[0].loading);
+    drop(live);
+}
+
 // Live tests: BROXSER_TEST_BROWSER=/path/to/helium cargo test -p broxser-engine -- --ignored
 
 const PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
@@ -297,10 +702,14 @@ struct Live {
 
 impl Live {
     fn start(workspace: Workspace) -> Self {
+        Self::start_with(workspace, Limits::default())
+    }
+
+    fn start_with(workspace: Workspace, limits: Limits) -> Self {
         let root = profile_root();
         let notified = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&notified);
-        let session = LiveSession::start(
+        let session = LiveSession::start_with(
             workspace,
             BrowserOptions {
                 executable: test_browser(),
@@ -308,6 +717,7 @@ impl Live {
                 profile_root: Some(root.path().to_owned()),
                 cancel: Cancellation::new(),
             },
+            limits,
             move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             },
@@ -1190,4 +1600,175 @@ fn live_session_reports_crashes_and_browser_exit() {
     let Live { session, root, .. } = live;
     drop(session);
     assert_gone(root.path(), &processes);
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_navigation_without_response_is_stopped_and_not_retried() {
+    // The first three document requests load; the phone's reload then hangs.
+    let documents = AtomicUsize::new(0);
+    let fixture = Fixture::start(move |request, _| {
+        if request.path == "/" && documents.fetch_add(1, Ordering::SeqCst) == 3 {
+            return Reply::Hang;
+        }
+        Reply::Html {
+            body: PAGE.replace("AUTO", ""),
+            delay: Duration::ZERO,
+            cookie: None,
+        }
+    });
+    let limits = Limits {
+        load: Duration::from_secs(3),
+        ..Limits::default()
+    };
+    let live = Live::start_with(workspace(fixture.url("/")), limits);
+    live.wait("pages", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/")
+    });
+    // The deadline starts when Broxser sends the reload.
+    let reloaded = Instant::now();
+    live.send(Command::Reload { device: 0 });
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| count(fixture, "/") == 4));
+    let others: Vec<u64> = live.session().status().devices[1..]
+        .iter()
+        .map(|device| device.frames)
+        .collect();
+    let status = live.wait("a timeout status", Duration::from_secs(10), |status| {
+        status.devices[0].error.is_some()
+    });
+    let elapsed = reloaded.elapsed();
+    let error = status.devices[0].error.clone().unwrap();
+    assert!(error.contains("loading stopped, not retried"), "{error}");
+    assert!(elapsed >= limits.load, "reported after {elapsed:?}");
+    // Stopping closed the held request; the phone keeps its page.
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| fixture.abandoned() == 1),
+        "the held request stayed open"
+    );
+    let status = live.wait(
+        "the phone stops loading",
+        Duration::from_secs(5),
+        |status| !status.devices[0].loading,
+    );
+    assert_eq!(status.devices[0].url, fixture.url("/"));
+    assert!(
+        status.devices[1..]
+            .iter()
+            .all(|device| device.error.is_none())
+    );
+    live.wait(
+        "the others keep streaming",
+        Duration::from_secs(5),
+        |status| {
+            status.devices[1..]
+                .iter()
+                .zip(&others)
+                .all(|(device, before)| device.frames > before + 2)
+        },
+    );
+    println!(
+        "phone reload stopped after {} ms; held request closed",
+        elapsed.as_millis()
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(&fixture, "/"), 4, "not retried");
+
+    // Only an explicit action loads the page again, once.
+    live.send(Command::Reload { device: 0 });
+    live.wait("the explicit reload", Duration::from_secs(15), |status| {
+        status.devices[0].error.is_none() && !status.devices[0].loading
+    });
+    assert_eq!(count(&fixture, "/"), 5);
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_busy_page_does_not_stop_other_devices() {
+    // The first key press blocks the page's main thread for four seconds.
+    let fixture = Fixture::start(|request, _| Reply::Html {
+        body: if request.path.starts_with("/event") {
+            String::new()
+        } else {
+            PAGE.replace(
+                "AUTO",
+                "const field = document.getElementById('field'); field.focus(); let busy = true;
+                 field.addEventListener('keydown', () => { if (!busy) return; busy = false;
+                   const end = Date.now() + 4000; while (Date.now() < end) {} });",
+            )
+        },
+        delay: Duration::ZERO,
+        cookie: None,
+    });
+    let live = Live::start(workspace(fixture.url("/")));
+    live.wait("pages", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/")
+    });
+    // The desktop is alone in its session, so its renderer is its own.
+    let typed = |presses: usize| {
+        for _ in 0..presses {
+            for down in [true, false] {
+                live.send(Command::Key {
+                    device: 2,
+                    key: KeyInput::from_key("a", Some("a"), Modifiers::default(), down).unwrap(),
+                });
+            }
+        }
+    };
+    typed(150);
+    let busy = Instant::now();
+    let phone = live.session().status().devices[0].frames;
+    let status = live.wait(
+        "the desktop not responding",
+        Duration::from_secs(3),
+        |status| status.devices[2].error.as_deref() == Some(NOT_RESPONDING),
+    );
+    assert!(running(&status), "{status:#?}");
+    click(&live, 0, 40.0, 300.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(3), |fixture| {
+            events(fixture, "down")
+                .iter()
+                .any(|event| event["w"] == "360")
+        }),
+        "the phone stopped taking input"
+    );
+    let status = live.wait("phone frames", Duration::from_secs(3), |status| {
+        status.devices[0].frames > phone + 2
+    });
+    assert!(
+        busy.elapsed() < Duration::from_secs(4),
+        "the busy loop ended first"
+    );
+    println!(
+        "while the desktop was busy: phone frames +{}, phone click delivered after {} ms",
+        status.devices[0].frames - phone,
+        busy.elapsed().as_millis()
+    );
+    // Once the page answers again, the events sent before the limit arrive and
+    // the rest were dropped: 16 presses typed, not 150.
+    live.wait("the desktop answering", Duration::from_secs(15), |status| {
+        status.devices[2].error.is_none()
+    });
+    let value = |fixture: &Fixture| {
+        events(fixture, "input")
+            .iter()
+            .filter(|event| event["w"] == "1000")
+            .map(|event| event["v"].len())
+            .max()
+    };
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| value(fixture)
+            == Some(MAX_UNANSWERED_INPUT / 2))
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(value(&fixture), Some(MAX_UNANSWERED_INPUT / 2));
+    typed(1);
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| value(fixture)
+            == Some(MAX_UNANSWERED_INPUT / 2 + 1)),
+        "input did not resume"
+    );
+    assert!(running(&live.session().status()));
+    live.close();
 }

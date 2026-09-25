@@ -7,11 +7,13 @@
 
 use crate::Limits;
 use crate::browser::{BrowserOptions, BrowserProcess};
-use crate::cdp::{Cancellation, Cancelled, Cdp, Event, parse_response, required_str};
+use crate::cdp::{
+    Cancellation, Cancelled, Cdp, Event, error_message, parse_response, required_str,
+};
 use crate::device::{Commands, ExtensionObservations, extension_in_context, setup_target};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
-use broxser_core::{SyncAction, SyncEvent, SyncRouter, Workspace, validate_url};
+use broxser_core::{MAX_DEVICES, SyncAction, SyncEvent, SyncRouter, Workspace, validate_url};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -24,7 +26,15 @@ const COMMANDS_PER_TURN: usize = 64;
 /// Socket read timeout of the live loop; bounds the delay before UI commands run.
 const LIVE_POLL: Duration = Duration::from_millis(8);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PENDING: usize = 256;
+/// Input events, including the coalesced move and wheel in flight, that one
+/// page may leave unanswered before Broxser reports it as not responding.
+const MAX_UNANSWERED_INPUT: usize = 32;
+/// One navigation plus the unanswered input of every device, so one stuck
+/// device can never exhaust the commands of the others.
+const MAX_PENDING: usize = MAX_DEVICES * (MAX_UNANSWERED_INPUT + 1);
+/// Device status while its page leaves input unanswered.
+pub(crate) const NOT_RESPONDING: &str =
+    "The page is not responding to input. New input is dropped, not sent later.";
 const MAX_LINK_INTENT_BYTES: usize = 8192;
 const LINK_INTENT_WINDOW: Duration = Duration::from_secs(1);
 const LINK_WORLD: &str = "broxser_link_observer";
@@ -80,6 +90,16 @@ impl LiveSession {
         options: BrowserOptions,
         notify: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self> {
+        Self::start_with(workspace, options, Limits::default(), notify)
+    }
+
+    /// [`LiveSession::start`] with other deadlines; tests shorten them.
+    pub(crate) fn start_with(
+        workspace: Workspace,
+        options: BrowserOptions,
+        limits: Limits,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
         workspace
             .validate()
             .map_err(|error| anyhow!("invalid workspace: {error}"))?;
@@ -96,7 +116,7 @@ impl LiveSession {
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("broxser-live".into())
-            .spawn(move || run_worker(&workspace, &options, &receiver, &worker_shared))
+            .spawn(move || run_worker(&workspace, &options, limits, &receiver, &worker_shared))
             .context("start live runtime thread")?;
         Ok(Self {
             commands,
@@ -415,10 +435,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn run_worker(
     workspace: &Workspace,
     options: &BrowserOptions,
+    limits: Limits,
     commands: &Receiver<Command>,
     shared: &Shared,
 ) {
-    let error = match drive(workspace, options, commands, shared) {
+    let error = match drive(workspace, options, limits, commands, shared) {
         Ok(()) => None,
         Err(error) if error.is::<Cancelled>() => None,
         Err(error) => Some(format!("{error:#}")),
@@ -438,14 +459,14 @@ fn run_worker(
 fn drive(
     workspace: &Workspace,
     options: &BrowserOptions,
+    limits: Limits,
     commands: &Receiver<Command>,
     shared: &Shared,
 ) -> Result<()> {
     let mut browser = BrowserProcess::start(options, true)?;
-    let result = match browser.connect(&Limits::default()) {
-        Ok(cdp) => {
-            Controller::new(cdp, workspace, shared).and_then(|controller| controller.run(commands))
-        }
+    let result = match browser.connect(&limits) {
+        Ok(cdp) => Controller::new(cdp, workspace, shared, limits)
+            .and_then(|controller| controller.run(commands)),
         Err(error) => Err(error),
     };
     let cleanup = browser.shutdown();
@@ -463,6 +484,7 @@ struct Controller<'a> {
     cdp: Cdp,
     workspace: &'a Workspace,
     shared: &'a Shared,
+    limits: Limits,
     contexts: HashSet<String>,
     extensions: ExtensionObservations,
     devices: Vec<LiveDevice>,
@@ -516,6 +538,27 @@ struct LiveDevice {
     wheel_in_flight: bool,
     pointer_move: Option<PointerEvent>,
     move_in_flight: bool,
+    /// Input events sent to the page that it has not answered yet.
+    unanswered: usize,
+    /// Since when the page has left input unanswered without answering any.
+    waiting_since: Option<Instant>,
+    /// The page left input unanswered too long or too often. New input is
+    /// dropped, never queued, until the page answers again.
+    unresponsive: bool,
+    /// The navigation Broxser started that has not committed, failed or stopped.
+    navigation: Option<Navigation>,
+}
+
+/// A navigation Broxser started. It is stopped and reported, never retried,
+/// if it has not ended by `deadline`.
+struct Navigation {
+    /// The navigate or reload command while its answer is outstanding.
+    command: Option<u64>,
+    /// `Page.navigate` answers once the navigation commits or fails, but
+    /// `Page.reload` as soon as it starts. A reload therefore ends with the
+    /// main frame's next commit or stop after that answer.
+    reload: bool,
+    deadline: Instant,
 }
 
 struct Wheel {
@@ -526,16 +569,39 @@ struct Wheel {
     generation: u64,
 }
 
+/// A command whose answer the live loop waits for without blocking.
 enum Pending {
-    Navigate { device: usize },
-    Wheel { device: usize },
-    Move { device: usize },
+    /// The command of a device's [`Navigation`].
+    Navigate {
+        device: usize,
+    },
+    Wheel {
+        device: usize,
+    },
+    Move {
+        device: usize,
+    },
+    /// A pointer button or key event.
+    Input {
+        device: usize,
+    },
+}
+
+impl Pending {
+    fn device(&self) -> usize {
+        match *self {
+            Self::Navigate { device }
+            | Self::Wheel { device }
+            | Self::Move { device }
+            | Self::Input { device } => device,
+        }
+    }
 }
 
 impl Commands for Controller<'_> {
     fn command(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<Value> {
         let id = self.cdp.send(method, params, session)?;
-        let deadline = Instant::now() + Limits::default().command;
+        let deadline = Instant::now() + self.limits.command;
         loop {
             if let Some(response) = self.cdp.take_response(id) {
                 return parse_response(response, method);
@@ -549,11 +615,12 @@ impl Commands for Controller<'_> {
 }
 
 impl<'a> Controller<'a> {
-    fn new(cdp: Cdp, workspace: &'a Workspace, shared: &'a Shared) -> Result<Self> {
+    fn new(cdp: Cdp, workspace: &'a Workspace, shared: &'a Shared, limits: Limits) -> Result<Self> {
         Ok(Self {
             cdp,
             workspace,
             shared,
+            limits,
             contexts: HashSet::new(),
             extensions: ExtensionObservations::default(),
             devices: Vec::new(),
@@ -577,6 +644,7 @@ impl<'a> Controller<'a> {
             if self.cdp.read_until(Instant::now() + LIVE_POLL)? {
                 self.drain()?;
             }
+            self.expire(Instant::now())?;
             if let Some(error) = self.cdp.take_detached_error() {
                 self.shared
                     .update(|status| status.protocol_error = Some(error));
@@ -642,6 +710,10 @@ impl<'a> Controller<'a> {
                 wheel_in_flight: false,
                 pointer_move: None,
                 move_in_flight: false,
+                unanswered: 0,
+                waiting_since: None,
+                unresponsive: false,
+                navigation: None,
             });
             self.command(
                 "Runtime.enable",
@@ -688,13 +760,7 @@ impl<'a> Controller<'a> {
                 }
             }
             Command::Reload { device } if device < count && self.devices[device].visible => {
-                let session = self.devices[device].session.clone();
-                let id = self.cdp.send("Page.reload", json!({}), Some(&session))?;
-                self.track(id, Pending::Navigate { device })?;
-                self.shared.device(device, |status| {
-                    status.loading = true;
-                    status.error = None;
-                });
+                self.start_navigation(device, "Page.reload", json!({}))?;
             }
             Command::Pointer { device, event } if device < count => self.pointer(device, event)?,
             Command::Wheel {
@@ -749,9 +815,10 @@ impl<'a> Controller<'a> {
             Command::SetSync(settings) => self.set_sync(settings)?,
             #[cfg(test)]
             Command::CrashForTest { device } if device < count => {
+                // The crashing renderer may never answer.
                 let session = self.devices[device].session.clone();
                 self.cdp
-                    .send_detached("Page.crash", json!({}), Some(&session))?;
+                    .send_ignored("Page.crash", json!({}), Some(&session))?;
             }
             _ => {}
         }
@@ -765,14 +832,26 @@ impl<'a> Controller<'a> {
         device.link_intent = None;
         device.requested_link = None;
         device.link_navigation = None;
-        let session = device.session.clone();
-        let id = self
-            .cdp
-            .send("Page.navigate", json!({"url": url}), Some(&session))?;
+        self.start_navigation(index, "Page.navigate", json!({"url": url}))
+    }
+
+    /// Sends a navigation of `index` and replaces the one it may still follow:
+    /// the browser cancels that navigation, and its late answer must not
+    /// describe this one.
+    fn start_navigation(&mut self, index: usize, method: &str, params: Value) -> Result<()> {
+        self.forget_navigation(index);
+        let session = self.devices[index].session.clone();
+        let id = self.cdp.send(method, params, Some(&session))?;
         self.track(id, Pending::Navigate { device: index })?;
+        self.devices[index].navigation = Some(Navigation {
+            command: Some(id),
+            reload: method == "Page.reload",
+            deadline: Instant::now() + self.limits.load,
+        });
+        let unresponsive = self.devices[index].unresponsive;
         self.shared.device(index, |device| {
             device.loading = true;
-            device.error = None;
+            device.error = unresponsive.then(|| NOT_RESPONDING.to_owned());
         });
         Ok(())
     }
@@ -781,15 +860,158 @@ impl<'a> Controller<'a> {
         if self.pending.len() >= MAX_PENDING {
             bail!("too many unanswered live commands");
         }
+        if !matches!(pending, Pending::Navigate { .. }) {
+            let device = &mut self.devices[pending.device()];
+            device.unanswered += 1;
+            device.waiting_since.get_or_insert_with(Instant::now);
+        }
         self.pending.insert(id, pending);
         Ok(())
     }
 
-    fn pointer(&mut self, index: usize, event: PointerEvent) -> Result<()> {
+    /// Stops following the navigation that Broxser started on device `index`;
+    /// a late answer to it is discarded. Nothing is sent again.
+    fn forget_navigation(&mut self, index: usize) {
+        if let Some(Navigation {
+            command: Some(id), ..
+        }) = self.devices[index].navigation.take()
+        {
+            self.pending.remove(&id);
+            self.cdp.abandon(id);
+        }
+    }
+
+    /// Stops waiting for the input that device `index` has not answered; late
+    /// answers are discarded. Nothing is sent again.
+    fn forget_input(&mut self, index: usize) {
+        let forgotten: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                pending.device() == index && !matches!(pending, Pending::Navigate { .. })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in forgotten {
+            self.pending.remove(&id);
+            self.cdp.abandon(id);
+        }
         let device = &mut self.devices[index];
-        if !device.visible {
+        device.unanswered = 0;
+        device.waiting_since = None;
+        device.move_in_flight = false;
+        device.wheel_in_flight = false;
+        device.unresponsive = false;
+    }
+
+    /// The main frame of device `index` committed, stopped loading or moved
+    /// within its document. That ends a started reload; a navigate command
+    /// ends with its own answer instead.
+    fn navigation_settled(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        if device
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.command.is_none())
+        {
+            device.navigation = None;
+        }
+    }
+
+    /// Whether new input may go to device `index` now. Input that may not is
+    /// dropped, never queued or sent later.
+    fn input_allowed(&mut self, index: usize) -> bool {
+        let device = &self.devices[index];
+        if !device.visible || device.unresponsive {
+            return false;
+        }
+        if device.unanswered >= MAX_UNANSWERED_INPUT {
+            self.set_unresponsive(index);
+            return false;
+        }
+        true
+    }
+
+    /// Reports that the page of device `index` leaves input unanswered, and
+    /// drops its coalesced move and wheel. An error already shown, such as an
+    /// open dialog or a crash, explains more and stays.
+    fn set_unresponsive(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        device.unresponsive = true;
+        device.pointer_move = None;
+        device.wheel = None;
+        self.shared.device(index, |status| {
+            status
+                .error
+                .get_or_insert_with(|| NOT_RESPONDING.to_owned());
+        });
+    }
+
+    /// The page of device `index` answered an input event, so it responds.
+    fn answered(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        device.unanswered -= 1;
+        device.waiting_since = (device.unanswered > 0).then(Instant::now);
+        if std::mem::take(&mut device.unresponsive) {
+            self.shared.device(index, |status| {
+                if status.error.as_deref() == Some(NOT_RESPONDING) {
+                    status.error = None;
+                }
+            });
+        }
+    }
+
+    /// Applies deadlines. The browser must answer detached commands within the
+    /// command limit, or the runtime stops. A navigation that has not ended
+    /// within the load limit is stopped and reported. A page that leaves input
+    /// unanswered for the command limit is reported as not responding. None of
+    /// them is sent again.
+    fn expire(&mut self, now: Instant) -> Result<()> {
+        if let Some((sent, method)) = self.cdp.oldest_detached()
+            && now >= sent + self.limits.command
+        {
+            bail!(
+                "the browser did not answer {method} within {} seconds",
+                self.limits.command.as_secs_f32()
+            );
+        }
+        for index in 0..self.devices.len() {
+            if self.devices[index]
+                .navigation
+                .as_ref()
+                .is_some_and(|navigation| now >= navigation.deadline)
+            {
+                self.forget_navigation(index);
+                let session = self.devices[index].session.clone();
+                // Like the Stop button: the page keeps its current document.
+                self.cdp
+                    .send_ignored("Page.stopLoading", json!({}), Some(&session))?;
+                let error = format!(
+                    "Navigation got no response within {} seconds; loading stopped, not retried",
+                    self.limits.load.as_secs_f32()
+                );
+                self.shared.device(index, |status| {
+                    status.loading = false;
+                    status.error = Some(error);
+                });
+            }
+            let device = &self.devices[index];
+            if !device.unresponsive
+                && device
+                    .waiting_since
+                    .is_some_and(|since| now >= since + self.limits.command)
+            {
+                self.set_unresponsive(index);
+            }
+        }
+        Ok(())
+    }
+
+    fn pointer(&mut self, index: usize, event: PointerEvent) -> Result<()> {
+        if !self.input_allowed(index) {
             return Ok(());
         }
+        let device = &mut self.devices[index];
         if event.kind == PointerKind::Move {
             // Coalesce moves: only the newest one waits while another is in flight.
             device.pointer_move = Some(event);
@@ -798,12 +1020,14 @@ impl<'a> Controller<'a> {
         device.pointer_move = None;
         let session = device.session.clone();
         let params = mouse_params(event, device.css);
-        self.cdp
-            .send_detached("Input.dispatchMouseEvent", params, Some(&session))
+        let id = self
+            .cdp
+            .send("Input.dispatchMouseEvent", params, Some(&session))?;
+        self.track(id, Pending::Input { device: index })
     }
 
     fn wheel(&mut self, index: usize, x: f64, y: f64, delta_x: f64, delta_y: f64) {
-        if !self.devices[index].visible {
+        if !self.input_allowed(index) {
             return;
         }
         self.queue_wheel(index, x, y, delta_x, delta_y);
@@ -869,7 +1093,7 @@ impl<'a> Controller<'a> {
     }
 
     fn key(&mut self, index: usize, key: &KeyInput) -> Result<()> {
-        if !self.devices[index].visible {
+        if !self.input_allowed(index) {
             return Ok(());
         }
         if key.key.is_empty()
@@ -900,21 +1124,28 @@ impl<'a> Controller<'a> {
             params["text"] = json!(text);
             params["unmodifiedText"] = json!(text);
         }
-        let device = &mut self.devices[index];
-        let session = device.session.clone();
-        self.cdp
-            .send_detached("Input.dispatchKeyEvent", params, Some(&session))
+        let session = self.devices[index].session.clone();
+        let id = self
+            .cdp
+            .send("Input.dispatchKeyEvent", params, Some(&session))?;
+        self.track(id, Pending::Input { device: index })
     }
 
     /// Sends coalesced pointer moves and wheel deltas, one in flight per device.
     fn flush_input(&mut self) -> Result<()> {
         for index in 0..self.devices.len() {
-            let device = &mut self.devices[index];
-            if !device.visible {
+            let device = &self.devices[index];
+            if device.pointer_move.is_none() && device.wheel.is_none() {
+                continue;
+            }
+            if !self.input_allowed(index) {
+                // Hidden or not responding: queued input is dropped, never sent later.
+                let device = &mut self.devices[index];
                 device.pointer_move = None;
                 device.wheel = None;
                 continue;
             }
+            let device = &mut self.devices[index];
             if !device.move_in_flight
                 && let Some(event) = device.pointer_move.take()
             {
@@ -926,10 +1157,11 @@ impl<'a> Controller<'a> {
                 self.devices[index].move_in_flight = true;
                 self.track(id, Pending::Move { device: index })?;
             }
-            let device = &mut self.devices[index];
-            if device.wheel_in_flight {
+            // Sending the move may have reached the unanswered input limit.
+            if self.devices[index].wheel_in_flight || !self.input_allowed(index) {
                 continue;
             }
+            let device = &mut self.devices[index];
             let Some(wheel) = device.wheel.take() else {
                 continue;
             };
@@ -1041,6 +1273,13 @@ impl<'a> Controller<'a> {
                             .map(|error| format!("Navigation failed: {error}; not retried")),
                         Err(error) => Some(format!("{error:#}")),
                     };
+                    let navigation = &mut self.devices[device].navigation;
+                    match navigation {
+                        Some(started) if started.reload && error.is_none() => {
+                            started.command = None
+                        }
+                        _ => *navigation = None,
+                    }
                     if let Some(error) = error {
                         self.shared.device(device, |status| {
                             status.error = Some(error);
@@ -1048,8 +1287,21 @@ impl<'a> Controller<'a> {
                         });
                     }
                 }
-                Some(Pending::Wheel { device }) => self.devices[device].wheel_in_flight = false,
-                Some(Pending::Move { device }) => self.devices[device].move_in_flight = false,
+                Some(Pending::Wheel { device }) => {
+                    self.devices[device].wheel_in_flight = false;
+                    self.answered(device);
+                }
+                Some(Pending::Move { device }) => {
+                    self.devices[device].move_in_flight = false;
+                    self.answered(device);
+                }
+                Some(Pending::Input { device }) => {
+                    if let Some(error) = error_message(&response) {
+                        self.shared
+                            .update(|status| status.protocol_error = Some(error));
+                    }
+                    self.answered(device);
+                }
                 None => {}
             }
         }
@@ -1090,6 +1342,10 @@ impl<'a> Controller<'a> {
                     .position(|device| Some(device.target_id.as_str()) == text("targetId"))
                 {
                     let crashed = event.method == "Target.targetCrashed";
+                    // The renderer or the session that owed these answers is
+                    // gone; the error below describes the device instead.
+                    self.forget_input(index);
+                    self.forget_navigation(index);
                     self.devices[index].streaming = false;
                     self.shared.device(index, |device| {
                         device.loading = false;
@@ -1196,6 +1452,9 @@ impl<'a> Controller<'a> {
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
                 let loading = event.method == "Page.frameStartedLoading";
+                if !loading {
+                    self.navigation_settled(index);
+                }
                 self.shared.device(index, |device| device.loading = loading);
             }
             "Page.frameRequestedNavigation"
@@ -1245,6 +1504,7 @@ impl<'a> Controller<'a> {
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
                 let url = text("url").unwrap_or_default().to_owned();
+                self.navigation_settled(index);
                 self.devices[index].link_intent = None;
                 self.devices[index].requested_link = None;
                 self.devices[index].link_navigation = None;
@@ -1265,6 +1525,9 @@ impl<'a> Controller<'a> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
+                // A new document answers input again; the old one's is moot.
+                self.forget_input(index);
+                self.navigation_settled(index);
                 let device = &mut self.devices[index];
                 device.generation += 1;
                 device.wheel = None;

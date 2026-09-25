@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use tungstenite::protocol::{Message, WebSocketConfig};
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGE: usize = 128 * 1024 * 1024;
 const MAX_PENDING_RESPONSES: usize = 16;
+const MAX_AWAITED: usize = 1024;
 const MAX_DETACHED: usize = 256;
 const MAX_QUEUED_EVENTS: usize = 1024;
 
@@ -148,12 +149,50 @@ impl Cdp {
         Ok(())
     }
 
+    /// Sends a command and keeps its response for [`Cdp::take_response`] until
+    /// the caller takes it or [abandons](Cdp::abandon) the command.
     pub(crate) fn send(
         &mut self,
         method: &str,
         params: Value,
         session: Option<&str>,
     ) -> Result<u64> {
+        if self.inbox.awaited.len() >= MAX_AWAITED {
+            bail!("too many unanswered CDP commands");
+        }
+        let id = self.write(method, params, session)?;
+        self.inbox.awaited.insert(id);
+        Ok(id)
+    }
+
+    /// Sends a command whose result is not needed. Its response is discarded on
+    /// arrival; a protocol error is kept for [`Cdp::take_detached_error`], and
+    /// [`Cdp::oldest_detached`] tells how long the browser has left one unanswered.
+    pub(crate) fn send_detached(
+        &mut self,
+        method: &'static str,
+        params: Value,
+        session: Option<&str>,
+    ) -> Result<()> {
+        if self.inbox.detached.len() >= MAX_DETACHED {
+            bail!("too many unanswered CDP commands");
+        }
+        let id = self.write(method, params, session)?;
+        self.inbox.detached.insert(id, (Instant::now(), method));
+        Ok(())
+    }
+
+    /// Sends a command and discards its response and any error, if one arrives.
+    pub(crate) fn send_ignored(
+        &mut self,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+    ) -> Result<()> {
+        self.write(method, params, session).map(drop)
+    }
+
+    fn write(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<u64> {
         self.cancel.check()?;
         let id = self.next_id;
         self.next_id += 1;
@@ -167,28 +206,25 @@ impl Cdp {
         Ok(id)
     }
 
-    /// Sends a command whose result is not needed. Its response is discarded on
-    /// arrival; a protocol error is kept for [`Cdp::take_detached_error`].
-    pub(crate) fn send_detached(
-        &mut self,
-        method: &str,
-        params: Value,
-        session: Option<&str>,
-    ) -> Result<()> {
-        if self.inbox.detached.len() >= MAX_DETACHED {
-            bail!("too many unanswered CDP commands");
-        }
-        let id = self.send(method, params, session)?;
-        self.inbox.detached.insert(id);
-        Ok(())
-    }
-
     pub(crate) fn take_detached_error(&mut self) -> Option<String> {
         self.inbox.detached_error.take()
     }
 
+    /// When the oldest unanswered detached command was sent, and its method.
+    pub(crate) fn oldest_detached(&self) -> Option<(Instant, &'static str)> {
+        self.inbox.detached.first_key_value().map(|(_, sent)| *sent)
+    }
+
     pub(crate) fn take_response(&mut self, id: u64) -> Option<Value> {
-        self.inbox.responses.remove(&id)
+        let response = self.inbox.responses.remove(&id)?;
+        self.inbox.awaited.remove(&id);
+        Some(response)
+    }
+
+    /// Stops waiting for command `id`; a response that arrives later is discarded.
+    pub(crate) fn abandon(&mut self, id: u64) {
+        self.inbox.awaited.remove(&id);
+        self.inbox.responses.remove(&id);
     }
 
     pub(crate) fn pop_event(&mut self) -> Option<Event> {
@@ -228,7 +264,11 @@ impl Cdp {
 #[derive(Default)]
 struct Inbox {
     responses: HashMap<u64, Value>,
-    detached: HashSet<u64>,
+    /// Commands sent with [`Cdp::send`] whose response nobody took or abandoned.
+    awaited: HashSet<u64>,
+    /// Detached commands with their sending time and method. IDs grow with
+    /// sending time, so the first entry is the oldest.
+    detached: BTreeMap<u64, (Instant, &'static str)>,
     detached_error: Option<String>,
     events: VecDeque<Event>,
 }
@@ -239,14 +279,14 @@ impl Inbox {
             bail!("CDP message is not an object");
         };
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
-            if self.detached.remove(&id) {
-                if let Some(error) = message
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(Value::as_str)
-                {
-                    self.detached_error = Some(error.chars().take(200).collect());
+            if self.detached.remove(&id).is_some() {
+                if let Some(error) = error_message(&Value::Object(message)) {
+                    self.detached_error = Some(error);
                 }
+                return Ok(());
+            }
+            if !self.awaited.contains(&id) {
+                // The late answer to an abandoned command, or to none sent.
                 return Ok(());
             }
             if self.responses.len() >= MAX_PENDING_RESPONSES {
@@ -274,6 +314,15 @@ impl Inbox {
         });
         Ok(())
     }
+}
+
+/// The protocol error message of a response, shortened for status display.
+pub(crate) fn error_message(response: &Value) -> Option<String> {
+    response
+        .get("error")?
+        .get("message")?
+        .as_str()
+        .map(|message| message.chars().take(200).collect())
 }
 
 pub(crate) fn parse_response(value: Value, method: &str) -> Result<Value> {
@@ -309,6 +358,7 @@ mod tests {
     #[test]
     fn responses_events_and_errors_are_separated() {
         let mut inbox = Inbox::default();
+        inbox.awaited.insert(7);
         inbox
             .accept(json!({"method":"Page.lifecycleEvent","sessionId":"one","params":{"name":"load","loaderId":"new"}}))
             .unwrap();
@@ -339,7 +389,9 @@ mod tests {
     #[test]
     fn detached_responses_are_dropped_but_errors_kept() {
         let mut inbox = Inbox::default();
-        inbox.detached.extend([3, 4]);
+        let sent = Instant::now();
+        inbox.detached.insert(3, (sent, "Page.startScreencast"));
+        inbox.detached.insert(4, (sent, "Page.screencastFrameAck"));
         inbox.accept(json!({"id":3,"result":{}})).unwrap();
         inbox
             .accept(json!({"id":4,"error":{"message":"No target with given id"}}))
@@ -352,12 +404,30 @@ mod tests {
     }
 
     #[test]
+    fn answers_nobody_awaits_are_dropped() {
+        let mut inbox = Inbox::default();
+        inbox.awaited.insert(5);
+        // Abandoned, or never sent: a late answer leaves no state behind.
+        for id in [4, 6, 999] {
+            inbox.accept(json!({"id": id, "result": {}})).unwrap();
+        }
+        assert!(inbox.responses.is_empty());
+        inbox.accept(json!({"id": 5, "result": {}})).unwrap();
+        assert!(inbox.responses.contains_key(&5));
+    }
+
+    #[test]
     fn protocol_buffers_reject_floods_and_duplicates() {
         let mut inbox = Inbox::default();
+        inbox.awaited.extend(0..=MAX_PENDING_RESPONSES as u64);
         for id in 0..MAX_PENDING_RESPONSES as u64 {
             inbox.accept(json!({"id": id, "result": {}})).unwrap();
         }
-        assert!(inbox.accept(json!({"id": 999, "result": {}})).is_err());
+        assert!(
+            inbox
+                .accept(json!({"id": MAX_PENDING_RESPONSES, "result": {}}))
+                .is_err()
+        );
         inbox.responses.clear();
         inbox.accept(json!({"id": 1, "result": {}})).unwrap();
         assert!(inbox.accept(json!({"id": 1, "result": {}})).is_err());
