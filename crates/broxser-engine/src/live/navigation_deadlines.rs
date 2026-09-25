@@ -242,18 +242,21 @@ fn live_reload_deadline_survives_history_api_changes() {
             Duration::from_secs(1),
             |fixture| events(fixture, "history").len() > histories + 1
         ));
+        // Helium reports each History API update as `Page.frameStartedLoading`.
+        // One sent before the browser handled `Page.stopLoading` can briefly
+        // mark the device loading again until its `Page.frameStoppedLoading`.
         let status = live.wait(
             "reload deadline despite History API",
             Duration::from_secs(5),
             |status| {
-                status.devices[0]
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("loading stopped"))
+                !status.devices[0].loading
+                    && status.devices[0]
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("loading stopped"))
             },
         );
         assert!(reloaded.elapsed() >= limits.load);
-        assert!(!status.devices[0].loading);
         assert!(
             status.devices[1..]
                 .iter()

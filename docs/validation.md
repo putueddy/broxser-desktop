@@ -32,9 +32,34 @@ reply is remembered, including when that reply never arrives.
 One default run failed in the unchanged
 `guardian_waits_for_helpers_started_after_its_owner_died` test at its pre-kill
 process-alive assertion. A full rerun passed without changes to guardian code or
-that test; the intermittent failure's cause was not established. The first two
+that test. The cause, a race in the test helper, was found later and fixed through
+PR 8 (see "Snapshot race in the late-helper test" under P0). The first two
 Helium reproducers failed on the reviewed head as shown above. No GUI code changed;
 a new window/Wayland/GPU check was not run for these engine fixes.
+
+### Cloud container rerun after merging `main`
+
+In the P1.1 cloud container, `live_reload_deadline_survives_history_api_changes`
+failed at `!status.devices[0].loading` in four of five full live-suite runs with
+four test threads (three of three after merging `main`, one of two on `9d12f2f`).
+It passed six of six runs alone on an otherwise idle machine and failed on the
+first traced run beside the rest of the suite. The traced page events showed that
+Helium reports each History API update as `Page.frameStartedLoading` for the main
+frame. An update sent before the browser handled `Page.stopLoading` arrived after
+Broxser had reported the stop and marked the device loading again until its
+`Page.frameStoppedLoading` 26 ms later. The final state was correct; the test now
+waits until the device reports the stop while not loading. Afterwards `check.sh`
+passed and the full live suite passed 22 of 22 in four of four runs (48.6–51.5 s),
+the held reload stopping after 2026–2086 ms.
+
+One earlier run also failed `live_link_sync_binds_slow_commit_and_preserves_long_url`,
+unchanged since M1, with `browser processes still running` after close. Its sandbox
+processes were stuck in the VM kernel (6.18): the init of a nested Chromium PID
+namespace was a zombie whose last thread waited in `zap_pid_ns_processes` with
+SIGKILL pending, the outer namespace init waited for it, and two crash handlers
+stayed alive. As ADR 0007 describes, shutdown killed only the main browser process,
+waited five seconds and removed the profile; the stuck processes were not
+signaled. Later runs were not affected; the kernel-side cause was not established.
 
 ## P1.1 live command and navigation deadlines, 25 September 2026 (cloud container)
 
