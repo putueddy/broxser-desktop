@@ -737,7 +737,9 @@ dependencies = [
  "broxser-core",
  "broxser-engine",
  "clap",
+ "futures",
  "gpui",
+ "image",
  "tempfile",
 ]
 
@@ -749,6 +751,7 @@ dependencies = [
  "base64 0.23.1",
  "broxser-core",
  "png 0.18.1",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",

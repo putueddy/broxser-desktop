@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use broxser_core::Workspace;
-use broxser_engine::{CaptureOptions, capture_workspace, discover_browser};
+use broxser_engine::{BrowserOptions, Cancellation, capture_workspace, discover_browser};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -100,9 +100,11 @@ fn main() -> Result<()> {
             if output.is_file() {
                 bail!("Capture output must be a directory");
             }
-            let options = CaptureOptions {
+            let options = BrowserOptions {
                 executable,
                 headless: !headed,
+                profile_root: None,
+                cancel: Cancellation::new(),
             };
             // Every run has a distinct directory, so a failed refresh cannot
             // leave an old report looking like the result of a new capture.

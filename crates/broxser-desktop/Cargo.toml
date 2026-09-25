@@ -10,7 +10,9 @@ broxser-core.workspace = true
 broxser-engine.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 gpui.workspace = true
+image.workspace = true
 tempfile.workspace = true
 
 [lints]

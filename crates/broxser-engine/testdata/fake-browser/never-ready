@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake browser for engine tests: starts and never publishes a CDP endpoint.
+exec sleep 60

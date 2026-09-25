@@ -6,6 +6,13 @@ commit [`5bcd5f1`](https://github.com/putueddy/broxser-desktop/commit/5bcd5f1)
 berhasil di-push pada 25 September 2026. Selalu baca HEAD terbaru; kode bisa sudah
 berkembang setelah snapshot handoff ini.
 
+Catatan review 25 September 2026: perbaikan PR #4 mengganti otorisasi sync berbasis
+input baru dengan bukti link tepercaya dan loader navigasi, mempertahankan URL
+utuh, menolak input ke device tersembunyi, memeriksa ulang event ekstensi yang
+mendahului registrasi context, serta membuat handshake dapat dibatalkan. Baca
+ADR 0006 dan bagian validasi terbaru sebelum melanjutkan; jangan mengembalikan
+heuristik timestamp atau memotong URL yang akan dipakai untuk navigasi.
+
 ## Prompt handoff
 
 Anda melanjutkan implementasi **Broxser**, aplikasi desktop internal untuk tim
@@ -35,7 +42,7 @@ Keputusan pengguna yang wajib dipertahankan:
 ### Baca sebelum mengubah kode
 
 1. `AGENTS.md` dan `README.md`.
-2. `docs/system-design.md` beserta `docs/adr/0001-*.md` sampai `0003-*.md`.
+2. `docs/system-design.md` beserta seluruh `docs/adr/`, termasuk ADR 0006.
 3. `docs/validation.md`, `SECURITY.md`, dan `NOTICE.md`.
 4. `Cargo.toml`, `rust-toolchain.toml`, `runtime/helium-linux-x86_64.json`.
 5. Keempat crate dan `examples/workspace.json` untuk memahami kontrak yang nyata.
@@ -256,8 +263,16 @@ memindahkan item ke selesai hanya karena implementasinya terlihat masuk akal.
 
 - [x] Foundation repo, initial commit dan upstream tersedia.
 - [x] Rust 1.98.1, GPUI shell, real Helium capture, schema v1, CI dan System Design.
-- [ ] M0 reliability — slow-page cancellation dan lifecycle/cleanup teruji.
+- [x] M0 reliability — slow-page cancellation dan lifecycle/cleanup teruji.
+  Bukti cloud 24 September 2026: penyebab `ERR_ABORTED` (ADR 0004), reproducer,
+  tes lifecycle dan cleanup normal/error di `docs/validation.md`. CI remote run #9
+  (`9c14532`) lulus termasuk suite live Helium. Masih terbuka: cleanup saat proses
+  Broxser dibunuh/crash.
 - [ ] M1 — runtime tetap hidup, live frames, input, navigation/scroll sync.
+  Spike berjalan dan lulus tes live (Helium dan Chromium), CI remote run #13
+  (`9e09830`) serta pemeriksaan window X11 di cloud (ADR 0005, `docs/validation.md`).
+  Belum dicentang: checklist desktop manual di Wayland/GPU nyata, pengukuran
+  latency, ketajaman HiDPI, IME, clipboard, popup, dialog dan aksesibilitas.
 - [ ] M2 — daily workflows, persistent session, debug/capture dan pilot tim.
 - [ ] M3 — Linux packaging, security updates, rollback dan operational ownership.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

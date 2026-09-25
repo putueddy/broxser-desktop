@@ -22,14 +22,16 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
-      - name: Compile GPUI desktop
-        run: cargo check --locked -p broxser-desktop -j 2
+      - name: Check GPUI desktop and input regression tests
+        run: |
+          cargo clippy --locked -p broxser-desktop --all-targets -j 2 -- -D warnings
+          cargo test --locked -p broxser-desktop -j 2
       - name: Pinned Helium integration
         run: |
           bash scripts/fetch-helium.sh
           # Permit this exact downloaded binary to create its normal sandbox.
           printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile broxser-helium-ci "%s" flags=(unconfined) {\n  userns,\n}\n' "$PWD/.local/helium/helium" > "$RUNNER_TEMP/broxser-helium.apparmor"
           sudo apparmor_parser -r "$RUNNER_TEMP/broxser-helium.apparmor"
-          BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" cargo test --locked -p broxser-engine live_capture_has_expected_pixels_and_isolated_sessions -- --ignored --nocapture
+          BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" cargo test --locked -p broxser-engine -- --ignored --nocapture
         # Keep Chromium's sandbox enabled. AppArmor/userns restrictions are a
         # runner setup failure, not permission to add --no-sandbox here.

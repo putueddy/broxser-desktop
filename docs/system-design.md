@@ -7,6 +7,10 @@ backup yang perlu ditunjuk perusahaan. Dokumen ini mengikuti struktur template
 System Design; [versi Word](system-design.docx) adalah snapshot untuk review.
 Perubahan desain selanjutnya harus memperbarui dokumen dan ADR terkait.
 
+> **Snapshot Word perlu diselaraskan.** Sejak M0 reliability dan spike M1
+> (24 September 2026) Markdown ini diperbarui di lingkungan tanpa renderer dokumen;
+> DOCX belum diubah atau dirender ulang dan tidak mencerminkan ADR 0004 dan 0005.
+
 ## 1. Abstract
 
 Broxser membantu developer memeriksa satu aplikasi web pada beberapa viewport dan
@@ -15,9 +19,10 @@ Rust: GPUI menampilkan UI native, domain mengatur konfigurasi dan aturan sinkron
 sedangkan adapter CDP mengendalikan proses Helium milik aplikasi. Engine dapat
 diganti tanpa mengubah format workspace maupun model domain.
 
-Fondasi saat ini menghasilkan **capture PNG statis** dari browser sungguhan. Ini
-belum merupakan browser interaktif tertanam dan belum menggantikan seluruh workflow
-Sizzy. Keberhasilan tahap berikutnya ditentukan oleh bukti input, rendering,
+Spike M1 menampilkan **frame live** (CDP screencast) dari browser sungguhan dengan
+URL bar, input per device dan sync opt-in, di samping capture PNG statis. Ini frame
+streaming ke window native, belum browser tertanam, dan belum menggantikan seluruh
+workflow Sizzy. Keberhasilan tahap berikutnya ditentukan oleh bukti input, rendering,
 accessibility, keamanan, dan biaya perawatan; kesamaan tampilan saja tidak cukup.
 
 ## 2. Goals and non-goals
@@ -63,14 +68,18 @@ flowchart TB
   CLI --> Domain
   Config[(Workspace JSON)] --> Domain
   UI --> Worker[Background capture job]
+  UI -->|Commands, latest frame, status| Live[Live session worker]
   CLI --> Adapter[broxser-engine\nCDP adapter dan process owner]
   Worker --> Adapter
+  Live --> Adapter
   Adapter -->|Loopback CDP, random port| Browser[Owned Helium subprocess\nPrivate temporary profile]
   Browser --> Guest[BrowserContext guest]
   Browser --> Admin[BrowserContext admin]
   Guest --> Devices[Targets dan viewport emulation]
   Admin --> Devices
   Devices --> PNG[PNG capture dan metadata]
+  Devices --> Frames[Screencast JPEG frames]
+  Frames --> Live
   PNG --> UI
   PNG --> Export[(Explicit CLI export)]
 ```
@@ -78,14 +87,15 @@ flowchart TB
 | Komponen | Tanggung jawab dan batas | Kegagalan |
 | --- | --- | --- |
 | `broxser-core` | Validasi, workspace v1, pure sync routing; tanpa UI/network | Input ditolak sebelum browser dimulai |
-| `broxser-engine` | Proses browser, CDP, emulasi dan capture | Error terbatas waktu; child miliknya dihentikan |
-| `broxser-desktop` | State UI, canvas, job background | Tampilkan status, pertahankan UI responsif |
+| `broxser-engine` | Proses browser, CDP, emulasi, capture dan gate ekstensi | Error terbatas waktu dan dapat dibatalkan; child dan profil dihapus |
+| `broxser-desktop` | State UI, frame live, input, sync toggle, mode statis | Tampilkan status; tutup window setelah cleanup |
 | `broxser-cli` | Validasi, bootstrap config, capture untuk otomasi | Exit nonzero; tidak menyatakan capture sukses |
 | Helium | Network, DOM/CSS/JS, storage, sandbox Chromium | Hentikan job; jangan replay aksi pengguna |
 
-Satu proses browser per capture job, satu BrowserContext per session, satu target
-per device. Device dengan session sama sengaja berbagi konteks. Label `Admin`
-hanyalah nama session; tidak memberi hak akses atau melakukan login.
+Satu proses browser per capture job atau per workspace live yang terbuka, satu
+BrowserContext per session, satu target per device. Device dengan session sama
+sengaja berbagi konteks. Label `Admin` hanyalah nama session; tidak memberi hak
+akses atau melakukan login.
 
 GPUI tidak mengimpor tipe CDP. Domain tidak mengimpor GPUI atau adapter. Lapisan
 adapter saat ini berupa API fungsi Rust; trait generik baru ditambahkan jika ada
@@ -99,19 +109,33 @@ agar fitur lokal bekerja.
 2. Ambil executable Helium dari `BROXSER_HELIUM_BIN` atau PATH. `--browser` menerima
    pilihan eksplisit untuk pengujian. Jangan diam-diam beralih ke Chromium.
 3. UI menjalankan capture di background, maksimal satu job aktif. Buat profil
-   sementara privat dan child browser milik job dengan sandbox tetap aktif.
+   sementara privat, isi preferensinya sebelum launch (blocker bawaan Helium tidak
+   aktif di context session, ADR 0004), arahkan crash dump ke profil itu, lalu
+   jalankan child browser dengan sandbox tetap aktif.
 4. Baca `DevToolsActivePort` dari profil tersebut. Validasi port dan path, lalu
    hubungkan hanya ke `127.0.0.1`. Catat `Browser.getVersion` dan versi protokol.
-5. Buat konteks session dan target, atur emulasi, navigasi, tunggu lifecycle load
-   yang sesuai dengan navigation loader, lalu ambil PNG. `load` bukan bukti SPA
-   telah tenang; readiness selector dan network-idle adalah pengembangan lanjutan.
+5. Aktifkan target discovery, buat konteks session dan target, atur emulasi,
+   navigasi, tunggu lifecycle load yang sesuai dengan navigation loader, lalu ambil
+   PNG. Halaman ekstensi di context session menghentikan job. Navigasi yang
+   digantikan navigasi lain dilaporkan beserta pemicunya (halaman atau browser).
+   `load` bukan bukti SPA telah tenang; readiness selector dan network-idle adalah
+   pengembangan lanjutan.
 6. Kembalikan file capture dan metadata. UI menampilkan preview statis; CLI
-   mengekspor PNG dan `report.json`. Hentikan browser dan hapus profil sementara.
+   mengekspor PNG dan `report.json`. Hentikan browser, tunggu seluruh prosesnya
+   keluar (identitas PID dan waktu mulai), lalu hapus profil sementara.
+
+Live session memakai langkah 2–5 yang sama, lalu tetap hidup: worker memiliki
+seluruh I/O CDP, UI hanya mengirim command ke antrean berbatas dan membaca status
+serta satu frame terbaru per device. Frame di-ack saat diterima, termasuk yang
+digantikan; device tersembunyi berhenti streaming. Crash renderer, target lepas,
+browser keluar dan error transport menghasilkan state eksplisit. Restart adalah aksi
+pengguna yang memulihkan konfigurasi dan memuat URL sekali (ADR 0005).
 
 Startup dibatasi 15 detik, setiap command 15 detik dan load 30 detik. Ini deadline
-per operasi, bukan SLA total job. Maksimal 8 device berarti kegagalan berurutan
-masih dapat memakan waktu; cancellation dan deadline global merupakan gate pilot.
-Tidak ada retry otomatis untuk navigasi atau aksi yang mungkin memberi efek samping.
+per operasi, bukan SLA total job. Cancellation dicek paling lambat setiap 500 ms;
+menutup window membatalkan capture dan menunggu cleanup. Deadline global job masih
+gate pilot. Tidak ada retry otomatis untuk navigasi atau aksi yang mungkin memberi
+efek samping.
 
 ## 6. API and data contracts
 
@@ -123,7 +147,8 @@ Tidak ada retry otomatis untuk navigasi atau aksi yang mungkin memberi efek samp
 | `devices[]` | ID unik, dimensi CSS, DPR, mobile/touch dan referensi session |
 | `capture_workspace` | Blocking Rust API; menerima workspace tervalidasi, executable, direktori output |
 | `CaptureReport` | Browser product, protocol version, daftar file dan ukuran PNG aktual |
-| `SyncRouter` | Aturan pure opt-in untuk scope dan pencegahan replay; belum dihubungkan ke browser |
+| `SyncRouter` | Aturan pure opt-in untuk scope dan pencegahan replay; dipakai live session untuk link dan scroll |
+| `LiveSession` | Worker per workspace; `Command`, `Status` dan `Frame` tanpa tipe GPUI atau payload CDP |
 
 Schema contoh: [examples/workspace.json](../examples/workspace.json). Definisi
 otoritatif berikut validasinya berada di
@@ -152,20 +177,30 @@ bukan salinan state aplikasi web yang bisa dipulihkan.
 | Browser restart | Pulihkan konfigurasi; minta aksi pengguna untuk aktivitas yang dapat mengubah data |
 | Config berubah saat capture | Selesaikan snapshot aktif, pakai perubahan pada job berikutnya |
 
-Pure router awal memerlukan opt-in, memeriksa source session/device, dan tidak
-mengaktifkan click/typing secara default. Integrasi live perlu bounded event queue,
-scroll coalescing, navigation generation, frame/input mapping, serta tests dengan
-DOM berbeda. Jangan memakai klaim exactly-once untuk aksi web; side effect di server
-tidak bisa dibatalkan oleh router lokal.
+Router memerlukan opt-in, memeriksa source session/device, dan tidak mengaktifkan
+click/typing. Live session memerlukan bukti aktivasi link tepercaya dari execution
+context terisolasi pada main frame, lalu mencocokkannya dengan request dan loader
+navigasi (ADR 0006). Respons HTTP lambat tidak menghapus kelayakan yang sudah
+terikat ke navigasi itu. URL asli divalidasi tanpa dipotong; redirect ke URL berbeda
+tidak dicerminkan. Scroll di-coalesce dan dibuang bila tujuan sudah bernavigasi
+atau tersembunyi. Device tersembunyi tidak menerima input atau sync. Antrean
+command, frame dan event berbatas. Jangan memakai klaim exactly-once untuk aksi
+web; side effect di server tidak bisa dibatalkan oleh router lokal.
 
 ## 8. Security and privacy considerations
 
 Halaman web adalah input tidak tepercaya; jangan beri akses filesystem, shell,
 native app atau credential melalui bridge. CDP memiliki hak penuh atas browser
 child; loopback mengurangi paparan jaringan, tetapi tidak mengautentikasi proses
-lokal lain. Evaluasi transport pipe sebelum rollout luas. Profil pribadi pengguna
-tidak boleh dipakai. Jangan menambahkan `--no-sandbox`, wildcard debug origins,
-atau mengabaikan sertifikat untuk memudahkan test.
+lokal lain. Evaluasi transport pipe sebelum rollout luas; transport itu juga akan
+menghentikan browser bila proses Broxser mati mendadak, yang saat ini meninggalkan
+browser yatim dan profil sementara. Profil pribadi pengguna tidak boleh dipakai;
+crash dump diarahkan ke profil privat, sedangkan database sertifikat NSS bersama
+masih dibuka Chromium. Core dump kernel dibatasi (soft `RLIMIT_CORE` dan
+`coredump_filter` 0, diwarisi browser): dump tidak memuat memori renderer, sehingga
+cookie dan isi halaman tidak sampai ke systemd-coredump atau apport, dan crash
+renderer tidak tertahan di jalur dump. Jangan menambahkan `--no-sandbox`, wildcard
+debug origins, atau mengabaikan sertifikat untuk memudahkan test.
 
 HTTP localhost dan jaringan internal sengaja didukung. Validasi URL awal bukan
 allowlist redirect; CLI bukan layanan URL-fetch publik. Upstream browser tetap
@@ -174,8 +209,10 @@ ekspor dipicu pengguna dan tidak diunggah otomatis. Git mengabaikan profil, capt
 runtime dan `.env`. Tidak ada endpoint analytics aplikasi.
 
 Helium memiliki privacy/filter defaults yang dapat memengaruhi aplikasi uji.
-Perbedaan itu harus ditandai dan diuji sebelum dipakai sebagai browser QA utama;
-headless tidak boleh diasumsikan identik dengan mode interaktif/extension.
+Blocker bawaannya me-reload tab di context baru sehingga dimatikan di session
+Broxser (ADR 0004); halaman session tidak memakai content blocking. Default lain,
+seperti fingerprint noise, masih perlu dievaluasi sebelum dipakai sebagai browser QA
+utama; headless tidak boleh diasumsikan identik dengan mode interaktif/extension.
 Review lisensi dilakukan sebelum packaging; [NOTICE.md](../NOTICE.md) merangkum
 status tanpa menganggap pemisahan proses menghapus kewajiban distribusi.
 
@@ -249,10 +286,15 @@ yang dihemat dan beban maintenance.
 | Milestone | Hasil | Exit criteria |
 | --- | --- | --- |
 | M0 foundation | Repo, GPUI shell, validasi, real Helium capture, dokumentasi | Compile/test dan bukti Linux capture/isolation; status keterbatasan jelas |
+| M0 reliability | Reproducer slow-page, penyebab `ERR_ABORTED`, tes lifecycle/cleanup | Error dapat dijelaskan tanpa retry; tes dapat diulang; cleanup normal/error terbukti |
 | M1 interactive spike | Frame transport, navigation/scroll sync, coordinate/input mapping | Resize/DPR/IME/clipboard/popups/a11y dan latency memenuhi gate; ADR lanjut atau ganti integrasi |
 | M2 daily workflow pilot | Persistent session aman, console, capture/export, crash recovery | 5 developer 2 minggu, update/rollback rehearsal dan tidak ada isolation/data-loss bug |
 | M3 Linux rollout | Packaging/signing/support, resource control dan release ownership | Workflow pengganti Sizzy diverifikasi tim; biaya maintenance terukur |
 | M4 optional platforms | macOS lalu target lain sesuai permintaan | Test/packaging platform tersendiri, tanpa klaim dukungan dari kompilasi saja |
+
+Status 24 September 2026: M0 reliability lulus dengan bukti cloud dan CI. Spike M1
+berjalan (ADR 0005) dan lulus tes live serta pemeriksaan window X11 di cloud; checklist
+desktop Wayland/GPU, latency, HiDPI, IME, clipboard, popup dan aksesibilitas belum.
 
 Keputusan saat ini: lanjutkan foundation dan bukti integrasi, pertahankan runtime
 eksternal dan konfigurasi portabel. Full embedding perlu keputusan baru berdasarkan
@@ -270,4 +312,4 @@ dikunci di repo dan runtime manifest.
 - [Helium Linux baseline 0.18.1.1](https://github.com/imputnet/helium-linux/releases/tag/0.18.1.1)
 - [Chrome headless](https://developer.chrome.com/docs/automation-and-testing/headless)
 - [Remote debugging and private profiles](https://developer.chrome.com/blog/remote-debugging-port)
-- [CDP Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/) dan [CDP Page](https://chromedevtools.github.io/devtools-protocol/tot/Page/)
+- [CDP Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), [CDP Page](https://chromedevtools.github.io/devtools-protocol/tot/Page/) dan [CDP Input](https://chromedevtools.github.io/devtools-protocol/tot/Input/)
