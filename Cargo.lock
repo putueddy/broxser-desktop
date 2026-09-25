@@ -716,6 +716,7 @@ dependencies = [
  "broxser-engine",
  "clap",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
