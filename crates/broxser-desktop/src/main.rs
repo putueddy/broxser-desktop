@@ -66,6 +66,8 @@ impl AssetSource for FileAssets {
 }
 
 fn main() -> Result<()> {
+    // Browser guardians are this executable started again (ADR 0007).
+    broxser_engine::run_guardian_if_requested();
     let args = Args::parse();
     let mut workspace = if let Some(path) = args.workspace {
         Workspace::load(&path).with_context(|| format!("load workspace {}", path.display()))?

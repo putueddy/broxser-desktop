@@ -1,9 +1,12 @@
 //! Owned browser subprocess: private temporary profile, loopback CDP endpoint and
-//! cleanup that waits for every browser process before deleting the profile.
+//! cleanup that waits for every browser process before deleting the profile. If
+//! the Broxser process itself dies, the profile's guardian does both (ADR 0007).
 
 use crate::Limits;
 use crate::cdp::{Cancellation, Cdp};
+use crate::profile::OwnedProfile;
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::ffi::OsString;
@@ -12,10 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 
 /// How long browser processes may take to exit after the main process is killed.
-const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Helium bundles uBlock Origin as a component extension with this ID and makes
 /// it follow the per-extension incognito preference, which defaults to enabled.
@@ -77,13 +79,15 @@ pub fn discover_browser() -> Result<PathBuf> {
 
 pub(crate) struct BrowserProcess {
     child: Child,
-    profile: Option<TempDir>,
+    /// Removed after the browser stops. `None` once `shutdown` has handled it.
+    profile: Option<OwnedProfile>,
     cancel: Cancellation,
 }
 
 impl BrowserProcess {
     /// Launches the browser. `seed` writes Broxser's profile preferences first;
-    /// only the reproducer's baseline mode launches an unseeded profile.
+    /// only the reproducer's baseline mode launches an unseeded profile. The
+    /// profile's guardian is ready before the browser starts.
     pub(crate) fn start(options: &BrowserOptions, seed: bool) -> Result<Self> {
         if options.executable.as_os_str().is_empty() {
             bail!("browser executable is empty; install Helium or set BROXSER_HELIUM_BIN");
@@ -95,18 +99,12 @@ impl BrowserProcess {
             );
         }
         options.cancel.check()?;
-        let mut builder = tempfile::Builder::new();
-        builder.prefix("broxser-cdp-");
-        let profile = match &options.profile_root {
-            Some(root) => builder.tempdir_in(root),
-            None => builder.tempdir(),
-        }
-        .context("create private browser profile")?;
+        #[cfg(unix)]
+        restrict_core_dumps()?;
+        let profile = OwnedProfile::create(options.profile_root.as_deref(), &options.cancel)?;
         if seed {
             seed_profile(profile.path())?;
         }
-        #[cfg(unix)]
-        restrict_core_dumps()?;
         let child = Command::new(&options.executable)
             .args(launch_args(profile.path(), options.headless))
             // Chromium keeps its crash database under the default user data
@@ -121,11 +119,18 @@ impl BrowserProcess {
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("launch browser {}", options.executable.display()))?;
-        Ok(Self {
+        let identity = self::identity(child.id());
+        // From here on, dropping `browser` stops the child before the profile goes.
+        let mut browser = Self {
             child,
             profile: Some(profile),
             cancel: options.cancel.clone(),
-        })
+        };
+        let identity = identity.ok_or_else(|| anyhow!("read the browser's identity from /proc"))?;
+        if let Some(profile) = &mut browser.profile {
+            profile.watch(identity)?;
+        }
+        Ok(browser)
     }
 
     /// The browser, its descendants and any detached helper whose command line
@@ -140,6 +145,11 @@ impl BrowserProcess {
             }
         }
         processes
+    }
+
+    /// The guardian that cleans up if this process dies; it exits on release.
+    pub(crate) fn guardian(&self) -> Option<ProcessIdentity> {
+        self.profile.as_ref().and_then(OwnedProfile::guardian)
     }
 
     /// Waits for `DevToolsActivePort` and opens the loopback websocket.
@@ -178,22 +188,19 @@ impl BrowserProcess {
         }
     }
 
-    /// Kills the browser, waits until its process tree has exited and removes the
-    /// profile. An error means a browser process or profile file may remain.
+    /// Kills the browser, waits until its process tree has exited, removes the
+    /// profile and releases its guardian. An error means a browser process or
+    /// profile file may remain.
     pub(crate) fn shutdown(mut self) -> Result<()> {
+        #[cfg(test)]
+        crate::test_support::abort_point("before-kill");
         let processes = self.processes();
         let _ = self.child.kill();
         self.child.wait().context("wait for browser exit")?;
         let survivors = wait_for_exit(&processes, EXIT_TIMEOUT);
-        let removal = match self.profile.take() {
-            Some(profile) => {
-                let path = profile.path().to_owned();
-                profile
-                    .close()
-                    .with_context(|| format!("remove browser profile {}", path.display()))
-            }
-            None => Ok(()),
-        };
+        #[cfg(test)]
+        crate::test_support::abort_point("before-remove");
+        let removal = self.profile.take().map_or(Ok(()), OwnedProfile::close);
         if survivors > 0 {
             bail!("{survivors} browser processes did not exit after the browser was stopped");
         }
@@ -203,12 +210,18 @@ impl BrowserProcess {
 
 impl Drop for BrowserProcess {
     fn drop(&mut self) {
-        // Fallback for early returns and panics. `shutdown` is the checked path;
-        // neither runs if the Broxser process itself is killed.
-        let processes = self.processes();
+        // Fallback for early returns and panics; `shutdown` is the checked path.
+        // After `shutdown` the reaped PID may belong to another process.
+        let Some(profile) = self.profile.take() else {
+            return;
+        };
+        let mut processes = process_tree(self.child.id());
+        processes.extend(referencing(profile.path()));
         let _ = self.child.kill();
         let _ = self.child.wait();
         wait_for_exit(&processes, EXIT_TIMEOUT);
+        // Removes the profile, then releases the guardian.
+        drop(profile);
     }
 }
 
@@ -299,10 +312,92 @@ pub(crate) fn parse_endpoint(contents: &str) -> Result<(u16, String)> {
 
 /// A process identified by PID and kernel start time, so a reused PID is never
 /// mistaken for a browser process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProcessIdentity {
     pub pid: u32,
     pub start_time: u64,
+}
+
+/// The identity of the process that holds `pid` now, zombies included.
+#[cfg(target_os = "linux")]
+pub(crate) fn identity(pid: u32) -> Option<ProcessIdentity> {
+    procfs::read(pid).map(|process| process.identity)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
+}
+
+/// `root` and its current descendants, or nothing if `root` has exited or its
+/// PID now belongs to another process.
+pub(crate) fn descendants(root: &ProcessIdentity) -> Vec<ProcessIdentity> {
+    let tree = process_tree(root.pid);
+    if tree.first() == Some(root) {
+        tree
+    } else {
+        Vec::new()
+    }
+}
+
+/// Sends SIGKILL to `process` if it is still running. The pidfd pins whichever
+/// process holds the PID before its start time is compared, so a reused PID is
+/// never signaled. Returns whether a signal was sent.
+#[cfg(target_os = "linux")]
+pub(crate) fn terminate(process: &ProcessIdentity) -> std::io::Result<bool> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    let Some(pid) = i32::try_from(process.pid).ok().and_then(Pid::from_raw) else {
+        return Ok(false);
+    };
+    let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(Errno::SRCH) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !is_running(process) {
+        return Ok(false);
+    }
+    match pidfd_send_signal(&pidfd, Signal::KILL) {
+        Ok(()) => Ok(true),
+        Err(Errno::SRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn terminate(_process: &ProcessIdentity) -> std::io::Result<bool> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Fails unless process file descriptors work (Linux 5.3 or newer), which
+/// guardians need to signal only the processes they recorded.
+#[cfg(target_os = "linux")]
+pub(crate) fn check_pidfd() -> Result<()> {
+    use rustix::process::{PidfdFlags, getpid, pidfd_open};
+    pidfd_open(getpid(), PidfdFlags::empty())
+        .map(drop)
+        .context("process file descriptors are unavailable; Linux 5.3 or newer is required")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn check_pidfd() -> Result<()> {
+    bail!("browser crash cleanup is implemented for Linux only (ADR 0007)")
+}
+
+/// Running processes started with `--user-data-dir=<profile>`, the argument
+/// Broxser gives each browser it launches on that private profile.
+#[cfg(target_os = "linux")]
+pub(crate) fn launched_with(profile: &Path) -> Vec<ProcessIdentity> {
+    let mut argument = b"--user-data-dir=".to_vec();
+    argument.extend_from_slice(profile.as_os_str().as_encoded_bytes());
+    procfs::with_argument(&argument)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn launched_with(_profile: &Path) -> Vec<ProcessIdentity> {
+    Vec::new()
 }
 
 /// The browser and its current descendants. Chromium's sandboxed zygotes,
@@ -399,16 +494,38 @@ pub(crate) mod procfs {
     /// Running processes whose command line mentions `path`.
     pub(crate) fn referencing(path: &Path) -> Vec<ProcessIdentity> {
         let needle = path.as_os_str().as_encoded_bytes();
+        matching(|cmdline| cmdline.windows(needle.len()).any(|window| window == needle))
+    }
+
+    /// Running processes with `argument` as one whole argument. Chromium may
+    /// rewrite its title and join arguments with spaces, so a space ends one too.
+    pub(crate) fn with_argument(argument: &[u8]) -> Vec<ProcessIdentity> {
+        matching(|cmdline| has_argument(cmdline, argument))
+    }
+
+    fn matching(condition: impl Fn(&[u8]) -> bool) -> Vec<ProcessIdentity> {
         all()
             .into_iter()
             .filter(|process| !process.zombie)
             .filter(|process| {
-                fs::read(format!("/proc/{}/cmdline", process.identity.pid)).is_ok_and(|cmdline| {
-                    cmdline.windows(needle.len()).any(|window| window == needle)
-                })
+                fs::read(format!("/proc/{}/cmdline", process.identity.pid))
+                    .is_ok_and(|cmdline| condition(&cmdline))
             })
             .map(|process| process.identity)
             .collect()
+    }
+
+    pub(super) fn has_argument(cmdline: &[u8], argument: &[u8]) -> bool {
+        let boundary = |byte: Option<&u8>| matches!(byte, None | Some(0 | b' '));
+        !argument.is_empty()
+            && cmdline
+                .windows(argument.len())
+                .enumerate()
+                .any(|(at, window)| {
+                    window == argument
+                        && (at == 0 || boundary(cmdline.get(at - 1)))
+                        && boundary(cmdline.get(at + argument.len()))
+                })
     }
 
     /// Parses `/proc/<pid>/stat`: the command name may contain spaces or
@@ -543,5 +660,49 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(wait_for_exit(&tree, Duration::from_secs(2)), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_argument_matches_only_a_whole_argument() {
+        let argument = b"--user-data-dir=/tmp/broxser-cdp-a";
+        assert!(procfs::has_argument(
+            b"helium\0--user-data-dir=/tmp/broxser-cdp-a\0about:blank\0",
+            argument
+        ));
+        // Chromium's rewritten process title joins arguments with spaces.
+        assert!(procfs::has_argument(
+            b"helium --type=zygote --user-data-dir=/tmp/broxser-cdp-a",
+            argument
+        ));
+        for other in [
+            &b"helium\0--user-data-dir=/tmp/broxser-cdp-ab\0"[..],
+            b"ls\0/tmp/broxser-cdp-a\0",
+            b"x--user-data-dir=/tmp/broxser-cdp-a\0",
+        ] {
+            assert!(!procfs::has_argument(other, argument), "{other:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_signals_only_the_recorded_process() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let recorded = identity(child.id()).unwrap();
+        let reused = ProcessIdentity {
+            start_time: recorded.start_time + 1,
+            ..recorded
+        };
+        assert!(!terminate(&reused).unwrap());
+        assert_eq!(descendants(&reused), []);
+        assert!(is_running(&recorded), "another start time was signaled");
+        assert_eq!(descendants(&recorded), [recorded]);
+        assert!(terminate(&recorded).unwrap());
+        child.wait().unwrap();
+        assert!(
+            !terminate(&recorded).unwrap(),
+            "a reaped process was signaled"
+        );
+        assert_eq!(descendants(&recorded), []);
     }
 }

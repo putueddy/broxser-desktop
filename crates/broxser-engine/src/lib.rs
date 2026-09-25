@@ -5,12 +5,18 @@
 //! worker thread; it blocks on browser I/O and stops only its own child.
 //! [`LiveSession`] keeps one browser alive for an open workspace and streams
 //! frames to the desktop; its worker thread owns all browser I/O.
+//!
+//! Each browser gets a guardian process that stops it and removes its profile
+//! if the Broxser process dies (ADR 0007). Binaries that launch browsers must
+//! call [`run_guardian_if_requested`] first in `main`.
 
 mod browser;
 mod capture;
 mod cdp;
 mod device;
+mod guardian;
 mod live;
+mod profile;
 #[cfg(test)]
 mod test_support;
 
@@ -19,6 +25,7 @@ use std::time::Duration;
 pub use browser::{BrowserOptions, discover_browser};
 pub use capture::{CaptureFrame, CaptureReport, capture_workspace};
 pub use cdp::{Cancellation, Cancelled};
+pub use guardian::run_guardian_if_requested;
 pub use live::{
     Command, DeviceStatus, Frame, KeyInput, LiveSession, Modifiers, PointerButton, PointerEvent,
     PointerKind, RuntimeState, Status, SyncSettings, to_viewport,
