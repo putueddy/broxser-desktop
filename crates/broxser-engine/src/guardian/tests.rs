@@ -256,11 +256,14 @@ struct Armed {
 }
 
 impl Armed {
-    /// Every process of the instance: its guardian, the browser tree and the
-    /// detached helpers naming the profile. All of them run when this returns.
+    /// Every running process of the instance: its guardian, the browser tree
+    /// and the detached helpers naming the profile. The guardian and the
+    /// browser run when this returns; a short-lived child of a fake browser's
+    /// helper that exited after the snapshot is left out.
     fn processes(&self) -> Vec<ProcessIdentity> {
-        let mut processes = vec![self.lease.guardian.unwrap()];
-        for process in browser::descendants(&self.lease.browser.unwrap())
+        let (guardian, browser) = (self.lease.guardian.unwrap(), self.lease.browser.unwrap());
+        let mut processes = vec![guardian];
+        for process in browser::descendants(&browser)
             .into_iter()
             .chain(browser::referencing(&self.profile))
         {
@@ -268,8 +271,9 @@ impl Armed {
                 processes.push(process);
             }
         }
+        processes.retain(browser::is_running);
         assert!(
-            processes.len() >= 2 && processes.iter().all(browser::is_running),
+            processes.contains(&guardian) && processes.contains(&browser),
             "the instance is not running before its owner dies"
         );
         processes

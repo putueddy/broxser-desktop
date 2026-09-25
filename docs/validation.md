@@ -141,6 +141,24 @@ shutdown and the guardian (owner SIGKILLed) both left `Default/` behind in 8 of 
 runs; after it, 10 of 10 runs passed, the guardian finishing 334–357 ms after the
 owner died.
 
+### Snapshot race in the late-helper test (CI run #39)
+
+`guardian_waits_for_helpers_started_after_its_owner_died` failed CI run #39 for PR 7
+and its re-run with "the instance is not running before its owner dies"; the push
+run of the same commit passed. The test helper recorded the browser's descendants
+and then required every one of them to run. The fake browser's helper polls
+`/proc` with `sleep 0.02`, so the record could hold a `sleep` that had exited by
+the check; the guardian was not involved. Instrumented runs found one exited
+process (empty command line) out of four. The test alone, in four parallel loops
+of 150 runs as the unprivileged user, failed 23 of 600 runs on `035b6fe`.
+
+The helper now keeps the recorded processes that still run and still requires the
+guardian and the browser among them. A process that exited before the owner died
+needs no cleanup, and the checks after the death are unchanged. Under the same
+load the test then failed 0 of 600 runs on `035b6fe` and 0 of 1200 on PR 7's head;
+`check.sh` passed, and the live Helium suite passed 18 of 18 twice with four test
+threads (40.8–43.7 s).
+
 ## PR 4 review fixes 25 September 2026
 
 Verified locally with Rust 1.98.1, GPUI 0.2.2 and the pinned Helium 0.18.1.1.
