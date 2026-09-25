@@ -9,7 +9,7 @@ Perubahan desain selanjutnya harus memperbarui dokumen dan ADR terkait.
 
 > **Snapshot Word perlu diselaraskan.** Sejak M0 reliability dan spike M1
 > (24 September 2026) Markdown ini diperbarui di lingkungan tanpa renderer dokumen;
-> DOCX belum diubah atau dirender ulang dan tidak mencerminkan ADR 0004 dan 0005.
+> DOCX belum diubah atau dirender ulang dan tidak mencerminkan ADR 0004–0007.
 
 ## 1. Abstract
 
@@ -87,7 +87,7 @@ flowchart TB
 | Komponen | Tanggung jawab dan batas | Kegagalan |
 | --- | --- | --- |
 | `broxser-core` | Validasi, workspace v1, pure sync routing; tanpa UI/network | Input ditolak sebelum browser dimulai |
-| `broxser-engine` | Proses browser, CDP, emulasi, capture dan gate ekstensi | Error terbatas waktu dan dapat dibatalkan; child dan profil dihapus |
+| `broxser-engine` | Proses browser dan guardian-nya, lease profil, CDP, emulasi, capture dan gate ekstensi | Error terbatas waktu dan dapat dibatalkan; child dan profil dihapus, oleh guardian bila proses Broxser mati |
 | `broxser-desktop` | State UI, frame live, input, sync toggle, mode statis | Tampilkan status; tutup window setelah cleanup |
 | `broxser-cli` | Validasi, bootstrap config, capture untuk otomasi | Exit nonzero; tidak menyatakan capture sukses |
 | Helium | Network, DOM/CSS/JS, storage, sandbox Chromium | Hentikan job; jangan replay aksi pengguna |
@@ -108,10 +108,12 @@ agar fitur lokal bekerja.
    referensi session, viewport dan anggaran piksel.
 2. Ambil executable Helium dari `BROXSER_HELIUM_BIN` atau PATH. `--browser` menerima
    pilihan eksplisit untuk pengujian. Jangan diam-diam beralih ke Chromium.
-3. UI menjalankan capture di background, maksimal satu job aktif. Buat profil
-   sementara privat, isi preferensinya sebelum launch (blocker bawaan Helium tidak
-   aktif di context session, ADR 0004), arahkan crash dump ke profil itu, lalu
-   jalankan child browser dengan sandbox tetap aktif.
+3. UI menjalankan capture di background, maksimal satu job aktif. Pulihkan profil
+   stale di root yang sama, buat profil sementara privat (mode 0700) dengan lease
+   pemilik, jalankan guardian dan tunggu sampai siap (ADR 0007), isi preferensi
+   profil sebelum launch (blocker bawaan Helium tidak aktif di context session,
+   ADR 0004), arahkan crash dump ke profil itu, lalu jalankan child browser dengan
+   sandbox tetap aktif dan laporkan identitasnya ke guardian.
 4. Baca `DevToolsActivePort` dari profil tersebut. Validasi port dan path, lalu
    hubungkan hanya ke `127.0.0.1`. Catat `Browser.getVersion` dan versi protokol.
 5. Aktifkan target discovery, buat konteks session dan target, atur emulasi,
@@ -122,7 +124,15 @@ agar fitur lokal bekerja.
    pengembangan lanjutan.
 6. Kembalikan file capture dan metadata. UI menampilkan preview statis; CLI
    mengekspor PNG dan `report.json`. Hentikan browser, tunggu seluruh prosesnya
-   keluar (identitas PID dan waktu mulai), lalu hapus profil sementara.
+   keluar (identitas PID dan waktu mulai), hapus profil sementara (lease terakhir),
+   lalu lepaskan guardian.
+
+Bila proses Broxser mati di langkah mana pun (SIGKILL, SIGTERM, crash), pipe ke
+guardian tertutup oleh kernel. Guardian di session sendiri menghentikan browser
+yang tercatat, menunggu helper-nya dan menghapus profil; bila guardian ikut mati,
+start berikutnya di root yang sama menghapus profil yang terbukti stale dan
+menghentikan browser yatim yang masih memakai profil itu. Keduanya tidak memutar
+ulang aksi pengguna.
 
 Live session memakai langkah 2–5 yang sama, lalu tetap hidup: worker memiliki
 seluruh I/O CDP, UI hanya mengirim command ke antrean berbatas dan membaca status
@@ -192,15 +202,18 @@ web; side effect di server tidak bisa dibatalkan oleh router lokal.
 Halaman web adalah input tidak tepercaya; jangan beri akses filesystem, shell,
 native app atau credential melalui bridge. CDP memiliki hak penuh atas browser
 child; loopback mengurangi paparan jaringan, tetapi tidak mengautentikasi proses
-lokal lain. Evaluasi transport pipe sebelum rollout luas; transport itu juga akan
-menghentikan browser bila proses Broxser mati mendadak, yang saat ini meninggalkan
-browser yatim dan profil sementara. Profil pribadi pengguna tidak boleh dipakai;
-crash dump diarahkan ke profil privat, sedangkan database sertifikat NSS bersama
-masih dibuka Chromium. Core dump kernel dibatasi (soft `RLIMIT_CORE` dan
-`coredump_filter` 0, diwarisi browser): dump tidak memuat memori renderer, sehingga
-cookie dan isi halaman tidak sampai ke systemd-coredump atau apport, dan crash
-renderer tidak tertahan di jalur dump. Jangan menambahkan `--no-sandbox`, wildcard
-debug origins, atau mengabaikan sertifikat untuk memudahkan test.
+lokal lain. Evaluasi transport pipe sebelum rollout luas untuk membatasi akses CDP
+lokal. Kematian proses Broxser ditangani guardian per browser dan lease profil
+(ADR 0007): browser, endpoint CDP dan profil hilang dalam batas lima detik yang
+terukur di tes; bila guardian ikut mati, profil stale dipulihkan pada start
+berikutnya di root yang sama. Profil dibuat dengan mode 0700; profil pribadi
+pengguna tidak boleh dipakai. Crash dump diarahkan ke profil privat, sedangkan
+database sertifikat NSS bersama masih dibuka Chromium. Core dump kernel dibatasi
+(soft `RLIMIT_CORE` dan `coredump_filter` 0, diwarisi browser): dump tidak memuat
+memori renderer, sehingga cookie dan isi halaman tidak sampai ke systemd-coredump
+atau apport, dan crash renderer tidak tertahan di jalur dump. Jangan menambahkan
+`--no-sandbox`, wildcard debug origins, atau mengabaikan sertifikat untuk
+memudahkan test.
 
 HTTP localhost dan jaringan internal sengaja didukung. Validasi URL awal bukan
 allowlist redirect; CLI bukan layanan URL-fetch publik. Upstream browser tetap
@@ -295,6 +308,11 @@ yang dihemat dan beban maintenance.
 Status 24 September 2026: M0 reliability lulus dengan bukti cloud dan CI. Spike M1
 berjalan (ADR 0005) dan lulus tes live serta pemeriksaan window X11 di cloud; checklist
 desktop Wayland/GPU, latency, HiDPI, IME, clipboard, popup dan aksesibilitas belum.
+
+Status 25 September 2026: P0 cleanup saat proses induk mati diimplementasikan
+(ADR 0007) dan lulus reproducer fake browser, Helium live, CLI serta window X11 di
+cloud. Preview mode statis dan direktori socket Chromium di temp dir belum tercakup;
+kualifikasi pada desktop dan distro perusahaan masih diperlukan.
 
 Keputusan saat ini: lanjutkan foundation dan bukti integrasi, pertahankan runtime
 eksternal dan konfigurasi portabel. Full embedding perlu keputusan baru berdasarkan

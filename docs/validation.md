@@ -3,6 +3,102 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P0 cleanup after owner death, 25 September 2026 (cloud container)
+
+Ubuntu 24.04.4 container, kernel 6.18, x86_64, 4 vCPU, 15 GB RAM, `pid_max` 32768,
+Rust 1.98.1, GPUI 0.2.2, Helium 0.18.1.1 from `scripts/fetch-helium.sh` (binary
+SHA-256 `50d69027…40890`). Browser tests ran as the unprivileged user
+`broxsertest` with the sandbox enabled. The container lacked `libxkbcommon-dev`
+and `libxkbcommon-x11-dev`, so the first baseline `check.sh` failed to link the
+desktop tests; after installing the packages CI also installs, baseline `d6e7e97`
+passed (8 core, 28 engine and 4 desktop tests, strict Clippy) and the live suite
+passed 14 of 14. X11 checks used Xvfb with Mesa lavapipe (`mesa-vulkan-drivers`
+25.2.8) and Ubuntu's xdotool; nothing on the host desktop was changed.
+
+### Before the change
+
+A scratch copy of the reproducer, run on `d6e7e97` and not committed, recorded the
+state five seconds after the owner died:
+
+| Owner death | State five seconds later |
+| --- | --- |
+| Capture startup, fake browser: SIGKILL, SIGTERM, `abort()` | Browser running, profile present |
+| Capture startup: SIGTERM to the owner's process group | Browser gone (it received the signal), profile present |
+| Helium, held capture request: SIGKILL, SIGTERM | 15 of 15 browser processes running, CDP port open, profile present |
+| Helium, live frames: SIGKILL, SIGTERM | 15 of 15 running, CDP port open, profile present |
+
+A separate Python experiment (parent SIGKILLed, Helium on `about:blank`) measured
+the candidate mechanisms for ADR 0007. With the CDP websocket held by the parent,
+all 12 processes stayed alive for ten seconds with the port open.
+`PR_SET_PDEATHSIG=SIGKILL` (through `setpriv`) and `--remote-debugging-pipe` both
+stopped them within 0.5 s but left the profile. SIGKILL of only the main browser
+process ended all 12 in 37–87 ms, including two `helium_crashpad` handlers that run
+in their own sessions with parent PID 1.
+
+Profiles were created with mode 0755 (the `tempfile` default under umask 022) and
+Chromium kept it: `DevToolsActivePort` and some metadata files were readable by
+other local users; `Default/` was 0700. Profiles are now created with mode 0700.
+
+### After the change
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 45 engine (one is the libtest entry point for re-executed roles) and 4 desktop tests; strict Clippy for default members and desktop; 18 live tests ignored by default |
+| Default engine tests, 25 consecutive runs as the unprivileged user | 25 passed, repeated after the last test changes |
+| Whole live Helium suite, two test threads | Passed 18 of 18 in 46 s: the 14 earlier tests (slow-page reproducer six runs without failure, renderer crash reported after 40 ms) and 4 new ones |
+| `scripts/desktop-smoke.sh` under Xvfb | Passed all five runs, below |
+
+Measured from owner death until every process of that instance (browser tree,
+detached helpers and guardian) had exited and its profile was gone, over several
+runs. Each test first proves the instance is running, then checks that another
+instance in the same root keeps running, that the CDP port closed and that no
+document request was replayed.
+
+| Scenario | Owner death | Gone after |
+| --- | --- | --- |
+| Fake browser, capture and live startup | SIGKILL, SIGTERM, `abort()` | 26 ms |
+| Fake browser, capture startup | SIGTERM to the process group | 5 ms |
+| Fake browser, capture and live teardown | `abort()` before the kill or before profile removal | 45–65 ms |
+| Helium, held capture request | SIGKILL, SIGTERM, `abort()` | 62–90 ms (16 processes with the guardian) |
+| Helium, live frames | SIGKILL, SIGTERM, `abort()`, SIGTERM to the process group | 38–99 ms |
+| Helium, live teardown | `abort()` before the kill or before profile removal | 53–70 ms |
+| Real `broxser` CLI during a capture | SIGKILL | 26 ms |
+| Helium orphan: owner and guardian killed, browser left running | Next browser start in the same root | 56–60 ms for 15 processes |
+
+| Desktop smoke run | Result |
+| --- | --- |
+| Live, Ctrl+Q | Exit 0 after 155 ms; 15 browser processes before, 0 after; nothing left |
+| Static close during a held request | Exit 0 after 307–505 ms; nothing left |
+| Live, SIGKILL | Exit 137; 0 browser processes and profiles when checked 69–71 ms later; window gone |
+| Live, SIGINT to its process group (Ctrl+C) | Exit 130; 0 processes and profiles when checked 134 ms later; window gone |
+| Static, SIGTERM during a held request | Exit 143; 0 processes and profiles after 68 ms; one preview directory left (below) |
+
+Guardian cost: one process per browser, not per frame, with one thread and 12.3 MB
+VmRSS under the debug desktop binary (2.7 MB anonymous, the rest shared file
+pages). A profile with its lease and a ready guardian took 4 ms warm and 26 ms
+cold in tests. `ps` shows `broxser-guardian --broxser-browser-guardian`; the kernel
+command name is `exe` because the guardian starts through `/proc/self/exe`.
+
+Findings and limits:
+
+- Pre-existing and also on normal close: each browser run leaves Chromium's
+  process-singleton directory `org.chromium.Chromium.XXXXXX` (mode 0700, a dead
+  socket and a cookie symlink, no page data) in the temporary directory, because
+  Broxser stops browsers with SIGKILL. Not changed here; a candidate is pointing
+  the browser's `TMPDIR` into its profile, followed by the whole live suite.
+- Static preview directories (`broxser-preview-*`) belong to the desktop, not to a
+  browser, and still remain after the desktop is killed.
+- Profiles left by earlier Broxser versions have no lease and are never removed
+  automatically; delete stale `broxser-cdp-*` directories once by hand.
+- The container's PID 1 reaps orphans with a delay. Zombies count as exited, as
+  `is_running` already did.
+- A non-interactive shell starts background jobs with SIGINT ignored. The first
+  Ctrl+C smoke attempt therefore left the desktop running while Helium stopped
+  itself; the script now enables job control for that run, as a terminal does.
+- Not checked: the kill scenarios on Wayland or a physical GPU, other distros and
+  kernels, and macOS (unsupported; guardians need Linux 5.3+ pidfds). The System
+  Design DOCX was not re-rendered.
+
 ## PR 4 review fixes 25 September 2026
 
 Verified locally with Rust 1.98.1, GPUI 0.2.2 and the pinned Helium 0.18.1.1.
@@ -347,9 +443,10 @@ engine suite with Helium.
   register state. A browser change that resets the inherited `coredump_filter`
   would bring back large dumps and delayed crash reports; the live crash test and
   its diagnostics would show it.
-- If the Broxser process is killed (SIGTERM, SIGKILL, crash), `Drop` does not run:
-  the browser keeps running with its loopback CDP port and temporary files remain.
-  Candidate fixes: pipe transport, parent-death signal and a stale-profile sweep.
+- Owner death is handled by guardians and profile leases (ADR 0007, P0 section
+  above). Still open: static preview directories and Chromium's singleton socket
+  directory after a kill, profiles in roots never used again, and qualification of
+  the kill scenarios on company desktops, distros and kernels.
 - Physical GPU, Wayland compositors, fractional scaling, IME and accessibility
   need a real desktop session; the cloud check above is X11 on software Vulkan.
 - Before a team rollout: multiple distro/GPU combinations, SPA readiness,
