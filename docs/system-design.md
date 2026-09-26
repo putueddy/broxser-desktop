@@ -297,8 +297,10 @@ Pertahankan core dan kontrak data yang kecil, serta kemampuan mengganti adapter.
 Angka performa adalah target awal, **belum hasil benchmark**. Definisikan laptop
 16 GB, distro/GPU/driver, 3 viewport DPR1 dan fixture yang sama sebelum mengukur.
 Browser halaman dunia nyata bisa memakai jauh lebih banyak memori; batas piksel
-bukan hard memory limit. Stop/adaptive suspension perlu dibuktikan sebelum 8 device
-dipakai sebagai fitur production.
+bukan hard memory limit. Device yang ter-scroll keluar canvas kini menjeda
+screencast-nya (ADR 0012); di kontainer software-rendering hal itu menurunkan CPU
+browser 8 device beranimasi dari 170% ke 97%. Kualifikasi pada hardware referensi
+masih diperlukan sebelum 8 device dipakai sebagai fitur production.
 
 Cargo.lock, Rust toolchain, GPUI exact version dan checksum Helium memberi baseline
 yang dapat direproduksi. Dependabot membantu Rust/action; pembaruan browser tetap

@@ -5,8 +5,11 @@
 # process group (Ctrl+C) while live frames stream, and with SIGTERM during a held
 # static capture: the browser guardian must stop the browser and remove its
 # profile (ADR 0007). Two runs kill the live browser and click Restart twice,
-# once followed by Ctrl+Q: at most one browser may start (ADR 0009). Every run
-# must leave no browser process or profile behind, and the window must be gone.
+# once followed by Ctrl+Q: at most one browser may start (ADR 0009). The last
+# run types while every page animates; use a release build
+# (BROXSER_DESKTOP_BIN=target/release/broxser-desktop) for it to cover the GPUI
+# atlas race of ADR 0012. Every run must leave no browser process or profile
+# behind, and the window must be gone.
 # Needs an X11 display (a desktop session or Xvfb), xdotool, python3,
 # BROXSER_HELIUM_BIN and a built desktop binary. It does not check rendering
 # quality, Wayland, IME, accessibility or a physical GPU.
@@ -205,6 +208,124 @@ restart_run() {
   if [[ $quit == quit ]]; then [[ $launches -le 1 ]]; else [[ $launches -eq 1 ]]; fi
 }
 
+# Succeeds once the window region X Y WIDTH HEIGHT has changed in each of six
+# consecutive half seconds, read every 100 ms with XGetImage, within TIMEOUT
+# seconds: device frames that are displayed and keep changing. A static page
+# changes in a burst of about a second while it loads, then not at all.
+# xdotool already needs libX11.
+frames_change() {
+  python3 - "$@" <<'PY'
+import ctypes, sys, time
+window = int(sys.argv[1], 0)
+x, y, width, height = (int(value) for value in sys.argv[2:6])
+deadline = time.monotonic() + float(sys.argv[6])
+
+class XImage(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int) for name in ("width", "height", "xoffset", "format")]
+    _fields_ += [("data", ctypes.c_void_p)]
+    _fields_ += [(name, ctypes.c_int) for name in ("byte_order", "bitmap_unit",
+        "bitmap_bit_order", "bitmap_pad", "depth", "bytes_per_line", "bits_per_pixel")]
+
+xlib = ctypes.CDLL("libX11.so.6")
+xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+xlib.XOpenDisplay.restype = ctypes.c_void_p
+xlib.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int]
+xlib.XGetImage.restype = ctypes.POINTER(XImage)
+xlib.XFree.argtypes = [ctypes.c_void_p]
+display = xlib.XOpenDisplay(None)
+if not display:
+    sys.exit("cannot open the X display")
+previous, changed, streak = None, False, 0
+slice_end = time.monotonic() + 0.5
+while time.monotonic() < deadline:
+    image = xlib.XGetImage(display, window, x, y, width, height, 0xFFFFFFFF, 2)  # ZPixmap
+    if image:
+        pixels = ctypes.string_at(image.contents.data,
+                                  image.contents.bytes_per_line * image.contents.height)
+        xlib.XFree(image.contents.data)
+        xlib.XFree(image)
+        changed |= previous is not None and pixels != previous
+        previous = pixels
+    if time.monotonic() >= slice_end:
+        streak = streak + 1 if changed else 0
+        if streak >= 6:
+            sys.exit(0)
+        changed, slice_end = False, slice_end + 0.5
+    time.sleep(0.1)
+sys.exit(1)
+PY
+}
+
+# Types 1500 keys into the selected device while every device animates, then
+# quits. Before the atlas fix in ADR 0012 a release build panicked in GPUI's
+# texture atlas within seconds; a debug build rarely reaches that race. Typing
+# starts only once the browser requested PAGE and the phone and tablet frames
+# are seen animating in the window; the two Guest devices share one browser
+# context and may load PAGE from its cache. Every path closes the desktop and
+# checks that no browser process or profile is left.
+typing_run() {
+  local label=$1 page=$2
+  local before app window= requests=0 keys failure= left_processes left_profiles code=0
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/$page" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    xdotool windowsize "$window" 1360 861 || true
+    # Without a window manager the window draws and takes keys once the
+    # pointer is in it.
+    xdotool mousemove --window "$window" 600 400 || true
+    for _ in $(seq 300); do
+      requests=$(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "/$page" || true)
+      [[ $requests -gt 0 ]] && break
+      sleep 0.1
+    done
+    # At 50% zoom in this window the phone frame (195 × 422 px) is at (267, 180)
+    # and the tablet frame (384 × 512 px) at (508, 180); the fixture's box moves
+    # through these bands of them. The desktop device is below the fold.
+    if [[ $requests -eq 0 ]]; then
+      failure="the browser did not request /$page within 30 s"
+    elif ! frames_change "$window" 270 205 190 75 15; then
+      failure="the phone frame did not animate within 15 s"
+    elif ! frames_change "$window" 512 215 376 75 15; then
+      failure="the tablet frame did not animate within 15 s"
+    fi
+  fi
+  if [[ -z $failure ]]; then
+    # Frames churn the atlas for a while first: an unpatched release build
+    # then crashed in 4 of 4 runs, against 2 of 4 when typing began at once.
+    sleep 20
+    keys=$(printf 'x%.0s' $(seq 1500))
+    xdotool type --delay 10 "$keys" || failure="xdotool could not type"
+    if ! kill -0 "$app" 2>/dev/null; then
+      failure="the desktop exited while typing"
+    elif [[ -z $failure ]] && ! frames_change "$window" 270 205 190 75 15; then
+      failure="the phone frame stopped animating after typing"
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  # A desktop that died leaves the browser to its guardian (ADR 0007).
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-1500 keys typed}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -212,4 +333,5 @@ run "live SIGINT to its process group" "/live.html" INT-group --url "http://127.
 run "static SIGTERM during held request" "/hang" TERM --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 restart_run "live Restart clicked twice" stay
 restart_run "live Restart clicked twice, then Ctrl+Q" quit
+typing_run "typing while pages animate" animation.html
 echo "desktop smoke passed"

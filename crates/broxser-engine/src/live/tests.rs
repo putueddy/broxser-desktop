@@ -2726,6 +2726,85 @@ fn live_session_bounds_frames_and_pauses_hidden_devices() {
 
 #[test]
 #[ignore = "requires an installed CDP browser"]
+fn live_off_screen_devices_pause_frames_keep_input_and_resume_fresh() {
+    // A static page that changes once, when the test says so.
+    let change = Arc::new(AtomicBool::new(false));
+    let changed = Arc::clone(&change);
+    let fixture = Fixture::start(move |request, _| {
+        Reply::Html {
+        body: match request.path.as_str() {
+            "/change" if changed.load(Ordering::SeqCst) => "yes".into(),
+            "/change" => "no".into(),
+            path if path.starts_with("/event") => String::new(),
+            _ => "<body style='margin:0;background:#fff'><script>
+                const report = (kind) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth}));
+                addEventListener('mousedown', () => report('down'), true);
+                const poll = setInterval(() => fetch('/change').then(r => r.text()).then(answer => {
+                  if (answer !== 'yes') return;
+                  clearInterval(poll);
+                  document.body.style.background = '#f00';
+                  report('changed');
+                }), 100);
+                </script>"
+                .into(),
+        },
+        delay: Duration::ZERO,
+        cookie: None,
+    }
+    });
+    let live = Live::start(workspace(fixture.url("/")));
+    live.wait("pages", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/")
+    });
+    thread::sleep(Duration::from_millis(500));
+    live.send(Command::SetOnScreen {
+        device: 0,
+        on_screen: false,
+    });
+    live.wait("phone paused", Duration::from_secs(5), |status| {
+        !status.devices[0].streaming
+    });
+    thread::sleep(Duration::from_millis(500));
+    let paused = live.session().status().devices[0].frames;
+    // Unlike a hidden device, a device off screen takes input.
+    click(&live, 0, 40.0, 300.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| {
+            events(fixture, "down")
+                .iter()
+                .any(|event| event["w"] == "360")
+        }),
+        "an off-screen device dropped a click"
+    );
+    // Showing a device does not resume it while it is off screen.
+    for visible in [false, true] {
+        live.send(Command::SetVisible { device: 0, visible });
+    }
+    change.store(true, Ordering::SeqCst);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        events(fixture, "changed")
+            .iter()
+            .any(|event| event["w"] == "360")
+    }));
+    thread::sleep(Duration::from_millis(500));
+    let status = live.session().status();
+    assert!(!status.devices[0].streaming, "{status:#?}");
+    assert_eq!(status.devices[0].frames, paused, "frames while off screen");
+    assert!(live.session().take_frame(0).is_none());
+    // The page is static again; resuming still brings a frame of its change.
+    live.send(Command::SetOnScreen {
+        device: 0,
+        on_screen: true,
+    });
+    live.wait("phone resumes", Duration::from_secs(5), |status| {
+        status.devices[0].streaming && status.devices[0].frames > paused
+    });
+    assert!(live.session().take_frame(0).is_some());
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
 fn live_session_reports_crashes_and_browser_exit() {
     let fixture = fixture();
     let live = Live::start(workspace(fixture.url("/")));

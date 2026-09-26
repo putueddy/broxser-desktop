@@ -217,7 +217,9 @@ ketika proses induk mati (P0) diimplementasikan melalui guardian dan lease profi
 deadline command dan navigasi live (P1.1) melalui ADR 0008, transisi restart
 runtime (P1.2) melalui ADR 0009, serta keyboard, tombol browser dan paste
 eksplisit (P1.3) melalui ADR 0010, serta input handler IME dan caret melalui
-ADR 0011; prioritas berikutnya ialah kualifikasi resource dan workflow harian M2.
+ADR 0011. P1.4 (ADR 0012) memperbaiki crash atlas GPUI saat mengetik selama
+animasi, menjeda device di luar canvas dan mengukur 3/8 device; prioritas
+berikutnya ialah navigasi aplikasi modern (P1.5) dan workflow harian M2.
 Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
 hardware dan pengukuran performa lebih luas masih diperlukan sebelum pilot dan
 evaluasi penggantian subscription.
