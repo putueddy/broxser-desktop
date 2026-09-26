@@ -67,13 +67,21 @@ is answered by the browser process within 3 ms and closes the held request.
   "The page is not responding to input". New input for it is then dropped, never
   queued or sent later, until the page answers again. A newly committed document,
   a crash or a detached target forgets the old input. An error already shown,
-  such as an open dialog or a crash, stays. Explicit navigation remains possible.
-- **Isolation.** The per-device limits add up to the runtime's table
-  (8 devices × 33 commands), so one device can never fill it. Other devices keep
-  their frames, input and navigation.
+  such as a crash, stays, and explicit navigation remains possible. An open
+  dialog is different: it is no sign that the page stopped responding, so this
+  check pauses instead of tripping while one is open, and Broxser refuses
+  navigation for that device until the dialog is answered (ADR 0014).
+- **Isolation.** The per-device limits add up to the runtime's table (8 devices
+  × 34 commands: 32 input events, one navigation and one dialog answer each),
+  so one device can never fill it. Other devices keep their frames, input and
+  navigation.
 - **Browser.** Fire-and-forget commands that the browser process answers itself
   (screencast start, stop and acknowledgements, input ignore) must be answered
   within 15 s. Otherwise the runtime stops with an explicit error and cleans up.
+  The IME-refresh `Runtime.evaluate` a shown device sends is different: the
+  page's renderer answers it, not the browser process, and a dialog, a running
+  script or a pending navigation can hold it, so it carries no deadline of its
+  own (ADR 0014).
 - Answers that the engine no longer waits for are discarded on arrival, so
   abandoned commands leave no state behind.
 

@@ -56,7 +56,7 @@ fixture pages:
 | Both live tests in parallel, 2 threads | 3 of 3 runs passed after the fix below; before it, 1 of 4 and 2 of 2 runs failed |
 | `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 66 engine and 24 desktop tests; fmt and strict Clippy; 36 live tests ignored by default |
 | Live Helium suite (`--ignored`, 4 threads) | 36 of 36 passed in 59.0 s. A first run passed 35 and failed `hidden_devices_reject_input_and_sync_without_replay` at its cleanup check, "browser processes still running": two crash handler processes, a renderer and a zombie of one browser stayed until the handlers were killed by hand, the cleanup deadlock recorded under P1.4; the test passed alone |
-| `scripts/desktop-smoke.sh` (debug build, Xvfb, no window manager) | 9 of 9 runs passed, including the new "dialog answered on the card": the card shows "The page asks", the message and Cancel/OK above the frozen frame; OK then Cancel make the page report `confirm=true` and `confirm=false`, and the panel disappears each time; no browser process, profile or window left |
+| `scripts/desktop-smoke.sh` (debug build, Xvfb, no window manager) | 9 of 9 runs passed, including the new "dialog answered on the card": the check is by pixel color (XGetImage), not by reading on-screen text — it finds the page's blue button, then the panel's orange border and the OK/Cancel button colors inside it; clicking them makes the page report `confirm=true` and `confirm=false` over HTTP, and the border color is gone once the card repaints; no browser process, profile or window left |
 
 The parallel failures were a test problem worth recording: the test clicked a
 field and typed at once, and under load the key was processed before the click.
@@ -81,6 +81,131 @@ for the border to be absent.
   the panel does not say which frame asked.
 - A dialog on a hidden device is answered only after showing the device; hiding
   does not answer it.
+
+### Review fixes, 27 September 2026
+
+PR #14 review found gaps in the change above. Engine
+(`crates/broxser-engine/src/live.rs`):
+
+1. A prompt's default is now bounded as an answer Broxser can send back
+   unchanged (`prompt_text`): line breaks and tabs become a space, other
+   control characters are dropped, cut at `MAX_DIALOG_CHARS` with no cut mark.
+   The message keeps `dialog_text`'s rule (control characters dropped except
+   line breaks and tabs, cut and marked with `…`).
+2. A prompt answer over 2048 characters or holding a control character is not
+   sent; the dialog stays open and the device reports `PROMPT_REJECTED`,
+   clearing on the next sent answer or when the dialog closes.
+3. Only one answer per dialog is outstanding at a time: once
+   `Page.handleJavaScriptDialog` is sent, a further answer under the same
+   token is ignored until `Page.javascriptDialogClosed`, or the dialog is
+   cleared by a new document, a crash, a detach or a runtime stop. The reply to
+   that command is now tracked (`Pending::DialogAnswer`): if it is itself an
+   error and the same dialog is still open, the answer is taken back so the
+   dialog can be answered again, and the browser's message is shown as a
+   protocol error ("Input error" in the desktop), not a dialog-specific one.
+4. An unknown or missing dialog type reports `UNKNOWN_DIALOG` without blocking
+   input or navigation for that device; it clears once the browser reports the
+   dialog closed.
+5. Staying on a `beforeunload` ends only the Broxser navigation the question
+   belongs to: a tracked navigate or reload with no page-initiated main-frame
+   `Page.frameRequestedNavigation` in the current tab (no `disposition`, or
+   `disposition: "currentTab"`) since it was sent — a link or script that opens
+   a new tab, window or download no longer counts. A `beforeunload` the page's
+   own link raises while a Broxser navigation is pending leaves that navigation
+   tracked, running under its own deadline.
+6. The IME refresh sent when a hidden device is shown (`Runtime.evaluate`) is
+   renderer-answered and held while a dialog is open; it is now sent without a
+   deadline (`send_ignored`), skipped while a dialog is open and re-sent when
+   the dialog closes. Before this fix, showing a hidden device during its own
+   dialog stopped the whole runtime once the 15 s command limit passed.
+7. Opening a dialog invalidates IME state locally without sending a
+   composition cancel to the page, and the not-responding check pauses
+   instead of tripping while the dialog is open.
+8. A refused Go or workspace open (open dialog) now retires the device's
+   pending link, the same as a sent one would (ADR 0013); a refused synced link
+   is different and leaves the device's link-sync tracking untouched, so a
+   link that commits later still syncs.
+9. Stopping the runtime clears every device's dialog and dialog-related status
+   text.
+
+Desktop (`crates/broxser-desktop/src/live_view.rs`,
+`crates/broxser-desktop/src/url_input.rs`):
+
+11. Keys a prompt field does not consume never reach a page: the canvas
+    forwards input to the selected page only while the canvas itself holds
+    focus.
+12. The prompt field holds one line of at most 2048 characters (typing and
+    paste capped). OK and Enter send the field's text unchanged, without
+    trimming; Escape cancels like the Cancel button; either returns keyboard
+    focus to the canvas.
+13. A new prompt on the selected device takes focus only from the canvas or
+    that device's own previous field, never from the URL bar or another
+    device's field; a held or auto-repeating Enter does not answer a newly
+    focused prompt.
+14. The panel is shown only while the runtime is running, is at most 360 px
+    wide, anchored at the frame's left edge with its buttons on the left, and
+    its message box is limited to 120 px high and scrolls.
+15. Prompt fields are cleared on restart and close; focus returns to the
+    canvas when a focused field disappears.
+16. An auto-repeated Enter or Escape that the prompt guard ignores no longer
+    spoils the field's select-all-to-replace state: `LineEdit::key` clears
+    select-all unconditionally for Enter and Escape, so the field puts it back
+    (`restore_select_all`) when the repeat is the one the guard drops.
+17. Focus moving into a prompt field — by auto-focus or a later click — also
+    invalidates the desktop's own IME mark (`cx.on_focus_in`); nothing reaches
+    the page, since the engine already cleared that device's IME state when
+    the dialog opened.
+
+Helium 0.18.1.1 probe, same container as the audit above: while a dialog is
+open, `Page.startScreencast`, `Page.stopScreencast`,
+`Input.setIgnoreInputEvents` and `Page.screencastFrameAck` are answered in
+0-1 ms; `Runtime.evaluate` and `Emulation.setFocusEmulationEnabled` are held
+until it closes. A Go on a dirty page, then Stay, answers `net::ERR_ABORTED`
+before `Page.javascriptDialogClosed`. A Reload replies before the dialog
+opens. A page link, `location.href` or `location.reload()` during a pending
+slow Go emits `Page.frameRequestedNavigation` right before its own
+`beforeunload`, and the Go continues after Stay. A page `history.back()`
+cancels the Go with `net::ERR_ABORTED` before asking.
+
+New tests: fake CDP `dialog_text_and_prompt_defaults_are_bounded`,
+`showing_a_device_during_its_dialog_waits_for_nothing_the_page_answers`,
+`prompt_default_can_be_sent_back_and_rejected_answers_are_reported`,
+`a_dialog_takes_one_answer_and_never_the_previous_dialogs`,
+`a_dialog_answer_the_browser_refuses_can_be_sent_again`,
+`staying_ends_the_broxser_navigation_that_asked_in_either_reply_order`,
+`staying_ends_a_reload_that_asked`,
+`leaving_continues_the_navigation_under_a_fresh_deadline`,
+`staying_on_the_pages_own_link_keeps_the_broxser_navigation`,
+`staying_ends_the_broxser_navigation_after_a_page_request_outside_its_tab`,
+`a_dialog_drops_the_composition_without_a_cancel_or_a_not_responding_report`,
+`a_dialog_broxser_cannot_show_is_reported_and_blocks_nothing`,
+`a_refused_go_retires_the_devices_link_and_a_refused_synced_link_keeps_it`,
+`a_stopped_runtime_leaves_no_dialog_shown`,
+`a_dialog_refuses_reload_and_synced_links_and_drops_pointer_input` and
+`a_new_document_a_crash_or_a_detach_ends_the_dialog_and_its_token`; live
+Helium `live_dialog_survives_hide_show_scroll_and_zoom`, and
+`live_dialogs_wait_for_an_explicit_answer` revised to wait for settled frames
+and for the previous dialog to close.
+
+Verification actually run: the fake CDP engine suite, now 82 tests, passed.
+Live Helium: the three ignored dialog tests
+(`live_dialogs_wait_for_an_explicit_answer`,
+`live_dialog_survives_hide_show_scroll_and_zoom`,
+`live_beforeunload_dialog_needs_an_explicit_leave_or_stay`) were re-run after
+the link-retiring and dialog-answer-retry fixes and again passed 3 of 3 runs
+each, and the full ignored suite (`--ignored`, 4 threads) was re-run and
+passed 37 of 37. Desktop: 35 unit tests passed and strict Clippy is clean. Not
+run: the real X11 window check for the revised desktop panel (width,
+left-aligned buttons, scrolling message box, focus handling, and — new this
+round — composing with an IME, then a prompt taking focus, then returning to
+the canvas) — that check is still pending, unlike the original panel's, which
+was checked in a real window (P1.6 above).
+
+Flake note, kept honest: the frames check in
+`live_dialogs_wait_for_an_explicit_answer` failed once under load — a frame
+already in flight when the page stopped could still land after a fixed
+300 ms sleep. The test now waits, via a `settled_frames` helper, until no
+frame has arrived for 700 ms before reading the count.
 
 ## P1.5 modern application navigation, 26 September 2026 (cloud container)
 
