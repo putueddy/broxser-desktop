@@ -167,7 +167,7 @@ menjaganya. `scripts/desktop-smoke.sh` kini menguji Restart ganda, dengan dan ta
 Ctrl+Q. Sisa di luar lingkup: Restart untuk runtime yang masih berjalan, serta
 pemeriksaan Wayland dan GPU fisik untuk jalur ini.
 
-**Status P1.3 (26 September 2026, sebagian; menunggu review PR):** keputusan dan
+**Status P1.3 (26 September 2026, merged melalui PR #10):** keputusan dan
 pengukuran ada di [ADR 0010](docs/adr/0010-keyboard-identity-and-explicit-paste.md).
 Reproducer window X11 pada `4c2d5c1` membuktikan bahwa key-up yang namanya berubah
 (Shift dilepas lebih dulu pada layout Jerman) membuat tombol macet dan tekanan
@@ -186,12 +186,31 @@ berdasarkan caret halaman. Fcitx5/Pinyin melalui XIM dengan `UseOnTheSpot=True`
 sudah diuji pada window X11 nyata di Xvfb/Lavapipe: commit `你好` berulang, Escape,
 commit ASCII berulang, perpindahan input ke textarea, dan posisi kandidat.
 Patch GPUI 0.2.2 memisahkan commit ASCII Wayland dari tombol fisik dan memberi
-fokus pada context XIM. PR kelanjutan berbasis PR #10 yang masih terbuka.
-Sisa kualifikasi: IME native Wayland, keyboard fisik, bahasa/engine IME lain,
-iframe/shadow DOM/password/editor canvas, serta callback commit-only ambigu
-setelah komposisi kehilangan target. Copy ke clipboard sistem dan pengukuran ulang
-shortcut tiap update Helium tetap pekerjaan terpisah; berikutnya P1.4 kualitas
-frame dan penggunaan resource.
+fokus pada context XIM. PR #11 di-merge ke branch PR #10, lalu PR #10 ke `main`.
+Sebelum merge, CI menunjukkan pemeriksaan identitas target IME yang dibatasi 250 ms
+membuang commit asli saat halaman lambat menjawab; kini pemeriksaan itu menunggu
+tanpa memblokir runtime dan input berikutnya ke device itu menunggu di
+belakangnya. Sisa kualifikasi: IME native Wayland, keyboard fisik, bahasa/engine
+IME lain, iframe/shadow DOM/password/editor canvas, serta callback commit-only
+ambigu setelah komposisi kehilangan target. Copy ke clipboard sistem dan
+pengukuran ulang shortcut tiap update Helium tetap pekerjaan terpisah.
+
+**Status P1.4 (26 September 2026, menunggu review PR):** keputusan ada di
+[ADR 0012](docs/adr/0012-live-frame-resources.md), pengukuran di
+`docs/validation.md`. Build release crash di atlas tekstur GPUI 0.2.2 saat mengetik
+selagi halaman beranimasi (3/3 run dengan 1500 tombol); patch vendor ketiga
+memperbaikinya dan `scripts/desktop-smoke.sh` kini mengetik selama animasi. Device
+yang ter-scroll keluar canvas kini tidak di-upload dan screencast-nya dijeda tanpa
+semantik hide: dengan 8 device beranimasi (5 di luar layar) CPU browser turun dari
+170% ke 97%, PSS desktop dari 198 ke 156 MB dan p95 latensi dari 318 ke 173 ms.
+Frame limit dikirim ulang saat scale window berubah. Frame tetap berukuran CSS:
+`--force-device-scale-factor=2` memberi frame HiDPI dengan input benar, tetapi
+menaikkan CPU browser sekitar 64% pada ukuran tampilan yang sama, sehingga mode
+HiDPI yang lebih tajam menjadi pilihan eksplisit terpisah. Latensi di kontainer
+software-rendering tetap di atas target p95 50 ms. Sisa di luar lingkup: kualifikasi
+hardware/GPU, Wayland multi-monitor dan fractional scale, window yang diminimalkan
+tetap streaming, serta deadlock cleanup crash handler Helium di bawah beban yang
+tercatat di validation; berikutnya P1.5 navigasi aplikasi modern.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,

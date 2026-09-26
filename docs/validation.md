@@ -3,6 +3,113 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.4 frame quality and resource use, 26 September 2026 (cloud container)
+
+Release builds in the same container as P1.3: Xvfb 1600 × 1000 without a window
+manager, Mesa Lavapipe (Vulkan on the CPU), four shared cores, Helium 0.18.1.1,
+desktop and browser as the unprivileged user `broxsertest` with the sandbox
+enabled. The window was 1360 × 861 at the default 50% zoom. "Before" is `main` at
+`e8d9944` with only the atlas patch, so that its runs could finish; "after" is this
+change. Decisions are in [ADR 0012](adr/0012-live-frame-resources.md). These are
+relative results under software rendering, not hardware budgets.
+
+A scratch harness, not committed, pressed keys with XTest and read window pixels
+with XGetImage. Latency is the time from a key press until a probed pixel of the
+selected device's frame changes: 100 presses 250–350 ms apart on pages that flip a
+region on every key. CPU and PSS of the desktop and of its browser process tree
+were sampled for 30 s, and screenshots recorded each card's frame counters.
+
+Without a window manager the GPUI window draws only after it has X input focus,
+and a focus request sent before the window is mapped is lost. Early runs that
+focused too soon measured an undrawn window (desktop CPU 10–20%, black window)
+and were discarded. The harness now retries focus until the toolbar is drawn; one
+run whose window took longer than 30 s to draw is excluded below.
+
+### Typing while pages animate
+
+| Release build | `main` `e8d9944` | With the atlas patch |
+| --- | --- | --- |
+| 3 devices, 100 presses 250–350 ms apart | 2 of 4 runs panicked, after 84 and 34 presses | 0 of 3 |
+| 3 devices, 1500 keys 10 ms apart | 3 of 3 panicked | Passed in every smoke run below |
+| 8 devices, 1500 keys 10 ms apart | 3 of 3 panicked: `blade_atlas.rs:229` twice, `:239` once | 0 of 3 |
+| `desktop-smoke.sh`, new "typing while pages animate" run | Failed: exit 101 in `BladeRenderer::draw` | Passed |
+
+A debug build of `main` did not panic in a 150-press run or two 1500-key runs; it
+rarely reaches the race, so the smoke run needs a release build to cover it.
+
+### Before and after, default zoom
+
+Averages of two runs; the eight-device static page has one "before" run.
+
+| Devices, page | Desktop CPU | Browser CPU | Desktop / browser PSS | Latency p50 / p95 / p99 | First device frame |
+| --- | --- | --- | --- | --- | --- |
+| 3, static | 1% → 1% | 1% → 1% | 152 / 431 → 148 / 426 MB | 55 / 89 / 97 → 58 / 93 / 98 ms | 0.95 → 0.97 s |
+| 3, animated (1 off screen) | 172% → 177% | 128% → 77% | 162 / 457 → 157 / 442 MB | 124 / 170 / 219 → 99 / 131 / 161 ms | 0.98 → 0.91 s |
+| 8, static | 1% → 1% | 1% → 1% | 171 / 505 → 148 / 474 MB | 58 / 105 / 113 → 63 / 98 / 110 ms | 1.41 → 1.39 s |
+| 8, animated (5 off screen) | 147% → 152% | 170% → 97% | 198 / 578 → 156 / 514 MB | 238 / 318 / 371 → 129 / 173 / 189 ms | 1.40 → 1.36 s |
+
+At the end of the eight-device animated runs (about 85 s), each visible device had
+delivered about 2750 frames with 25% replaced before display (about 24 shown per
+second) before the change, and about 4970 with 34% replaced (about 38 shown per
+second) after it. Desktop CPU is dominated by Lavapipe drawing the window and did
+not change. Static pages produce no frames, so pausing changes nothing there.
+
+After 20 s of animation, scrolling the eight-device canvas down showed both
+tablets at 68 frames, from before the first paint paused them; 3 s later they had
+252 and 253, about 61 per second.
+
+### HiDPI and device pixel ratio
+
+A scratch engine test asked 360 × 640 devices with DPR 1, 2 and 3 for frames up to
+three times their CSS size:
+
+| Browser setting | Frames | Input and page |
+| --- | --- | --- |
+| Current launch | 360 × 640 for every DPR and limit | A click at CSS (40, 300) arrived at (40, 300) |
+| `Emulation.setDeviceMetricsOverride` with `scale: 2` | None within 2 s | — |
+| Helium started with `--force-device-scale-factor=2` | Up to 720 × 1280, following the limit, for every DPR | Clicks arrived at (40, 300); `devicePixelRatio` stayed 1, 2 and 3 |
+
+At the same displayed size (three animated devices, 50% zoom, 1× window), the
+forced scale factor raised browser CPU from about 75% to 124%, browser PSS by about
+34 MB and p95 latency from 126–150 ms to 178–182 ms. Frames therefore stay at the
+CSS size: sharp while zoom × window scale is at most 1, upscaled above it, for
+example above 50% zoom on a 2× display. ADR 0012 records the trade-off.
+
+### Automated checks
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 63 engine and 24 desktop tests; format and strict Clippy; 29 live tests ignored by default |
+| Live Helium suite, four threads, beside the long session | Passed 29 of 29 twice (68.8 s, 64.1 s). One more run failed the cleanup check of `live_ime_rejects_scripted_focus_and_selection_after_synthetic_events`; see the next subsection |
+| New `live_off_screen_devices_pause_frames_keep_input_and_resume_fresh` | Passed 3 of 3; without the on-screen check in `start_stream` it failed, because showing the device restarted its stream while off screen |
+| `scripts/desktop-smoke.sh` with the debug and the release build | Passed all eight runs each; no browser process, profile or window left, and the known preview directory after SIGTERM |
+
+### Browser cleanup deadlock under load (not changed here)
+
+In the failed run, the IME assertions passed, but processes of the stopped browser
+still ran 10 s after `LiveSession` was dropped. A renderer had crashed while the
+browser was killed, and Helium's crash handler traced all its threads with ptrace
+to write a dump. That renderer is the init of a sandbox PID namespace: its last
+thread waited in the kernel's `zap_pid_ns_processes` for the traced threads to be
+reaped, and the crash handler waited for that thread. The renderer zombie, its
+namespace parent and two crash handlers were still there 90 s later. Killing the
+tracing crash handler released all four within 5 s. `BrowserProcess::shutdown`
+waits 5 s for processes that name the profile but does not kill them, and keeps
+the profile while any does; the next start's stale-profile recovery (ADR 0007)
+would stop them. Proposed separate change: after that wait, kill the survivors that
+still name the private profile and wait once more.
+
+### Limits
+
+- Latency stays above the 50 ms p95 target in every scenario. The frame path
+  includes JPEG encoding in the browser, decoding and software rendering on shared
+  cores; frame age was not measured separately and is part of these numbers.
+- When the whole window is minimized or obscured, GPUI stops painting, so devices
+  that were on screen keep streaming and their frames are decoded but not uploaded.
+- Not available here: Wayland scale changes, fractional scaling, multi-monitor
+  setups, physical GPUs and HiDPI displays. X11 fixes the scale factor at startup,
+  so the re-sent limits are a no-op on this display.
+
 ## P1.3 keyboard, browser keys and clipboard, 26 September 2026 (cloud container)
 
 Same container and toolchain as P1.2 below. The desktop and its browser ran as

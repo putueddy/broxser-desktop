@@ -32,6 +32,10 @@ An audit of `main` at `e8d9944` found:
   they are displayed, in physical pixels (ADR 0005). It sends that limit at start
   and on zoom only. Moving the window to a display with another scale factor, which
   GPUI reports as a bounds change on Wayland, kept the old limit.
+- **Frames never exceed the CSS size.** Headless Helium delivers screencast frames
+  at the device's CSS size for DPR 1, 2 and 3 and for limits up to three times
+  that size. Frames are sharp while zoom × window scale is at most 1 and upscaled
+  above it, for example above 50% zoom on a 2× display.
 
 Measurements and reproductions are in `docs/validation.md` (P1.4).
 
@@ -49,6 +53,12 @@ Measurements and reproductions are in `docs/validation.md` (P1.4).
 - Scale: re-send the limits on every bounds change, or only when the scale factor
   changes. Limits depend on zoom and scale, not on the window size, so only a scale
   change needs them.
+- HiDPI: `Emulation.setDeviceMetricsOverride` with `scale: 2` stopped all frames.
+  Starting Helium with `--force-device-scale-factor=2` gave frames up to twice the
+  CSS size for every DPR, with correct click coordinates and page DPR. It applies
+  to every device and cannot change while the browser runs; at the same displayed
+  size it raised browser CPU by about 64% and p95 latency by 30–40 ms. Keeping
+  CSS-size frames costs sharpness only above zoom × scale 1.
 
 ## Decision
 
@@ -68,22 +78,29 @@ Measurements and reproductions are in `docs/validation.md` (P1.4).
   device until the first paint pauses those still off screen.
 - The view re-sends frame limits when the window's scale factor differs from the
   one of the last limits.
+- Frames stay at the CSS size. A sharper HiDPI mode, if wanted, is an explicit
+  choice with its measured cost, qualified on a HiDPI display in a separate change.
 
 ## Consequences
 
 - A device that scrolls back into view shows its previous frame until the new
   stream's first frame arrives, one browser round trip later.
 - Pausing saves browser encoding, CDP transfer and desktop decoding for animated or
-  busy pages; a static page produces no frames either way.
+  busy pages; a static page produces no frames either way. With eight animated
+  devices, five of them off screen, browser CPU fell from 170% to 97%, desktop PSS
+  from 198 to 156 MB and p95 latency from 318 to 173 ms, and the visible devices
+  showed about 38 instead of 24 frames per second.
 - The atlas patch changes GPUI behavior only for textures destroyed before their
   first flush. It is covered by a real-window smoke run that types while every page
   animates; debug builds rarely reach the race, so that run needs a release build.
 
 ## Scope and limits
 
-- DPR and HiDPI frame resolution are unchanged by this decision.
-- Latency in the container is above the 50 ms target (System Design); it is
-  dominated by software rendering and shared cores and is not a hardware result.
+- Latency in the container stays above the 50 ms p95 target (System Design) in
+  every measured scenario; it is dominated by software rendering and shared cores
+  and is not a hardware result.
+- A minimized or obscured window stops painting, so devices that were on screen
+  keep streaming while it is.
 - Wayland scale changes, fractional scaling, physical GPUs and multi-monitor
   setups were not available here. X11 fixes the scale factor at startup.
 
