@@ -9,8 +9,9 @@ use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE,
 use anyhow::{Context as _, Result};
 use broxser_core::{Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, Frame, KeyInput, LiveSession, Modifiers, PointerButton,
-    PointerEvent, PointerKind, RuntimeState, Status, SyncSettings, to_viewport,
+    BrowserOptions, Cancellation, Command, Frame, KeyInput, LiveSession, MAX_PASTE_CHARS,
+    Modifiers, PasteRejected, PointerButton, PointerEvent, PointerKind, RuntimeState, Status,
+    SyncSettings, is_paste_key, paste_text, to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -20,7 +21,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, Subscription, Window, canvas, div, prelude::*, px, rgb,
 };
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,10 +37,9 @@ pub(crate) struct LiveView {
     status: Status,
     devices: Vec<DeviceView>,
     selected: Option<usize>,
+    pressed: PressedKeys,
     /// Keys sent to pages, retained so a release never lands on another device.
     held_keys: HashMap<String, (usize, KeyInput)>,
-    /// Released keys still physically down. X11 reports repeats with is_held=false.
-    suppressed_keys: HashSet<String>,
     url: Entity<UrlInput>,
     /// Display pixels per CSS pixel.
     scale: f32,
@@ -50,6 +50,68 @@ pub(crate) struct LiveView {
     notice: Option<String>,
     _url_events: Subscription,
     _focus_out: Subscription,
+    _key_presses: Subscription,
+}
+
+/// Keys down in the window, whoever handled the press, in press order. GPUI
+/// reports neither physical keys nor, on X11, repeats.
+#[derive(Default)]
+struct PressedKeys {
+    keys: Vec<PressedKey>,
+    /// The latest key-down: only that key auto-repeats.
+    latest: Option<String>,
+}
+
+struct PressedKey {
+    /// As [`logical_key_identity`] names the press.
+    identity: String,
+    /// Digits, symbols, dead keys and composed characters can be released
+    /// under another name; letters and named keys cannot.
+    renamable: bool,
+    /// Its latest key-down repeated the one before: an auto-repeat.
+    repeating: bool,
+}
+
+impl PressedKeys {
+    /// Records a key-down. It repeats the key only if that key had the latest
+    /// key-down; otherwise it is a new press, even under a name still down
+    /// whose release went unseen.
+    fn press(&mut self, identity: String, key: &KeyInput) {
+        let repeating = self.latest.as_deref() == Some(identity.as_str());
+        match self.keys.iter_mut().find(|down| down.identity == identity) {
+            Some(down) => down.repeating = repeating,
+            None => self.keys.push(PressedKey {
+                identity: identity.clone(),
+                renamable: key.code.is_empty() || key.code.starts_with("Digit"),
+                repeating,
+            }),
+        }
+        self.latest = Some(identity);
+    }
+
+    /// Whether the latest key-down of `identity` repeated its press.
+    fn repeating(&self, identity: &str) -> bool {
+        self.keys
+            .iter()
+            .any(|down| down.identity == identity && down.repeating)
+    }
+
+    /// Removes and returns the press a key-up ends: the key down under the
+    /// same name, or else the most recently pressed key that can be released
+    /// under another name, such as `/` released as `7` on a German layout
+    /// after Shift.
+    fn release(&mut self, identity: &str) -> Option<String> {
+        let index = self
+            .keys
+            .iter()
+            .position(|down| down.identity == identity)
+            .or_else(|| self.keys.iter().rposition(|down| down.renamable))?;
+        let released = self.keys.remove(index).identity;
+        if self.latest.as_deref() == Some(released.as_str()) {
+            self.latest = None;
+        }
+        Some(released)
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +143,11 @@ impl LiveView {
         let focus_out = cx.on_focus_out(&focus, window, |view, _, _, _| {
             view.release_keys();
         });
+        // Before shortcuts and elements, so every press pairs with its release.
+        let pressing = cx.entity().downgrade();
+        let key_presses = cx.intercept_keystrokes(move |event, _, cx| {
+            let _ = pressing.update(cx, |view, _| view.record_press(&event.keystroke));
+        });
         let entity = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             entity
@@ -98,8 +165,8 @@ impl LiveView {
             session: None,
             status: Status::default(),
             selected: Some(0),
+            pressed: PressedKeys::default(),
             held_keys: HashMap::new(),
-            suppressed_keys: HashSet::new(),
             url,
             scale: 0.5,
             sync: SyncSettings::default(),
@@ -108,6 +175,7 @@ impl LiveView {
             notice: None,
             _url_events: url_events,
             _focus_out: focus_out,
+            _key_presses: key_presses,
         };
         view.start(window, cx);
         view
@@ -354,6 +422,8 @@ impl LiveView {
         cx.notify();
     }
 
+    /// Releases the keys held in the page of device `index`. They stay pressed,
+    /// so their repeats go nowhere until the physical release.
     fn release_keys_for(&mut self, index: usize) -> bool {
         let keys: Vec<String> = self
             .held_keys
@@ -367,7 +437,6 @@ impl LiveView {
                     return false;
                 }
                 self.held_keys.remove(&name);
-                self.suppressed_keys.insert(name);
             }
         }
         true
@@ -459,7 +528,7 @@ impl LiveView {
         if !self.lifecycle.begin_restart() {
             return;
         }
-        self.suppressed_keys.extend(self.held_keys.keys().cloned());
+        // Keys still down stay pressed: their repeats reach no new page.
         self.held_keys.clear();
         for device in &mut self.devices {
             device.buttons = 0;
@@ -655,29 +724,22 @@ impl LiveView {
         });
     }
 
-    fn key(&mut self, keystroke: &Keystroke, down: bool, is_held: bool) {
-        let Some(key) = KeyInput::from_key(
-            &keystroke.key,
-            keystroke.key_char.as_deref(),
-            modifiers_of(&keystroke.modifiers),
-            down,
-        ) else {
+    /// Every key-down in the window, before shortcuts and elements see it.
+    fn record_press(&mut self, keystroke: &Keystroke) {
+        if let Some((key, identity)) = key_input(keystroke, true) {
+            self.pressed.press(identity, &key);
+        }
+    }
+
+    /// A key-down in the device canvas.
+    fn key_down(&mut self, keystroke: &Keystroke, is_held: bool, cx: &mut Context<Self>) {
+        let Some((key, identity)) = key_input(keystroke, true) else {
             return;
         };
-        let identity = logical_key_identity(keystroke, &key);
-        if !down {
-            // Key-up is observed on the window root, even if focus moved to
-            // the URL bar after the release was sent to the old page.
-            if self.suppressed_keys.remove(&identity) {
-                return;
-            }
-            if let Some((device, mut key)) = self.held_keys.get(&identity).cloned()
-                && !self.devices[device].hidden
-            {
-                key.down = false;
-                if self.send(Command::Key { device, key }) {
-                    self.held_keys.remove(&identity);
-                }
+        let repeat = is_held || self.pressed.repeating(&identity);
+        if is_paste_key(&key) {
+            if !repeat {
+                self.paste(cx);
             }
             return;
         }
@@ -685,9 +747,8 @@ impl LiveView {
             self.selected,
             |index| self.devices.get(index).is_some_and(|device| !device.hidden),
             &identity,
-            is_held,
+            repeat,
             &self.held_keys,
-            &self.suppressed_keys,
         ) else {
             return;
         };
@@ -697,6 +758,52 @@ impl LiveView {
         }) {
             self.held_keys.insert(identity, (device, key));
         }
+    }
+
+    /// A key-up anywhere in the window: it is observed on the window root,
+    /// even if focus moved to the URL bar after the press.
+    fn key_up(&mut self, keystroke: &Keystroke) {
+        let Some((_, identity)) = key_input(keystroke, false) else {
+            return;
+        };
+        let Some(pressed) = self.pressed.release(&identity) else {
+            return;
+        };
+        if let Some((device, mut key)) = self.held_keys.get(&pressed).cloned()
+            && !self.devices[device].hidden
+        {
+            key.down = false;
+            if self.send(Command::Key { device, key }) {
+                self.held_keys.remove(&pressed);
+            }
+        }
+    }
+
+    /// Inserts the system clipboard's text into the selected device (ADR 0010).
+    /// Pages never read the browser's clipboard, which all sessions share.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(device) = self.selected.filter(|&index| !self.devices[index].hidden) else {
+            return;
+        };
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        match paste_text(&text) {
+            Ok(text) => {
+                self.notice = None;
+                self.send(Command::InsertText { device, text });
+            }
+            Err(PasteRejected::Empty) => {
+                self.notice = Some("Nothing pasted: the clipboard holds no text.".into());
+            }
+            Err(PasteRejected::TooLong(length)) => {
+                self.notice = Some(format!(
+                    "Nothing pasted: the clipboard text has {length} characters, more than {MAX_PASTE_CHARS}."
+                ));
+            }
+        }
+        cx.notify();
     }
 
     fn device_card(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1139,7 +1246,7 @@ impl Render for LiveView {
                 view.url.update(cx, |input, cx| input.focus_all(window, cx));
             }))
             .on_key_up(cx.listener(|view, event: &KeyUpEvent, _, _| {
-                view.key(&event.keystroke, false, false);
+                view.key_up(&event.keystroke);
             }))
             .child(self.toolbar(cx))
             .child(
@@ -1160,7 +1267,7 @@ impl Render for LiveView {
                                     .track_focus(&self.focus)
                                     .on_key_down(cx.listener(
                                         |view, event: &KeyDownEvent, _, cx| {
-                                            view.key(&event.keystroke, true, event.is_held);
+                                            view.key_down(&event.keystroke, event.is_held, cx);
                                             cx.stop_propagation();
                                         },
                                     ))
@@ -1225,21 +1332,31 @@ fn logical_key_identity(keystroke: &Keystroke, key: &KeyInput) -> String {
         .to_owned()
 }
 
+/// The key event for a GPUI keystroke and the name its press is tracked by.
+fn key_input(keystroke: &Keystroke, down: bool) -> Option<(KeyInput, String)> {
+    let key = KeyInput::from_key(
+        &keystroke.key,
+        keystroke.key_char.as_deref(),
+        modifiers_of(&keystroke.modifiers),
+        down,
+    )?;
+    let identity = logical_key_identity(keystroke, &key);
+    Some((key, identity))
+}
+
+/// The device a key-down goes to. A repeat goes only to the page that
+/// received the press, never to one selected or shown later.
 fn key_down_target(
     selected: Option<usize>,
     visible: impl Fn(usize) -> bool,
     identity: &str,
-    is_held: bool,
+    repeat: bool,
     held: &HashMap<String, (usize, KeyInput)>,
-    suppressed: &HashSet<String>,
 ) -> Option<usize> {
     let device = selected.filter(|&index| visible(index))?;
-    if suppressed.contains(identity) {
-        return None;
-    }
     match held.get(identity) {
         Some((owner, _)) if *owner != device => None,
-        None if is_held => None,
+        None if repeat => None,
         _ => Some(device),
     }
 }
@@ -1269,18 +1386,32 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_down_target, logical_key_identity, selected_after_visibility_change};
-    use broxser_engine::{KeyInput, Modifiers};
+    use super::{PressedKeys, key_down_target, key_input, selected_after_visibility_change};
     use gpui::Keystroke;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
+
+    /// A keystroke as GPUI reports it on X11: key name and typed character.
+    fn stroke(key: &str, key_char: Option<&str>) -> Keystroke {
+        Keystroke {
+            key: key.into(),
+            key_char: key_char.map(Into::into),
+            ..Keystroke::default()
+        }
+    }
 
     fn identity(name: &str) -> String {
-        let stroke = Keystroke {
-            key: name.into(),
-            ..Keystroke::default()
-        };
-        let input = KeyInput::from_key(name, None, Modifiers::default(), true).unwrap();
-        logical_key_identity(&stroke, &input)
+        key_input(&stroke(name, Some(name)), true).unwrap().1
+    }
+
+    fn press(pressed: &mut PressedKeys, key: &str, key_char: Option<&str>) -> String {
+        let (input, identity) = key_input(&stroke(key, key_char), true).unwrap();
+        pressed.press(identity.clone(), &input);
+        identity
+    }
+
+    fn release(pressed: &mut PressedKeys, key: &str, key_char: Option<&str>) -> Option<String> {
+        let (_, identity) = key_input(&stroke(key, key_char), false).unwrap();
+        pressed.release(&identity)
     }
 
     #[test]
@@ -1314,40 +1445,99 @@ mod tests {
 
     #[test]
     fn a_released_key_cannot_repeat_into_the_next_device_even_without_is_held() {
-        let name = identity("a");
-        let input = KeyInput::from_key("a", None, Modifiers::default(), true).unwrap();
-        let mut held = HashMap::from([(name.clone(), (0, input))]);
-        let mut suppressed = HashSet::new();
+        let mut pressed = PressedKeys::default();
+        let name = press(&mut pressed, "a", Some("a"));
+        let (input, _) = key_input(&stroke("a", Some("a")), true).unwrap();
+        let mut held = HashMap::new();
+        assert!(!pressed.repeating(&name));
         assert_eq!(
-            key_down_target(Some(0), |_| true, &name, false, &held, &suppressed),
+            key_down_target(Some(0), |_| true, &name, false, &held),
+            Some(0)
+        );
+        held.insert(name.clone(), (0, input));
+        // X11 reports a repeat as another key-down with is_held=false.
+        press(&mut pressed, "a", Some("a"));
+        assert!(pressed.repeating(&name));
+        assert_eq!(
+            key_down_target(Some(0), |_| true, &name, true, &held),
             Some(0)
         );
 
         // Hiding device 0 sends keyUp to it, then device 1 becomes selected.
         held.remove(&name);
-        suppressed.insert(name.clone());
+        press(&mut pressed, "a", Some("a"));
+        assert!(pressed.repeating(&name));
+        assert_eq!(key_down_target(Some(1), |_| true, &name, true, &held), None);
+        // The physical keyUp ends the press; a fresh press may route.
+        assert_eq!(release(&mut pressed, "a", Some("a")), Some(name.clone()));
+        press(&mut pressed, "a", Some("a"));
+        assert!(!pressed.repeating(&name));
         assert_eq!(
-            key_down_target(Some(1), |_| true, &name, false, &held, &suppressed),
-            None
-        );
-        assert_eq!(
-            key_down_target(Some(1), |_| true, &name, true, &held, &suppressed),
-            None
-        );
-        // The physical keyUp clears suppression; a fresh press may route.
-        suppressed.remove(&name);
-        assert_eq!(
-            key_down_target(Some(1), |_| true, &name, false, &held, &suppressed),
+            key_down_target(Some(1), |_| true, &name, false, &held),
             Some(1)
         );
+        assert_eq!(key_down_target(None, |_| true, &name, false, &held), None);
         assert_eq!(
-            key_down_target(None, |_| true, &name, false, &held, &suppressed),
+            key_down_target(Some(0), |_| false, &name, false, &held),
             None
         );
-        assert_eq!(
-            key_down_target(Some(0), |_| false, &name, false, &held, &suppressed),
-            None
-        );
+    }
+
+    #[test]
+    fn only_the_latest_key_down_repeats() {
+        let mut pressed = PressedKeys::default();
+        let a = press(&mut pressed, "a", Some("a"));
+        let b = press(&mut pressed, "b", Some("b"));
+        press(&mut pressed, "b", Some("b"));
+        assert!(pressed.repeating(&b));
+        // "a" is still down, yet a key-down of it after "b" is a new press.
+        press(&mut pressed, "a", Some("a"));
+        assert!(!pressed.repeating(&a));
+        // German "/" held until it repeats, Shift released first: the repeats
+        // are named "7", and so is the release. The next "/" is a new press.
+        let slash = press(&mut pressed, "/", Some("/"));
+        press(&mut pressed, "/", Some("/"));
+        let seven = press(&mut pressed, "7", Some("7"));
+        assert_eq!(release(&mut pressed, "7", Some("7")), Some(seven));
+        press(&mut pressed, "/", Some("/"));
+        assert!(!pressed.repeating(&slash));
+        assert_eq!(release(&mut pressed, "7", Some("7")), Some(slash));
+    }
+
+    #[test]
+    fn a_release_under_another_name_ends_the_press_it_belongs_to() {
+        let mut pressed = PressedKeys::default();
+        // German Shift+7 types "/"; with Shift up first the release is "7".
+        let slash = press(&mut pressed, "/", Some("/"));
+        assert_eq!(release(&mut pressed, "7", Some("7")), Some(slash));
+        // A composed character is released as its base key.
+        let e_acute = press(&mut pressed, "eacute", Some("é"));
+        assert_eq!(release(&mut pressed, "e", Some("e")), Some(e_acute));
+        // AltGr+Q types "@"; with AltGr up first the release is "q". The
+        // letter pressed later keeps its name, so the release is not its.
+        let at = press(&mut pressed, "@", Some("@"));
+        let a = press(&mut pressed, "a", Some("a"));
+        assert_eq!(release(&mut pressed, "q", Some("q")), Some(at));
+        // A dead key has no character and is released under its own name.
+        let dead = press(&mut pressed, "=", None);
+        assert_eq!(release(&mut pressed, "=", None), Some(dead));
+        // Nothing renamable is down: a release from elsewhere ends nothing.
+        let enter = press(&mut pressed, "enter", None);
+        assert_eq!(release(&mut pressed, "7", Some("7")), None);
+        assert_eq!(release(&mut pressed, "a", Some("a")), Some(a));
+        assert_eq!(release(&mut pressed, "enter", None), Some(enter));
+        assert!(pressed.keys.is_empty());
+    }
+
+    #[test]
+    fn a_release_prefers_its_own_name_then_the_latest_renamable_press() {
+        let mut pressed = PressedKeys::default();
+        let slash = press(&mut pressed, "/", Some("/"));
+        let paren = press(&mut pressed, "(", Some("("));
+        assert_eq!(release(&mut pressed, "/", Some("/")), Some(slash.clone()));
+        let slash = press(&mut pressed, "/", Some("/"));
+        assert_eq!(release(&mut pressed, "7", Some("7")), Some(slash));
+        assert_eq!(release(&mut pressed, "8", Some("8")), Some(paren));
     }
 
     #[test]
