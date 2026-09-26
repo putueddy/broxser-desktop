@@ -5,8 +5,11 @@
 # process group (Ctrl+C) while live frames stream, and with SIGTERM during a held
 # static capture: the browser guardian must stop the browser and remove its
 # profile (ADR 0007). Two runs kill the live browser and click Restart twice,
-# once followed by Ctrl+Q: at most one browser may start (ADR 0009). Every run
-# must leave no browser process or profile behind, and the window must be gone.
+# once followed by Ctrl+Q: at most one browser may start (ADR 0009). The last
+# run types while every page animates; use a release build
+# (BROXSER_DESKTOP_BIN=target/release/broxser-desktop) for it to cover the GPUI
+# atlas race of ADR 0012. Every run must leave no browser process or profile
+# behind, and the window must be gone.
 # Needs an X11 display (a desktop session or Xvfb), xdotool, python3,
 # BROXSER_HELIUM_BIN and a built desktop binary. It does not check rendering
 # quality, Wayland, IME, accessibility or a physical GPU.
@@ -205,6 +208,42 @@ restart_run() {
   if [[ $quit == quit ]]; then [[ $launches -le 1 ]]; else [[ $launches -eq 1 ]]; fi
 }
 
+# Types 1500 keys into the selected device while every device animates, then
+# quits. Before the atlas fix in ADR 0012 a release build panicked in GPUI's
+# texture atlas within seconds; a debug build rarely reaches that race.
+typing_run() {
+  local label=$1
+  local before app window keys left_processes left_profiles code=0
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/animation.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1)
+  xdotool windowsize "$window" 1360 861
+  for _ in $(seq 300); do
+    [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /animation.html || true) -ge 3 ]] && break
+    sleep 0.1
+  done
+  sleep 2
+  keys=$(printf 'x%.0s' $(seq 1500))
+  xdotool mousemove --window "$window" 600 400 type --delay 10 "$keys"
+  if ! kill -0 "$app" 2>/dev/null; then
+    wait "$app" || code=$?
+    echo "$label: the desktop exited with $code while typing" >&2
+    return 1
+  fi
+  xdotool key ctrl+q
+  timeout 15 tail -s 0.05 --pid="$app" -f /dev/null || { echo "$label: did not exit" >&2; return 1; }
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: 1500 keys typed; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  [[ $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -212,4 +251,5 @@ run "live SIGINT to its process group" "/live.html" INT-group --url "http://127.
 run "static SIGTERM during held request" "/hang" TERM --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 restart_run "live Restart clicked twice" stay
 restart_run "live Restart clicked twice, then Ctrl+Q" quit
+typing_run "typing while pages animate"
 echo "desktop smoke passed"

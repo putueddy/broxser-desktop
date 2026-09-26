@@ -1,4 +1,4 @@
-# GPUI 0.2.2: native IME integration
+# GPUI 0.2.2: native IME integration and atlas fix
 
 This directory contains the published `gpui` 0.2.2 crate, unpacked from
 `https://static.crates.io/crates/gpui/gpui-0.2.2.crate`.
@@ -22,11 +22,21 @@ context is created. Creation alone does not focus it. With Fcitx5 on an isolated
 X server, the unpatched handler leaves no active context and the page receives
 literal Pinyin keys rather than native preedit and commit callbacks.
 
+`src/platform/blade/blade_atlas.rs` forgets the pending initialization and uploads
+of a texture that `remove` destroys. A texture created since the last flush, for
+example by the draw that key dispatch runs without presenting, can lose its last
+tile before the next frame flushes the atlas. Upstream then unwraps the empty
+slot and panics in `BladeRenderer::draw`, or initializes and uploads into a later
+texture that reuses the index. Broxser replaces every device frame with a new
+image, so typing while pages animate reached this within about a hundred key
+presses in a release build (P1.4 in `docs/validation.md`).
+
 No other upstream behavior is intentionally changed. `Cargo.toml` patches the
 same exact version to this source; transitive versions remain locked. The vendor
 directory is excluded from the Broxser workspace's formatting and lint targets.
 
 Requalification: compare this directory with the checksum-verified archive,
-repeat the real IME and normal-keyboard checks in `docs/validation.md`, and drop
-the override once an upstream release supplies a suitable text-commit path.
-See ADR 0011 for the canvas contract and remaining platform limits.
+repeat the real IME, normal-keyboard and typing-during-animation checks in
+`docs/validation.md`, and drop the override once an upstream release supplies a
+suitable text-commit path and atlas fix. See ADR 0011 for the canvas contract and
+remaining platform limits, and ADR 0012 for the atlas fix.

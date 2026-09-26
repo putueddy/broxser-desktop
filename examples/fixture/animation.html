@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Broxser animation fixture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #17312b; }
+  #box { position: absolute; top: 5%; width: 25vw; height: 20vh; border-radius: 12px; }
+  #flip { position: fixed; left: 0; right: 0; top: 40%; bottom: 0; background: #000; }
+</style>
+<!-- Local fixture: an animation on every frame, and a region that changes
+     colour on each key press, so every device streams new frames while typing.
+     No external assets. -->
+<div id="box"></div>
+<div id="flip"></div>
+<script>
+  const box = document.getElementById('box');
+  function step(time) {
+    box.style.left = (Math.sin(time / 500) * 0.35 + 0.35) * innerWidth + 'px';
+    box.style.background = `hsl(${(time / 10) % 360} 80% 60%)`;
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+  let dark = true;
+  addEventListener('keydown', () => {
+    dark = !dark;
+    document.getElementById('flip').style.background = dark ? '#000' : '#fff';
+  }, true);
+</script>
+</html>

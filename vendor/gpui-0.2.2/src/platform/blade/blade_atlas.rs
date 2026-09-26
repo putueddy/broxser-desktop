@@ -115,6 +115,14 @@ impl PlatformAtlas for BladeAtlas {
         if let Some(mut texture) = texture_slot.take() {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
+                // Broxser: a texture created since the last flush, for example
+                // by the draw that key dispatch runs without presenting, can be
+                // destroyed before that flush. Its pending initialization and
+                // uploads would then name an empty slot, or a later texture
+                // that reuses the index.
+                let destroyed = texture.id;
+                lock.initializations.retain(|id| *id != destroyed);
+                lock.uploads.retain(|upload| upload.id != destroyed);
                 lock.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
