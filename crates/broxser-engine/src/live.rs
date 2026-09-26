@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use broxser_core::{MAX_DEVICES, SyncAction, SyncEvent, SyncRouter, Workspace, validate_url};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -301,6 +301,20 @@ pub enum Command {
     CrashForTest {
         device: usize,
     },
+}
+
+impl Command {
+    /// The device this page input goes to; other commands have none.
+    fn input_device(&self) -> Option<usize> {
+        match *self {
+            Self::Pointer { device, .. }
+            | Self::Wheel { device, .. }
+            | Self::Key { device, .. }
+            | Self::InsertText { device, .. }
+            | Self::Ime { device, .. } => Some(device),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -692,6 +706,12 @@ struct LiveDevice {
     ime_blocked_anchor: Option<u64>,
     ime_target: Option<u64>,
     composing: bool,
+    /// The IME action whose editable identity check is outstanding.
+    ime_check: Option<ImeCheck>,
+    /// Input that arrived after that action, in order. It is sent once the
+    /// check has sent or dropped the action; a navigation, a new document,
+    /// hiding, a crash or overload drops it instead.
+    held_input: VecDeque<Command>,
     link_intent: Option<LinkIntent>,
     requested_link: Option<LinkCandidate>,
     link_navigation: Option<LinkNavigation>,
@@ -739,6 +759,17 @@ struct Wheel {
     generation: u64,
 }
 
+/// An IME action waiting for a read of the current editable identity in the
+/// isolated world. A script can move focus before its next animation-frame
+/// report arrives; the read rejects that. It waits without blocking the
+/// runtime, under the deadlines of ordinary input (ADR 0011).
+struct ImeCheck {
+    target: u64,
+    action: ImeAction,
+    /// The read, sent once the page has answered earlier input.
+    read: Option<u64>,
+}
+
 /// A command whose answer the live loop waits for without blocking.
 enum Pending {
     /// The command of a device's [`Navigation`].
@@ -755,6 +786,10 @@ enum Pending {
     Input {
         device: usize,
     },
+    /// The identity read of a device's [`ImeCheck`].
+    ImeRead {
+        device: usize,
+    },
 }
 
 impl Pending {
@@ -763,7 +798,8 @@ impl Pending {
             Self::Navigate { device }
             | Self::Wheel { device }
             | Self::Move { device }
-            | Self::Input { device } => device,
+            | Self::Input { device }
+            | Self::ImeRead { device } => device,
         }
     }
 }
@@ -810,6 +846,10 @@ impl<'a> Controller<'a> {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Ok(()),
                 }
+            }
+            for index in 0..self.devices.len() {
+                self.release_input(index)?;
+                self.read_ime_target(index)?;
             }
             self.flush_input()?;
             if self.cdp.read_until(Instant::now() + LIVE_POLL)? {
@@ -877,6 +917,8 @@ impl<'a> Controller<'a> {
                 ime_blocked_anchor: None,
                 ime_target: None,
                 composing: false,
+                ime_check: None,
+                held_input: VecDeque::new(),
                 link_intent: None,
                 requested_link: None,
                 link_navigation: None,
@@ -931,6 +973,20 @@ impl<'a> Controller<'a> {
     }
 
     fn handle(&mut self, command: Command) -> Result<()> {
+        if let Some(index) = command
+            .input_device()
+            .filter(|&index| index < self.devices.len())
+        {
+            self.release_input(index)?;
+            if self.devices[index].ime_check.is_some() {
+                self.hold_input(index, command);
+                return Ok(());
+            }
+        }
+        self.dispatch(command)
+    }
+
+    fn dispatch(&mut self, command: Command) -> Result<()> {
         let count = self.devices.len();
         match command {
             Command::NavigateAll { url } => {
@@ -989,6 +1045,7 @@ impl<'a> Controller<'a> {
                     let state = &mut self.devices[device];
                     state.pointer_move = None;
                     state.wheel = None;
+                    state.held_input.clear();
                     state.link_intent = None;
                     state.requested_link = None;
                     state.link_navigation = None;
@@ -1045,6 +1102,8 @@ impl<'a> Controller<'a> {
     /// describe this one.
     fn start_navigation(&mut self, index: usize, method: &str, params: Value) -> Result<()> {
         self.clear_ime(index, true)?;
+        // Input held for the current document never reaches the next one.
+        self.devices[index].held_input.clear();
         self.forget_navigation(index);
         let session = self.devices[index].session.clone();
         let id = self.cdp.send(method, params, Some(&session))?;
@@ -1110,6 +1169,7 @@ impl<'a> Controller<'a> {
         device.move_in_flight = false;
         device.wheel_in_flight = false;
         device.unresponsive = false;
+        device.held_input.clear();
     }
 
     /// The main frame of device `index` committed or stopped loading. That
@@ -1141,14 +1201,16 @@ impl<'a> Controller<'a> {
     }
 
     /// Reports that the page of device `index` leaves input unanswered, and
-    /// drops its coalesced move and wheel. An error already shown, such as an
-    /// open dialog or a crash, explains more and stays.
+    /// drops its coalesced move and wheel and the input held behind an IME
+    /// action. An error already shown, such as an open dialog or a crash,
+    /// explains more and stays.
     fn set_unresponsive(&mut self, index: usize) {
         self.invalidate_ime(index);
         let device = &mut self.devices[index];
         device.unresponsive = true;
         device.pointer_move = None;
         device.wheel = None;
+        device.held_input.clear();
         self.shared.device(index, |status| {
             status
                 .error
@@ -1371,6 +1433,8 @@ impl<'a> Controller<'a> {
         self.track(id, Pending::Input { device: index })
     }
 
+    /// Starts the identity check of an IME action. Input to the device that
+    /// follows waits until the check has sent or dropped the action.
     fn ime(&mut self, index: usize, target: u64, action: ImeAction) -> Result<()> {
         if self.devices[index].ime_target != Some(target)
             || !valid_ime_action(&action)
@@ -1378,11 +1442,72 @@ impl<'a> Controller<'a> {
         {
             return Ok(());
         }
-        if !self.verify_ime_anchor(index, target)? {
+        self.devices[index].ime_check = Some(ImeCheck {
+            target,
+            action,
+            read: None,
+        });
+        self.read_ime_target(index)
+    }
+
+    /// Reads the current editable identity in its trusted isolated context for
+    /// the waiting IME action of device `index`. Input dispatch and
+    /// Runtime.evaluate use different renderer queues, so the read waits until
+    /// the page has answered earlier input; otherwise it could overtake a key
+    /// or click that moves focus. It returns only an identity, never page text
+    /// or a password.
+    fn read_ime_target(&mut self, index: usize) -> Result<()> {
+        let device = &self.devices[index];
+        let Some(check) = &device.ime_check else {
+            return Ok(());
+        };
+        if check.read.is_some() || device.unanswered > 0 {
+            return Ok(());
+        }
+        let (Some(context), Some(_)) = (device.ime_context, device.ime_anchor) else {
+            self.devices[index].ime_check = None;
+            return Ok(());
+        };
+        let session = device.session.clone();
+        let id = self.cdp.send(
+            "Runtime.evaluate",
+            json!({
+                "expression": "globalThis.__broxserImeCurrent?.() ?? 0",
+                "contextId": context,
+                "returnByValue": true,
+                "silent": true,
+            }),
+            Some(&session),
+        )?;
+        self.track(id, Pending::ImeRead { device: index })?;
+        if let Some(check) = &mut self.devices[index].ime_check {
+            check.read = Some(id);
+        }
+        Ok(())
+    }
+
+    /// Sends the waiting IME action of device `index` if read `id` found its
+    /// target still current; otherwise the action is dropped.
+    fn ime_target_read(&mut self, index: usize, id: u64, response: Value) -> Result<()> {
+        let device = &mut self.devices[index];
+        if device.ime_check.as_ref().and_then(|check| check.read) != Some(id) {
+            return Ok(());
+        }
+        let Some(check) = device.ime_check.take() else {
+            return Ok(());
+        };
+        let anchor = parse_response(response, "Runtime.evaluate")
+            .ok()
+            .and_then(|result| result.pointer("/result/value").and_then(Value::as_u64));
+        if anchor.is_none() || anchor != device.ime_anchor {
+            self.invalidate_ime(index);
+            return Ok(());
+        }
+        if device.ime_target != Some(check.target) || !self.input_allowed(index) {
             return Ok(());
         }
         let session = self.devices[index].session.clone();
-        let (method, params) = match action {
+        let (method, params) = match check.action {
             ImeAction::Preedit { text, selection } => {
                 self.devices[index].composing = true;
                 (
@@ -1412,62 +1537,57 @@ impl<'a> Controller<'a> {
         self.track(id, Pending::Input { device: index })
     }
 
-    /// Rechecks the current editable anchor in its trusted isolated context.
-    /// A script can change focus before its next animation-frame report arrives.
-    /// This read returns only an identity, never page text or a password.
-    fn verify_ime_anchor(&mut self, index: usize, target: u64) -> Result<bool> {
-        let deadline = Instant::now() + self.limits.command.min(Duration::from_millis(250));
-        // Input dispatch and Runtime.evaluate use different renderer queues.
-        // Wait for preceding input to settle before inspecting its resulting
-        // focus; otherwise the read can overtake a click/key that moves it.
-        while self.devices[index].unanswered > 0 {
-            self.drain()?;
-            if self.devices[index].ime_target != Some(target) {
-                return Ok(false);
+    /// Holds input to device `index` behind its waiting IME action. As for
+    /// sent input, only the newest move and the summed wheel wait. A page that
+    /// leaves too much input waiting is not responding; the held input is dropped.
+    fn hold_input(&mut self, index: usize, command: Command) {
+        let device = &mut self.devices[index];
+        match (device.held_input.back_mut(), &command) {
+            (Some(Command::Pointer { event: held, .. }), Command::Pointer { event, .. })
+                if held.kind == PointerKind::Move && event.kind == PointerKind::Move =>
+            {
+                *held = *event;
+                return;
             }
-            if self.devices[index].unanswered == 0 {
-                break;
+            (
+                Some(Command::Wheel {
+                    x: held_x,
+                    y: held_y,
+                    delta_x: held_delta_x,
+                    delta_y: held_delta_y,
+                    ..
+                }),
+                Command::Wheel {
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                    ..
+                },
+            ) => {
+                (*held_x, *held_y) = (*x, *y);
+                *held_delta_x += delta_x;
+                *held_delta_y += delta_y;
+                return;
             }
-            if !self.cdp.read_until(deadline)? {
-                self.invalidate_ime(index);
-                return Ok(false);
-            }
+            _ => {}
         }
-        let (Some(context), Some(anchor)) = (
-            self.devices[index].ime_context,
-            self.devices[index].ime_anchor,
-        ) else {
-            return Ok(false);
-        };
-        let session = self.devices[index].session.clone();
-        let id = self.cdp.send(
-            "Runtime.evaluate",
-            json!({
-                "expression": "globalThis.__broxserImeCurrent?.() ?? 0",
-                "contextId": context,
-                "returnByValue": true,
-                "silent": true,
-            }),
-            Some(&session),
-        )?;
-        loop {
-            if let Some(response) = self.cdp.take_response(id) {
-                let same = parse_response(response, "Runtime.evaluate")
-                    .ok()
-                    .and_then(|result| result.pointer("/result/value").and_then(Value::as_u64))
-                    == Some(anchor);
-                if !same {
-                    self.invalidate_ime(index);
-                }
-                return Ok(same && self.devices[index].ime_target == Some(target));
-            }
-            if !self.cdp.read_until(deadline)? {
-                self.cdp.abandon(id);
-                self.invalidate_ime(index);
-                return Ok(false);
-            }
-            self.drain()?;
+        if device.unanswered + device.held_input.len() >= MAX_UNANSWERED_INPUT {
+            self.set_unresponsive(index);
+            return;
         }
+        device.held_input.push_back(command);
+    }
+
+    /// Sends the input held behind a decided IME action, in order, until
+    /// another IME action waits for its own check.
+    fn release_input(&mut self, index: usize) -> Result<()> {
+        while self.devices[index].ime_check.is_none()
+            && let Some(command) = self.devices[index].held_input.pop_front()
+        {
+            self.dispatch(command)?;
+        }
+        Ok(())
     }
 
     fn invalidate_ime(&mut self, index: usize) {
@@ -1475,6 +1595,8 @@ impl<'a> Controller<'a> {
         let had_target = device.ime_target.is_some();
         device.ime_anchor = None;
         device.ime_target = None;
+        // A waiting action is dropped; a late answer to its read is ignored.
+        device.ime_check = None;
         device.composing = false;
         if had_target {
             self.shared.device(index, |status| status.text_input = None);
@@ -1669,6 +1791,10 @@ impl<'a> Controller<'a> {
                             .update(|status| status.protocol_error = Some(error));
                     }
                     self.answered(device);
+                }
+                Some(Pending::ImeRead { device }) => {
+                    self.answered(device);
+                    self.ime_target_read(device, id, response)?;
                 }
                 None => {}
             }

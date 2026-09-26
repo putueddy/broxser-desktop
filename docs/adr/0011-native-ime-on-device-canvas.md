@@ -44,12 +44,15 @@ contract from ADR 0006 and cannot distinguish a physical press reliably.
   the final platform/window scaling and candidate popup positioning.
 - Apply the same per-device visibility, responsiveness, input budgets, and
   deadlines as ordinary input. Validate composition text and UTF-16 ranges before
-  a CDP side effect. A bounded read of the isolated editable identity before an
-  IME operation rejects a focus change that has not reached the asynchronous
+  a CDP side effect. A read of the isolated editable identity before each IME
+  operation rejects a focus change that has not reached the asynchronous
   observer yet. Preceding input responses settle before that read, because CDP
   input dispatch and Runtime evaluation use different renderer queues. The
-  combined wait is bounded at 250 ms; it is not an atomic transaction with
-  arbitrary page scripts.
+  runtime waits for both without blocking other devices. Later input to the same
+  device waits behind the operation, in order, and counts against the device's
+  input budget. A navigation, a new document, hiding, a crash or an unresponsive
+  page drops the waiting operation and that input; neither is sent later. The
+  check is not an atomic transaction with arbitrary page scripts.
 - Vendor the checksum-verified GPUI 0.2.2 crate with two platform fixes: all Wayland
   IME commits use the text handler, and newly created XIM contexts receive
   `SetIcFocus`, without which Fcitx5 does not compose. Keep its version, license and transitive pins;
@@ -88,9 +91,12 @@ The test harness configures this only in its temporary profile, never the user's
 
 The engine tests must cover composition events and final values, cancel, repeated
 identical commits without key-up, target isolation, stale/hidden targets, caret
-updates, UTF-16 boundaries, and forged or malformed observer reports. Desktop
-tests must cover composition ownership through focus/lifecycle changes, UTF-16
-range handling, commit without physical-key bookkeeping, and coordinate mapping.
+updates, UTF-16 boundaries, and forged or malformed observer reports. They must
+also cover a page that answers preceding input slowly: the first version bounded
+the identity check at 250 ms and dropped genuine commits on a loaded CI runner.
+Desktop tests must cover composition ownership through focus/lifecycle changes,
+UTF-16 range handling, commit without physical-key bookkeeping, and coordinate
+mapping.
 
 `examples/fixture/ime.html` records only local test input. `scripts/ime-smoke.py`
 runs a real Fcitx5 Pinyin engine over XIM with private configuration and D-Bus,

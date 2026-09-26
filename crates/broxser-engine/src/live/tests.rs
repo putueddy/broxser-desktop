@@ -1019,6 +1019,21 @@ field.addEventListener('keydown',e=>{
 field.focus();field.setSelectionRange(1,1);
 </script></body></html>"#;
 
+/// Answers F2 after 400 ms and F3 after 1.5 s.
+const IME_BUSY_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+</head><body><input id=field style="width:240px;height:32px"><script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind,w:innerWidth,...data}));
+field.addEventListener('input', () => report('input', {value: field.value}));
+field.addEventListener('keydown', e => {
+  const busy = {F2: 400, F3: 1500}[e.key];
+  if (!busy) return;
+  const end = performance.now() + busy;
+  while (performance.now() < end) {}
+  report('free', {key: e.key});
+});
+field.focus();
+</script></body></html>"#;
+
 fn fixture() -> Fixture {
     Fixture::start(|request, _| {
         let path = request.path.split('?').next().unwrap_or("/");
@@ -1038,6 +1053,7 @@ fn fixture() -> Fixture {
             "/keys" => KEYS_PAGE.into(),
             "/ime" => IME_PAGE.into(),
             "/ime-attacks" => IME_ATTACK_PAGE.into(),
+            "/ime-busy" => IME_BUSY_PAGE.into(),
             "/slowstart" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow';"),
             "/supersede" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow'; document.getElementById('link').addEventListener('click', () => setTimeout(() => location.href = '/supersede-dest', 100));"),
             "/longstart" => PAGE.replace("AUTO", &format!("document.getElementById('link').href = '/long?token={}';", "x".repeat(2300))),
@@ -1535,6 +1551,129 @@ fn live_ime_rejects_scripted_focus_and_selection_after_synthetic_events() {
     assert!(
         (188.0..215.0).contains(&tall.caret.y),
         "tall input caret: {tall:?}"
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_ime_waits_for_a_slow_page_without_dropping_or_reordering_input() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/ime-busy")));
+    let status = live.wait("busy editable", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/ime-busy") && s.devices[0].text_input.is_some()
+    });
+    let target = status.devices[0].text_input.unwrap().target;
+    // The page answers F2 after 400 ms. The identity check of the commits
+    // waits for that answer; a fixed 250 ms bound dropped them.
+    live.send(Command::Key {
+        device: 0,
+        key: KeyInput::from_key("f2", None, Modifiers::default(), true).unwrap(),
+    });
+    for _ in 0..2 {
+        live.send(Command::Ime {
+            device: 0,
+            target,
+            action: ImeAction::Commit { text: "✓".into() },
+        });
+    }
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("x", Some("x"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    let values = || {
+        events(&fixture, "input")
+            .into_iter()
+            .filter(|event| event["w"] == "360")
+            .map(|event| event["value"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |_| values()
+            .iter()
+            .any(|value| value == "✓✓x")),
+        "input: {:?}",
+        values()
+    );
+    // Reports can arrive out of order; each value is still a prefix.
+    assert!(
+        values()
+            .iter()
+            .all(|value| "✓✓x".starts_with(value.as_str())),
+        "input overtook a waiting commit: {:?}",
+        values()
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_input_held_behind_an_ime_check_is_dropped_when_hidden() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/ime-busy")));
+    let status = live.wait("busy editable", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/ime-busy") && s.devices[0].text_input.is_some()
+    });
+    let target = status.devices[0].text_input.unwrap().target;
+    // The page answers F3 after 1.5 s. The commit waits for that answer and
+    // the key waits behind the commit when the device is hidden.
+    live.send(Command::Key {
+        device: 0,
+        key: KeyInput::from_key("f3", None, Modifiers::default(), true).unwrap(),
+    });
+    live.send(Command::Ime {
+        device: 0,
+        target,
+        action: ImeAction::Commit { text: "b".into() },
+    });
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("x", Some("x"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    for visible in [false, true] {
+        live.send(Command::SetVisible { device: 0, visible });
+    }
+    assert!(fixture.wait_for(Duration::from_secs(10), |_| {
+        events(&fixture, "free")
+            .iter()
+            .any(|event| event["w"] == "360" && event["key"] == "F3")
+    }));
+    let shown = live
+        .wait("editable after showing", Duration::from_secs(5), |s| {
+            s.devices[0]
+                .text_input
+                .is_some_and(|state| state.target != target)
+        })
+        .devices[0]
+        .text_input
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let typed = |fixture: &Fixture| {
+        events(fixture, "input")
+            .into_iter()
+            .filter(|event| event["w"] == "360")
+            .map(|event| event["value"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        typed(&fixture).is_empty(),
+        "sent later: {:?}",
+        typed(&fixture)
+    );
+    // Nothing waits any longer: new input arrives alone.
+    live.send(Command::Ime {
+        device: 0,
+        target: shown.target,
+        action: ImeAction::Commit { text: "c".into() },
+    });
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| typed(fixture) == ["c"]),
+        "input: {:?}",
+        typed(&fixture)
     );
     live.close();
 }

@@ -783,10 +783,11 @@ Failures found and repaired during qualification:
   and a vertically misplaced caret in tall inputs. Regression coverage now
   exercises these cases; native deletion records a boundary for the next preedit.
 - One full live run exposed `Runtime.evaluate` overtaking earlier key dispatch.
-  The target check now waits for preceding input responses within the same bounded
-  deadline. Another run exposed a pre-existing link-test predicate accepting the
-  previous `/next` status; it now waits for the new source request before checking
-  the unchanged no-sync assertion. The complete final suite passed.
+  The target check now waits for preceding input responses (no longer within a
+  fixed 250 ms bound; see the next subsection). Another run exposed a
+  pre-existing link-test predicate accepting the previous `/next` status; it now
+  waits for the new source request before checking the unchanged no-sync
+  assertion. The complete final suite passed.
 - Initial sandbox-only runs could not bind fixture sockets; tests requiring
   localhost/browser/window access were rerun outside that sandbox. Private Xvfb
   initially lacked a usable Vulkan driver; a verified temporary Lavapipe package
@@ -800,6 +801,44 @@ commit-only input is dropped rather than moved to a new target. Frames and
 candidate/DOM updates are asynchronous; a streamed preedit can trail the latest
 DOM update. GPUI's existing numeric-fallback warnings and the existing
 `proc-macro-error2` future-compatibility warning remain non-failing.
+
+### Slow answers before an IME commit (PR #10 CI, 26 September 2026)
+
+CI on `4f4e54d` failed `live_ime_rejects_scripted_focus_and_selection_after_synthetic_events`:
+after the three attacks, the two genuine `✓` commits never produced a value with
+both check marks. The 25 other live tests passed on that runner, which was also
+writing browser core dumps for the guardian tests. The identity check blocked the
+runtime for at most 250 ms, including the wait for the page's answer to earlier
+input; on timeout it dropped the IME action and invalidated its target, so the
+next commit was dropped as well.
+
+Reproduction in the cloud container (user `broxsertest`, sandbox on):
+
+| Check on `4f4e54d` | Result |
+| --- | --- |
+| The CI test alone five times, then twelve times beside six busy loops | Passed each time: load alone did not reproduce it |
+| Full live suite, four threads, three times | Passed 26 of 26 each time |
+| Scratch test with debug logging: the page answers the first commit after 400 ms, a second commit follows | The second commit was dropped after 251 ms with the first still unanswered; the page kept one `✓` |
+| New test `live_ime_waits_for_a_slow_page_without_dropping_or_reordering_input` | Failed: both commits dropped, only `x` typed |
+| New test `live_input_held_behind_an_ime_check_is_dropped_when_hidden` | Failed as expected without a hold: the commit was dropped at 250 ms and the key typed after it reached the page |
+
+The check now waits without blocking the runtime: the read is sent once earlier
+input is answered, its answer sends or drops the action, and later input to that
+device waits behind it in order under the ordinary input budget and deadline.
+Navigation, a new document, hiding, a crash or an unresponsive page drops the
+waiting action and that input (ADR 0011).
+
+| Check with the change | Result |
+| --- | --- |
+| The two new tests, three runs each | Passed: `✓✓x` with every reported value a prefix; after hide and show nothing held was sent, and the next commit arrived alone |
+| The three older IME live tests | Passed |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 63 engine and 24 desktop tests; format and strict Clippy; 28 live tests ignored by default |
+| Live Helium suite, four test threads | Passed 28 of 28 twice, in 40.3 s and 40.0 s |
+| Same suite beside six busy loops on the four cores | Passed 28 of 28 in 90.9 s |
+| `scripts/desktop-smoke.sh` under Xvfb with the rebuilt desktop | Passed all seven runs; no browser process or profile left, and the known preview directory after SIGTERM |
+
+Not rerun: the native Fcitx5 smoke, since Fcitx5 is not installed in this
+container. The desktop code did not change.
 
 ## Open gates
 
