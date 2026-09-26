@@ -18,6 +18,8 @@ blocking browser I/O stays off the GPUI thread and nothing leaks on close.
   unread frame; a newer frame replaces it. Every frame is acknowledged on
   receipt, including replaced and hidden-device frames, so streams never stall.
   Hidden devices stop their screencast. Frame size is capped at the displayed size.
+  ADR 0012 also pauses devices scrolled out of the canvas, re-sends the cap when
+  the window's scale factor changes, and fixes a GPUI atlas crash on typing.
 - The desktop decodes frames on GPUI's background executor, one per device at a
   time, and drops the previous image from GPUI's sprite atlas when it replaces it.
 - Input uses `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent` in CSS pixels,
