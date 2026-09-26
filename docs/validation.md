@@ -3,6 +3,98 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.5 modern application navigation, 26 September 2026 (cloud container)
+
+Same container as P1.4: Helium 0.18.1.1 (Chrome/154.0.8037.57, protocol 1.3),
+headless, run by the unprivileged user `broxsertest` with the sandbox enabled and
+the profile seeded as in ADR 0004. Decisions are in
+[ADR 0013](adr/0013-modern-navigation-sync.md).
+
+### Probe: what Helium reports for each kind of navigation
+
+A scratch Node script, not committed, drove one page target with Broxser's own
+setup (device metrics, focus emulation, the link observer in its isolated world)
+and clicked links on a local fixture through `Input.dispatchMouseEvent`. It
+recorded the `Page` and `Runtime.bindingCalled` events. Scheduled-navigation
+events are omitted below; `C` and `Y` are the observer's activation and
+`beforeunload` confirmation reports.
+
+| Scenario | Main-frame events | `main` at `e2bf9cb` |
+| --- | --- | --- |
+| Link → 302 → `/final`; 307 → 302 chain; 302 to another origin | `C`, `frameRequestedNavigation anchorClick`, `Y`, `frameStartedNavigating differentDocument` with one loader, `frameNavigated` of that loader at the final URL | Never synchronized: the committed URL differs from the link |
+| Link → 302 → `/final#x`; link to `/final#x` | As above; `frameNavigated` has `url=/final` and `urlFragment=#x` | Never synchronized; the status showed `/final` |
+| Link to an unreachable host | `frameNavigated url=chrome-error://chromewebdata/ unreachableUrl=<link>`, then Chromium's own `reload` of the error page after 1 s | Not synchronized, because the URLs differed |
+| Hash link `#sec` | `C`, then only `navigatedWithinDocument fragment`; no request, loader or `beforeunload` | Never synchronized |
+| Link whose handler calls `pushState` or `replaceState`; Navigation API `intercept` | `C`, then only `navigatedWithinDocument` (`historyApi`, `other`) | Never synchronized |
+| Router that pushes 300 ms after the click | `C` at 8 ms, `navigatedWithinDocument` at 311 ms | Never synchronized |
+| Router that calls `replaceState(current URL)` then `pushState(link)` | `C`, `navigatedWithinDocument` with the current URL, then with the link's URL | Never synchronized |
+| Button that calls `pushState` or sets `location.hash`; script `a.click()` on a hash link | `navigatedWithinDocument` without any `C` | Not synchronized (correct) |
+| Link inside an iframe (page, hash and `pushState`); main-document link with `target=frame` | Every event names the subframe; `C` arrives from the frame's own isolated context | Not synchronized (correct) |
+| Link to a 204; redirect to a 204; download; redirect to a download | `frameStartedNavigating`, `frameStoppedLoading`, `downloadWillBegin` for downloads; no `frameNavigated` | Not synchronized (correct) |
+| Second link 300 ms after a slow first one | The second `frameRequestedNavigation` and loader replace the first; only the second commits | Only the second synchronized (correct) |
+| Go, or a script's `location.href`, 300 ms after a slow link | A new loader (`scriptInitiated` for the script) replaces the link's | Not synchronized (correct) |
+| `Page.navigate` to the current document plus `#sec`, as a peer receives it | `frameStartedNavigating sameDocument`, `navigatedWithinDocument fragment`, no request | — |
+| `history.back()` to a `pushState` entry | `frameStartedNavigating historySameDocument`, `navigatedWithinDocument fragment` | Not synchronized (no activation) |
+
+The first probe run started Helium without the seeded profile preference. Helium's
+bundled blocker then reloaded the page of the redirect chain 2.5 s after it
+committed and held the plain redirect for 2.3 s (ADR 0004). With the preference,
+no run showed either.
+
+### Before the change
+
+A temporary survey test loaded each fixture page on the three devices, clicked
+the phone's link (or pressed Enter on the focused link) with navigation sync on,
+and read the device URLs 3 s later:
+
+| Page | Phone | Tablet (same session) | Desktop (other session) |
+| --- | --- | --- | --- |
+| `/redirect-chain` (307 → 302 → `/landed`) | `/landed` | `/redirect-chain` | `/redirect-chain` |
+| `/redirect-fragment` (302 → `/landed#part`) | `/landed` (fragment lost) | `/redirect-fragment` | `/redirect-fragment` |
+| `/redirect-away` (302 to `localhost`) | `http://localhost:…/landed` | `/redirect-away` | `/redirect-away` |
+| `/fragment-link` (link to `/landed#part`) | `/landed` (fragment lost) | `/fragment-link` | `/fragment-link` |
+| `/hash` (link to `#part`) | `/hash#part` | `/hash` | `/hash` |
+| `/spa`, `/spa-late`, `/navigation-api`, `/spa-keyboard` (routers) | the route | the start page | the start page |
+
+The new tests on `main` at `e2bf9cb`:
+
+| Test | Before | After |
+| --- | --- | --- |
+| `redirected_link_commit_synchronizes_the_link_and_keeps_fragments` (fake CDP) | Failed: the status never showed `/landed#part` | Passed |
+| `same_document_link_navigation_follows_only_a_live_activation` (fake CDP) | Failed: no `Page.navigate` reached the tablet | Passed |
+| `live_link_sync_follows_redirects_and_fragments_with_the_link_url` | Failed: the tablet stayed on `/redirect-chain` | Passed |
+| `live_same_document_link_navigations_sync_within_the_session` | Failed: the tablet stayed on `/hash` | Passed |
+| `live_script_and_stale_same_document_changes_never_sync` | Passed | Passed |
+| `live_subframe_navigations_never_sync` | Passed, after a fixture fix: the frame's hash link scrolled the scrollable page, so the next click missed | Passed |
+| `live_cancelled_and_superseded_link_navigations_sync_at_most_the_latest` | Passed | Passed |
+
+The four passing tests pin behavior that was already correct but untested.
+
+### After the change
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 65 engine and 24 desktop tests; fmt and strict Clippy; 34 live tests ignored by default |
+| Live Helium suite (`--ignored`, 4 threads) | 34 of 34 passed in 53.4 s, including the five new tests and every earlier link, hidden-input, reload and deadline test |
+| Five new live tests alone (3 threads) | 5 of 5 passed in 16.2 s |
+
+The change touches the engine only; no desktop code changed, so no window check
+was run.
+
+### Limits
+
+- `history.back()` and `forward()`, page-started cross-document navigations (meta
+  refresh, `location.href`, forms), new tabs and downloads stay outside the sync
+  contract, as in ADR 0006.
+- Peers load an SPA route as a full document from the server; an application
+  whose server does not serve its client-side routes shows its 404 on the peers.
+- A same-document navigation follows an activation for up to 10 s. A slower
+  router does not synchronize; a page that pushes the link's URL within that
+  window for another reason does.
+- The fixture serves 302/307/204 and dropped connections; it does not cover
+  `Content-Disposition` downloads inside the live tests (the probe did, through
+  `Browser.setDownloadBehavior: deny`).
+
 ## P1.4 frame quality and resource use, 26 September 2026 (cloud container)
 
 Release builds in the same container as P1.3: Xvfb 1600 × 1000 without a window

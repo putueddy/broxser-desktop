@@ -35,6 +35,23 @@ No other upstream behavior is intentionally changed. `Cargo.toml` patches the
 same exact version to this source; transitive versions remain locked. The vendor
 directory is excluded from the Broxser workspace's formatting and lint targets.
 
+Upstream status, checked on 2026-09-26 against `zed-industries/zed` `main` at
+`933d8d9` and crates.io, where 0.2.2 is still the newest `gpui` release:
+
+- Atlas: `main` replaced the Blade renderer with wgpu
+  ([zed-industries/zed#46758](https://github.com/zed-industries/zed/pull/46758)).
+  Its atlas had the same race and fixed it the same way, by dropping the queued
+  uploads of a released texture, with a regression test
+  ([zed-industries/zed#53088](https://github.com/zed-industries/zed/pull/53088)).
+  [zed-industries/zed#64623](https://github.com/zed-industries/zed/pull/64623) also
+  makes each renderer skip sprites whose texture was released. Nothing is left to
+  report upstream, but no release carries these fixes yet.
+- XIM: `main` still creates the input context without `SetIcFocus`. Its handler
+  differs from the patched one here only in that call.
+- Wayland: `main` still turns a single-byte commit into a synthetic key-down, on
+  purpose, for modal key bindings. What Broxser needs there is an API change, such
+  as an origin for those events, rather than a bug fix.
+
 Requalification: compare this directory with the checksum-verified archive,
 repeat the real IME, normal-keyboard and typing-during-animation checks in
 `docs/validation.md`, and drop the override once an upstream release supplies a

@@ -39,6 +39,9 @@ pub(crate) struct Limits {
     /// Also the websocket handshake deadline; see [`cdp::Cdp::connect`].
     pub command: Duration,
     pub load: Duration,
+    /// Live only: how long after a trusted link activation a same-document
+    /// navigation to its URL still follows it (ADR 0013).
+    pub link_follow: Duration,
 }
 
 impl Default for Limits {
@@ -47,6 +50,7 @@ impl Default for Limits {
             startup: Duration::from_secs(15),
             command: Duration::from_secs(15),
             load: Duration::from_secs(30),
+            link_follow: Duration::from_secs(10),
         }
     }
 }

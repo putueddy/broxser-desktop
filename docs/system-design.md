@@ -241,9 +241,14 @@ Router memerlukan opt-in, memeriksa source session/device, dan tidak mengaktifka
 click/typing. Live session memerlukan bukti aktivasi link tepercaya dari execution
 context terisolasi pada main frame, lalu mencocokkannya dengan request dan loader
 navigasi (ADR 0006). Respons HTTP lambat tidak menghapus kelayakan yang sudah
-terikat ke navigasi itu. URL asli divalidasi tanpa dipotong; redirect ke URL berbeda
-tidak dicerminkan. Scroll di-coalesce dan dibuang bila tujuan sudah bernavigasi
-atau tersembunyi. Device tersembunyi tidak menerima input atau sync. Antrean
+terikat ke navigasi itu. URL asli divalidasi tanpa dipotong. Yang disinkronkan
+adalah URL link yang diaktifkan pengguna: peer memuatnya dan mengikuti redirect-nya
+sendiri, sedangkan URL hasil redirect (yang bisa memuat kode atau token) hanya
+tampil di status device itu. Navigasi same-document (hash, History API, Navigation
+API) ke URL aktivasi link yang masih hidup (dokumen sama, dalam 10 detik) ikut
+disinkronkan sekali; navigasi subframe, navigasi yang dimulai script, dan navigasi
+tanpa dokumen tidak (ADR 0013). Scroll di-coalesce dan dibuang bila tujuan sudah
+bernavigasi atau tersembunyi. Device tersembunyi tidak menerima input atau sync. Antrean
 command, frame dan event berbatas. Jangan memakai klaim exactly-once untuk aksi
 web; side effect di server tidak bisa dibatalkan oleh router lokal.
 

@@ -97,8 +97,10 @@ juga tertinggal pada close normal. Lihat
 
 Sync link memakai observer terisolasi, bukan asumsi bahwa setiap navigasi setelah
 mengetik berasal dari pengguna. Link lambat tetap dapat tersinkron; URL melebihi
-batas validasi ditolak untuk sync tanpa dipotong. Redirect ke URL berbeda, link
-subframe, download dan pembukaan tab baru belum dicakup kontrak sync ini.
+batas validasi ditolak untuk sync tanpa dipotong. Peer memuat URL link yang
+diklik dan mengikuti redirect-nya sendiri; navigasi hash dan router SPA ke URL
+link yang baru diklik ikut disinkronkan (ADR 0013). Link subframe, navigasi yang
+dimulai script, download dan pembukaan tab baru tidak dicakup kontrak sync ini.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable
