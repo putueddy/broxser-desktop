@@ -68,6 +68,8 @@ const LINK_OBSERVER: &str = r#"(() => {
     pending = null;
   }, true);
 })();"#;
+mod ime;
+use ime::{IME_BINDING, IME_OBSERVER, IME_WORLD, parse_caret_report, valid_ime_action};
 const JPEG_QUALITY: u32 = 80;
 /// Largest frame edge requested before the UI reports its display size.
 const DEFAULT_FRAME_EDGE: u32 = 2048;
@@ -202,6 +204,36 @@ pub struct DeviceStatus {
     pub dropped_frames: u64,
     /// Windows the page opened; they are not displayed yet.
     pub popups: u32,
+    /// Current main-frame editable caret. Cleared whenever its target is unsafe.
+    pub text_input: Option<TextInputState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaretRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextInputState {
+    /// Engine-assigned token; old tokens cannot type into a new focus or anchor.
+    pub target: u64,
+    pub caret: CaretRect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImeAction {
+    /// UTF-16 code-unit offsets within `text`.
+    Preedit {
+        text: String,
+        selection: std::ops::Range<usize>,
+    },
+    Commit {
+        text: String,
+    },
+    Cancel,
 }
 
 /// Opt-in synchronization inside one session. Pointer and key synchronization
@@ -246,6 +278,11 @@ pub enum Command {
     InsertText {
         device: usize,
         text: String,
+    },
+    Ime {
+        device: usize,
+        target: u64,
+        action: ImeAction,
     },
     /// Hidden devices stop their screencast and keep no frame.
     SetVisible {
@@ -612,6 +649,7 @@ struct Controller<'a> {
     router: SyncRouter,
     sync: SyncSettings,
     pending: HashMap<u64, Pending>,
+    next_ime_target: u64,
 }
 
 struct LinkIntent {
@@ -649,6 +687,11 @@ struct LiveDevice {
     /// Increments on every committed cross-document navigation.
     generation: u64,
     link_context: Option<i64>,
+    ime_context: Option<i64>,
+    ime_anchor: Option<u64>,
+    ime_blocked_anchor: Option<u64>,
+    ime_target: Option<u64>,
+    composing: bool,
     link_intent: Option<LinkIntent>,
     requested_link: Option<LinkCandidate>,
     link_navigation: Option<LinkNavigation>,
@@ -754,6 +797,7 @@ impl<'a> Controller<'a> {
             router: SyncRouter::new(workspace).map_err(|error| anyhow!("{error}"))?,
             sync: SyncSettings::default(),
             pending: HashMap::new(),
+            next_ime_target: 0,
         })
     }
 
@@ -828,6 +872,11 @@ impl<'a> Controller<'a> {
                 limit: (physical(device.width), physical(device.height)),
                 generation: 0,
                 link_context: None,
+                ime_context: None,
+                ime_anchor: None,
+                ime_blocked_anchor: None,
+                ime_target: None,
+                composing: false,
                 link_intent: None,
                 requested_link: None,
                 link_navigation: None,
@@ -855,6 +904,16 @@ impl<'a> Controller<'a> {
             self.command(
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({"source": LINK_OBSERVER, "worldName": LINK_WORLD, "runImmediately": true}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
+            self.command(
+                "Runtime.addBinding",
+                json!({"name": IME_BINDING, "executionContextName": IME_WORLD}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
+            self.command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": IME_OBSERVER, "worldName": IME_WORLD, "runImmediately": true}),
                 Some(&self.devices.last().unwrap().session.clone()),
             )?;
         }
@@ -901,16 +960,32 @@ impl<'a> Controller<'a> {
             Command::InsertText { device, text } if device < count => {
                 self.insert_text(device, &text)?;
             }
+            Command::Ime {
+                device,
+                target,
+                action,
+            } if device < count => {
+                self.ime(device, target, action)?;
+            }
             Command::SetVisible { device, visible } if device < count => {
-                self.devices[device].visible = visible;
                 if visible {
+                    self.devices[device].visible = true;
                     self.cdp.send_detached(
                         "Input.setIgnoreInputEvents",
                         json!({"ignore": false}),
                         Some(&self.devices[device].session.clone()),
                     )?;
                     self.start_stream(device)?;
+                    if let Some(context) = self.devices[device].ime_context {
+                        self.cdp.send_detached(
+                            "Runtime.evaluate",
+                            json!({"expression":"globalThis.__broxserImeRefresh?.()", "contextId":context, "silent":true}),
+                            Some(&self.devices[device].session.clone()),
+                        )?;
+                    }
                 } else {
+                    self.clear_ime(device, true)?;
+                    self.devices[device].visible = false;
                     let state = &mut self.devices[device];
                     state.pointer_move = None;
                     state.wheel = None;
@@ -969,6 +1044,7 @@ impl<'a> Controller<'a> {
     /// the browser cancels that navigation, and its late answer must not
     /// describe this one.
     fn start_navigation(&mut self, index: usize, method: &str, params: Value) -> Result<()> {
+        self.clear_ime(index, true)?;
         self.forget_navigation(index);
         let session = self.devices[index].session.clone();
         let id = self.cdp.send(method, params, Some(&session))?;
@@ -1068,6 +1144,7 @@ impl<'a> Controller<'a> {
     /// drops its coalesced move and wheel. An error already shown, such as an
     /// open dialog or a crash, explains more and stays.
     fn set_unresponsive(&mut self, index: usize) {
+        self.invalidate_ime(index);
         let device = &mut self.devices[index];
         device.unresponsive = true;
         device.pointer_move = None;
@@ -1153,6 +1230,13 @@ impl<'a> Controller<'a> {
         // session of the browser shares (ADR 0010).
         if event.button == PointerButton::Middle || !self.input_allowed(index) {
             return Ok(());
+        }
+        if event.kind == PointerKind::Down {
+            self.devices[index].ime_blocked_anchor = self.devices[index].ime_anchor;
+            self.clear_ime(index, true)?;
+            if !self.input_allowed(index) {
+                return Ok(());
+            }
         }
         let device = &mut self.devices[index];
         if event.kind == PointerKind::Move {
@@ -1285,6 +1369,130 @@ impl<'a> Controller<'a> {
             .cdp
             .send("Input.insertText", json!({"text": text}), Some(&session))?;
         self.track(id, Pending::Input { device: index })
+    }
+
+    fn ime(&mut self, index: usize, target: u64, action: ImeAction) -> Result<()> {
+        if self.devices[index].ime_target != Some(target)
+            || !valid_ime_action(&action)
+            || !self.input_allowed(index)
+        {
+            return Ok(());
+        }
+        if !self.verify_ime_anchor(index, target)? {
+            return Ok(());
+        }
+        let session = self.devices[index].session.clone();
+        let (method, params) = match action {
+            ImeAction::Preedit { text, selection } => {
+                self.devices[index].composing = true;
+                (
+                    "Input.imeSetComposition",
+                    json!({
+                        "text": text,
+                        "selectionStart": selection.start,
+                        "selectionEnd": selection.end,
+                    }),
+                )
+            }
+            ImeAction::Commit { text } => {
+                self.devices[index].composing = false;
+                ("Input.insertText", json!({"text": text}))
+            }
+            ImeAction::Cancel => {
+                self.devices[index].composing = false;
+                (
+                    "Input.imeSetComposition",
+                    json!({
+                        "text": "", "selectionStart": 0, "selectionEnd": 0,
+                    }),
+                )
+            }
+        };
+        let id = self.cdp.send(method, params, Some(&session))?;
+        self.track(id, Pending::Input { device: index })
+    }
+
+    /// Rechecks the current editable anchor in its trusted isolated context.
+    /// A script can change focus before its next animation-frame report arrives.
+    /// This read returns only an identity, never page text or a password.
+    fn verify_ime_anchor(&mut self, index: usize, target: u64) -> Result<bool> {
+        let deadline = Instant::now() + self.limits.command.min(Duration::from_millis(250));
+        // Input dispatch and Runtime.evaluate use different renderer queues.
+        // Wait for preceding input to settle before inspecting its resulting
+        // focus; otherwise the read can overtake a click/key that moves it.
+        while self.devices[index].unanswered > 0 {
+            self.drain()?;
+            if self.devices[index].ime_target != Some(target) {
+                return Ok(false);
+            }
+            if self.devices[index].unanswered == 0 {
+                break;
+            }
+            if !self.cdp.read_until(deadline)? {
+                self.invalidate_ime(index);
+                return Ok(false);
+            }
+        }
+        let (Some(context), Some(anchor)) = (
+            self.devices[index].ime_context,
+            self.devices[index].ime_anchor,
+        ) else {
+            return Ok(false);
+        };
+        let session = self.devices[index].session.clone();
+        let id = self.cdp.send(
+            "Runtime.evaluate",
+            json!({
+                "expression": "globalThis.__broxserImeCurrent?.() ?? 0",
+                "contextId": context,
+                "returnByValue": true,
+                "silent": true,
+            }),
+            Some(&session),
+        )?;
+        loop {
+            if let Some(response) = self.cdp.take_response(id) {
+                let same = parse_response(response, "Runtime.evaluate")
+                    .ok()
+                    .and_then(|result| result.pointer("/result/value").and_then(Value::as_u64))
+                    == Some(anchor);
+                if !same {
+                    self.invalidate_ime(index);
+                }
+                return Ok(same && self.devices[index].ime_target == Some(target));
+            }
+            if !self.cdp.read_until(deadline)? {
+                self.cdp.abandon(id);
+                self.invalidate_ime(index);
+                return Ok(false);
+            }
+            self.drain()?;
+        }
+    }
+
+    fn invalidate_ime(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        let had_target = device.ime_target.is_some();
+        device.ime_anchor = None;
+        device.ime_target = None;
+        device.composing = false;
+        if had_target {
+            self.shared.device(index, |status| status.text_input = None);
+        }
+    }
+
+    fn clear_ime(&mut self, index: usize, cancel: bool) -> Result<()> {
+        if cancel && self.devices[index].composing && self.input_allowed(index) {
+            let session = self.devices[index].session.clone();
+            let id = self.cdp.send(
+                "Input.imeSetComposition",
+                json!({"text": "", "selectionStart": 0, "selectionEnd": 0}),
+                Some(&session),
+            )?;
+            self.track(id, Pending::Input { device: index })?;
+        }
+        self.invalidate_ime(index);
+        Ok(())
     }
 
     /// Sends coalesced pointer moves and wheel deltas, one in flight per device.
@@ -1506,6 +1714,7 @@ impl<'a> Controller<'a> {
                     // gone; the error below describes the device instead.
                     self.forget_input(index);
                     self.forget_navigation(index);
+                    self.invalidate_ime(index);
                     self.devices[index].streaming = false;
                     self.shared.device(index, |device| {
                         device.loading = false;
@@ -1531,18 +1740,32 @@ impl<'a> Controller<'a> {
         match event.method.as_str() {
             "Runtime.executionContextCreated" => {
                 if let Some(context) = params.get("context")
-                    && context.get("name").and_then(Value::as_str) == Some(LINK_WORLD)
                     && context.pointer("/auxData/frameId").and_then(Value::as_str)
                         == Some(self.devices[index].target_id.as_str())
                     && context.pointer("/auxData/type").and_then(Value::as_str) == Some("isolated")
                 {
-                    self.devices[index].link_context = context
+                    let id = context
                         .get("id")
                         .and_then(Value::as_i64)
                         .filter(|id| *id > 0);
+                    match context.get("name").and_then(Value::as_str) {
+                        Some(LINK_WORLD) => self.devices[index].link_context = id,
+                        Some(IME_WORLD) => {
+                            self.invalidate_ime(index);
+                            self.devices[index].ime_context = id;
+                            self.devices[index].ime_blocked_anchor = None;
+                        }
+                        _ => {}
+                    }
                 }
             }
             "Runtime.executionContextDestroyed" => {
+                if self.devices[index].ime_context.is_some_and(|id| {
+                    params.get("executionContextId").and_then(Value::as_i64) == Some(id)
+                }) {
+                    self.devices[index].ime_context = None;
+                    self.invalidate_ime(index);
+                }
                 if self.devices[index].link_context.is_some_and(|id| {
                     params.get("executionContextId").and_then(Value::as_i64) == Some(id)
                 }) {
@@ -1553,6 +1776,44 @@ impl<'a> Controller<'a> {
             "Runtime.executionContextsCleared" => {
                 self.devices[index].link_context = None;
                 self.devices[index].link_intent = None;
+                self.devices[index].ime_context = None;
+                self.invalidate_ime(index);
+            }
+            "Runtime.bindingCalled"
+                if text("name") == Some(IME_BINDING)
+                    && self.devices[index].ime_context.is_some_and(|id| {
+                        params.get("executionContextId").and_then(Value::as_i64) == Some(id)
+                    })
+                    && self.devices[index].visible =>
+            {
+                match text("payload")
+                    .and_then(|payload| parse_caret_report(payload, self.devices[index].css))
+                {
+                    None => self.clear_ime(index, true)?,
+                    Some(None) => self.clear_ime(index, true)?,
+                    Some(Some((anchor, caret))) => {
+                        if self.devices[index]
+                            .ime_blocked_anchor
+                            .is_some_and(|blocked| anchor <= blocked)
+                        {
+                            return Ok(());
+                        }
+                        self.devices[index].ime_blocked_anchor = None;
+                        if self.devices[index].ime_anchor != Some(anchor) {
+                            self.clear_ime(index, true)?;
+                            self.next_ime_target = self
+                                .next_ime_target
+                                .checked_add(1)
+                                .ok_or_else(|| anyhow!("IME target token exhausted"))?;
+                            self.devices[index].ime_anchor = Some(anchor);
+                            self.devices[index].ime_target = Some(self.next_ime_target);
+                        }
+                        let target = self.devices[index].ime_target.unwrap();
+                        self.shared.device(index, |status| {
+                            status.text_input = Some(TextInputState { target, caret });
+                        });
+                    }
+                }
             }
             "Runtime.bindingCalled"
                 if text("name") == Some(LINK_BINDING)
@@ -1632,6 +1893,7 @@ impl<'a> Controller<'a> {
             "Page.frameRequestedNavigation"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
+                self.clear_ime(index, true)?;
                 let sync_navigation = self.sync.navigation;
                 let device = &mut self.devices[index];
                 let url = text("url");
@@ -1747,6 +2009,7 @@ impl<'a> Controller<'a> {
                     .to_owned();
                 // A new document answers input again; the old one's is moot.
                 self.forget_input(index);
+                self.invalidate_ime(index);
                 let matches_reload =
                     self.devices[index]
                         .navigation

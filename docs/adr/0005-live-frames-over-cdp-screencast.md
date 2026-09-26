@@ -60,10 +60,11 @@ canvas scale. See `docs/validation.md` for numbers.
   browser with a zero core limit and `coredump_filter` (see `SECURITY.md`).
 - Only the latest frame is shown; animation smoothness and input latency have not
   been measured on real hardware.
-- IME, rich or page-initiated clipboard access, touch gestures, drag and drop,
+- Rich or page-initiated clipboard access, touch gestures, drag and drop,
   popups, downloads, permissions, file upload, JavaScript dialogs and
   accessibility are not supported. Each needs its own gate; ADR 0010 covers
-  plain-text paste only.
+  plain-text paste only. ADR 0011 adds native IME composition and caret placement
+  for standard main-frame editable controls, qualified with Fcitx5/Pinyin over XIM.
 
 ## Options for later
 

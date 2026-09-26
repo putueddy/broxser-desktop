@@ -178,10 +178,20 @@ di window dicatat dan dipasangkan dengan key-up-nya, repeat hanya key-down terak
 dead key dan karakter komposisi dikirim benar, F-key diteruskan, tombol yang oleh
 Helium dijadikan perintah browser serta tombol paste dan klik tengah tidak
 diteruskan, dan paste menyisipkan teks clipboard sistem hanya ke device terpilih
-yang terlihat. Sisa: komposisi IME dan penempatan caret (butuh input handler pada
-canvas dan IME untuk verifikasi), copy ke clipboard sistem, pengukuran ulang daftar
-tombol browser pada setiap update Helium, serta pemeriksaan Wayland dan keyboard
-fisik.
+yang terlihat.
+
+Kelanjutan IME di [ADR 0011](docs/adr/0011-native-ime-on-device-canvas.md)
+menambahkan input handler canvas, preedit, commit tanpa key-up, dan posisi kandidat
+berdasarkan caret halaman. Fcitx5/Pinyin melalui XIM dengan `UseOnTheSpot=True`
+sudah diuji pada window X11 nyata di Xvfb/Lavapipe: commit `你好` berulang, Escape,
+commit ASCII berulang, perpindahan input ke textarea, dan posisi kandidat.
+Patch GPUI 0.2.2 memisahkan commit ASCII Wayland dari tombol fisik dan memberi
+fokus pada context XIM. PR kelanjutan berbasis PR #10 yang masih terbuka.
+Sisa kualifikasi: IME native Wayland, keyboard fisik, bahasa/engine IME lain,
+iframe/shadow DOM/password/editor canvas, serta callback commit-only ambigu
+setelah komposisi kehilangan target. Copy ke clipboard sistem dan pengukuran ulang
+shortcut tiap update Helium tetap pekerjaan terpisah; berikutnya P1.4 kualitas
+frame dan penggunaan resource.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,

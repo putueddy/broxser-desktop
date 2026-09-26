@@ -4,6 +4,9 @@ Status: accepted for P1.3 (keyboard, shortcuts and clipboard), 2026-09-25.
 Amends ADR 0005 (input) and ADR 0006 (held keys of hidden devices). IME
 composition is not decided here.
 
+ADR 0011 extends this decision with a native canvas input handler, composition,
+commit and caret placement, qualified with Fcitx5/Pinyin over XIM.
+
 ## Context
 
 GPUI 0.2.2 reports a key as `key`, `key_char` and modifiers, without a physical

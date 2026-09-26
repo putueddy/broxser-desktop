@@ -161,7 +161,19 @@ tombol yang oleh Helium dijadikan perintah browser (menutup tab atau window,
 membuka tab, DevTools, reload, navigasi riwayat), tombol paste, maupun klik tengah;
 clipboard dan selection buffer browser dipakai bersama semua session. Paste
 menyisipkan teks clipboard sistem dengan `Input.insertText` ke device terpilih
-yang terlihat. Komposisi IME belum didukung.
+yang terlihat.
+
+ADR 0011 menambahkan input handler native pada canvas device terpilih. Preedit
+memakai `Input.imeSetComposition`, commit memakai `Input.insertText`, dan teks
+commit tidak masuk pencatatan tombol fisik atau menunggu key-up. Komposisi terikat
+ke device, token editable engine dan generation runtime. Observer main frame
+terisolasi mengirim identitas fokus dan geometri caret yang divalidasi, tanpa
+menyalin teks halaman ke host. Geometri CSS dipetakan melalui batas frame yang
+benar-benar dilukis, termasuk zoom, untuk posisi kandidat IME. Komposisi yang
+kehilangan target dibatalkan; callback lama tidak boleh diteruskan ke device baru.
+Password, iframe, closed shadow root, editor canvas dan penggantian surrounding
+text belum dicakup. GPUI 0.2.2 dipertahankan sebagai source vendored dengan patch
+commit ASCII Wayland agar semua commit melewati input handler native.
 
 Startup dibatasi 15 detik, setiap command 15 detik dan load 30 detik. Ini deadline
 per operasi, bukan SLA total job. Cancellation dicek paling lambat setiap 500 ms;

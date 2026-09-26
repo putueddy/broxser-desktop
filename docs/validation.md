@@ -724,6 +724,83 @@ engine suite with Helium.
 | #12 | `76f5d26` (zero core limit) | Failed: systemd-coredump ignores the limit, crash not reported within 15 s; the other 9 passed |
 | #13 | `9e09830` (zero `coredump_filter`) | Passed: all 10 live tests, crash reported after 222 ms, reproducer 6 runs with no failure |
 
+## P1.3 native IME — 26 September 2026
+
+ADR 0011 extends PR #10 (`bcdb855`) with a selected-canvas input handler,
+target-bound CDP composition, and observed caret geometry. Verified on Linux with
+Helium 0.18.1.1 (`Chrome/154.0.8037.57`), GPUI 0.2.2 plus the two documented native
+IME patches, Fcitx5 5.1.22, Pinyin addons 5.1.14, libime 1.1.16, private Xvfb,
+and Mesa Lavapipe 26.2.2. Browser sandboxing remained enabled.
+
+| Check | Result |
+| --- | --- |
+| `CARGO_BUILD_JOBS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 63 engine + 24 desktop tests (96 total). 26 live tests ignored here and run separately |
+| `BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" cargo test --locked -p broxser-engine -- --ignored --test-threads=2 --nocapture` | Passed: 26/26, 140.60 s |
+| `cargo build --locked -p broxser-desktop -j 2` | Passed; actual GUI executable used below |
+| Real Fcitx5/Pinyin XIM, extended scenario | Passed: inline preedit, `你好` twice, Escape cancellation, two `n` commits with no DOM key-up, then a textarea commit without changing the first input |
+| Candidate placement | Visually checked under the input caret, then the textarea caret, at 50% canvas scale in an actual GPUI X11 window |
+| Final native event trace | Six composition starts/ends, 28 updates, final input `你好你好nn`, textarea `你好`. No DOM key-down/up events were needed for those commits |
+| Close after native IME | Exit 0 and zero browser profiles remaining; private Fcitx/Xvfb processes stopped by the harness |
+| Vendored GPUI audit | Original crate SHA-256 verified; only `wayland/client.rs` and `x11/xim_handler.rs` differ from upstream source. License retained; transitive Cargo versions unchanged |
+| Python harness | `python3 -m py_compile scripts/ime-smoke.py` passed |
+
+Native command:
+
+```bash
+python3 scripts/ime-smoke.py \
+  --desktop target/debug/broxser-desktop --browser .local/helium/helium \
+  --output /tmp/broxser-ime-handoff-verified --capture-private-root --scenario extended
+```
+
+The Arch-hosted harness expects the seven pinned archives listed in its
+`PACKAGES` constant in `BROXSER_IME_PACKAGES` (default
+`/tmp/broxser-ime-runtime/packages`), plus `bsdtar`, Python, Fcitx5, D-Bus and
+ImageMagick. It verifies SHA-256 against the local authenticated `extra.db` before
+extracting the temporary runtime. Set `--packages`, `--runtime` and `--database`
+when using other retained locations; no packages are installed into the system.
+It creates private configuration, starts Fcitx with cloud Pinyin disabled,
+enables `UseOnTheSpot=True`, and waits for both the XIM server and active Pinyin
+context. Full-display capture is allowed only for the Xvfb server it creates.
+The host IME daemon and configuration are untouched.
+
+Logs, native `summary.json`, fixture events and reviewed screenshots are retained
+locally in `artifacts/p1-3-ime/` (ignored by Git). The actual private native run was
+`/tmp/broxser-ime-handoff-verified`; earlier passing extended evidence remains in
+`/tmp/broxser-ime-final-extended2`.
+
+Failures found and repaired during qualification:
+
+- The original XIM context was never focused: Fcitx saw no active context and
+  forwarded Latin keys. Sending `SetIcFocus` produced native commits. Fcitx's
+  default off-the-spot mode sends no application preedit; the private test
+  explicitly enables on-the-spot mode.
+- Empty cleanup after a commit created a phantom composition and swallowed the
+  next field's first word. Cleanup no longer creates an origin; pointer-down also
+  retires the old caret token before new composition can latch it. A queued old
+  status snapshot cannot rearm that token while the worker processes the click.
+- Review reproduced an old commit migrating after cancellation plus empty
+  preedit, inactive-window input, synthetic events preserving stale target tokens,
+  and a vertically misplaced caret in tall inputs. Regression coverage now
+  exercises these cases; native deletion records a boundary for the next preedit.
+- One full live run exposed `Runtime.evaluate` overtaking earlier key dispatch.
+  The target check now waits for preceding input responses within the same bounded
+  deadline. Another run exposed a pre-existing link-test predicate accepting the
+  previous `/next` status; it now waits for the new source request before checking
+  the unchanged no-sync assertion. The complete final suite passed.
+- Initial sandbox-only runs could not bind fixture sockets; tests requiring
+  localhost/browser/window access were rerun outside that sandbox. Private Xvfb
+  initially lacked a usable Vulkan driver; a verified temporary Lavapipe package
+  supplied it. Formatting and Clippy findings were fixed before the passing run.
+
+Not qualified: native Wayland IME end-to-end, physical keyboards, other IME
+languages/engines, all fractional scales, password/iframe/shadow-root/canvas
+editors, surrounding-text replacement, or all cancellation callback orderings.
+In particular, after cancellation without a terminal callback, an ambiguous
+commit-only input is dropped rather than moved to a new target. Frames and
+candidate/DOM updates are asynchronous; a streamed preedit can trail the latest
+DOM update. GPUI's existing numeric-fallback warnings and the existing
+`proc-macro-error2` future-compatibility warning remain non-failing.
+
 ## Open gates
 
 - The M1 manual desktop checklist above, on Wayland and a physical GPU.
@@ -737,9 +814,10 @@ engine suite with Helium.
   the kill scenarios on company desktops, distros and kernels.
 - Physical GPU, Wayland compositors, fractional scaling, IME and accessibility
   need a real desktop session; the cloud check above is X11 on software Vulkan.
-- Input methods (P1.3 remainder): composition, commit and caret placement need an
-  input handler for the device canvas and an IME to verify with (ADR 0010). The
-  browser keys that the engine drops must be measured again on each Helium update.
+- Input methods: ADR 0011 qualifies Fcitx5/Pinyin over XIM with a native input
+  handler, preedit, commit and caret placement. Native Wayland IME, physical
+  keyboards, other language engines and complex editors remain unqualified.
+  The browser keys that the engine drops must be measured again on each Helium update.
 - Before a team rollout: multiple distro/GPU combinations, SPA readiness,
   popup/download/clipboard behavior, permission policy, persistent storage
   isolation, engine updates and rollback. Performance budgets in System Design are

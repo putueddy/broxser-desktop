@@ -1,0 +1,5 @@
+# Preserve the verified upstream archive and keep third-party code out of PR
+# language statistics. The two maintained patches are documented beside it.
+vendor/gpui-0.2.2/** -text linguist-vendored
+# These original shader indents contain a space before a tab; retain them intact.
+vendor/gpui-0.2.2/src/platform/mac/shaders.metal whitespace=-space-before-tab
