@@ -563,6 +563,18 @@ impl FakePeer {
             .2
     }
 
+    /// Parameters of the latest `method` sent to `session`.
+    fn last_params(&self, method: &str, session: &str) -> Value {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(m, s, _, _)| m == method && s.as_deref() == Some(session))
+            .map(|(_, _, _, params)| params.clone())
+            .unwrap_or(Value::Null)
+    }
+
     /// The `url` parameter of every `Page.navigate` sent to `session`.
     fn navigations(&self, session: &str) -> Vec<String> {
         self.received
@@ -972,6 +984,157 @@ fn same_document_link_navigation_follows_only_a_live_activation() {
     drop(live);
 }
 
+#[test]
+fn dialog_blocks_input_and_navigation_until_the_user_answers() {
+    let root = profile_root();
+    // The phone's page never answers pointer input, like the click that
+    // opened its dialog and the input Chromium holds behind the dialog.
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Input.dispatchMouseEvent" && session == Some("S0")
+    });
+    let live = fake_live(
+        root.path(),
+        Limits {
+            command: Duration::from_secs(1),
+            ..Limits::default()
+        },
+    );
+    let opening = |kind: &str, message: &str, default: &str| {
+        phone(
+            "Page.javascriptDialogOpening",
+            json!({"url": "http://127.0.0.1:4173/", "message": message, "type": kind,
+                "hasBrowserHandler": true, "defaultPrompt": default}),
+        )
+    };
+    let closed = |accepted: bool| {
+        phone(
+            "Page.javascriptDialogClosed",
+            json!({"result": accepted, "userInput": ""}),
+        )
+    };
+    for (kind, buttons) in [(PointerKind::Down, 1), (PointerKind::Up, 0)] {
+        assert!(live.send(Command::Pointer {
+            device: 0,
+            event: PointerEvent {
+                kind,
+                x: 10.0,
+                y: 10.0,
+                button: PointerButton::Left,
+                buttons,
+                click_count: 1,
+                modifiers: Modifiers::default(),
+            },
+        }));
+    }
+    wait_for_requests(&peer, "Input.dispatchMouseEvent", "S0", 2);
+    let long = "m".repeat(MAX_DIALOG_CHARS + 10);
+    peer.event(opening("confirm", &format!("Continue?\u{7}\n{long}"), ""));
+    let dialog = wait_for(&live, "the dialog", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_some()
+    })
+    .devices[0]
+        .dialog
+        .clone()
+        .unwrap();
+    assert_eq!(dialog.kind, DialogKind::Confirm);
+    assert!(
+        dialog.message.starts_with("Continue?\nmmm"),
+        "{}",
+        dialog.message
+    );
+    assert_eq!(dialog.message.chars().count(), MAX_DIALOG_CHARS + 1);
+    assert!(dialog.message.ends_with('…'));
+    assert_eq!(dialog.default_text, "");
+
+    // The unanswered click is the dialog's, not a page that stopped responding.
+    thread::sleep(Duration::from_millis(1400));
+    assert_eq!(live.status().devices[0].error, None);
+    // Keys and text are dropped, not held for the page behind the dialog.
+    send_keys(&live, 0, 2);
+    assert!(live.send(Command::InsertText {
+        device: 0,
+        text: "x".into(),
+    }));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Input.dispatchKeyEvent", "S0"), 0);
+    assert_eq!(peer.count("Input.insertText", "S0"), 0);
+    // Go reaches the other devices; navigating this one would cancel the dialog.
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into(),
+    }));
+    wait_for_requests(&peer, "Page.navigate", "S1", 2);
+    wait_for_requests(&peer, "Page.navigate", "S2", 2);
+    let status = wait_for(&live, "the refusal", Duration::from_secs(2), |s| {
+        s.devices[0].error.is_some()
+    });
+    assert_eq!(status.devices[0].error.as_deref(), Some(DIALOG_OPEN));
+    assert_eq!(peer.count("Page.navigate", "S0"), 1);
+    assert!(status.devices[0].dialog.is_some());
+
+    // Only the current dialog's token answers it.
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token: dialog.token + 1,
+        accept: true,
+        text: None,
+    }));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 0);
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token: dialog.token,
+        accept: false,
+        text: Some("ignored for a confirm".into()),
+    }));
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": false})
+    );
+    // The browser's report closes it, and the refusal with it.
+    peer.event(closed(false));
+    wait_for(&live, "the dialog to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none() && s.devices[0].error.is_none()
+    });
+    peer.release();
+    send_keys(&live, 0, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S0", 2);
+
+    // A prompt carries its default and takes the user's text only when accepted.
+    peer.event(opening("prompt", "Your name?", "guest"));
+    let prompt = wait_for(&live, "the prompt", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_some()
+    })
+    .devices[0]
+        .dialog
+        .clone()
+        .unwrap();
+    assert_eq!(prompt.kind, DialogKind::Prompt);
+    assert_eq!(prompt.default_text, "guest");
+    assert_ne!(prompt.token, dialog.token);
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token: prompt.token,
+        accept: true,
+        text: Some("Broxser".into()),
+    }));
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 2);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": true, "promptText": "Broxser"})
+    );
+    peer.event(closed(true));
+    wait_for(&live, "the prompt to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    assert_eq!(
+        peer.count("Page.navigate", "S0"),
+        1,
+        "nothing navigated for the user"
+    );
+    drop(live);
+}
+
 fn send_keys(live: &LiveSession, device: usize, presses: usize) {
     for _ in 0..presses {
         for down in [true, false] {
@@ -1274,6 +1437,36 @@ addEventListener('hashchange', () => report('framehash'));
 s.addEventListener('click', e => { e.preventDefault(); history.pushState(null, '', s.href); report('framespa'); });
 </script></body></html>"##;
 
+/// Buttons that open each kind of dialog, 60 px apart, and a field below them.
+/// Every dialog's outcome is reported once the page runs again.
+const DIALOG_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;font:16px sans-serif}button{position:absolute;left:20px;width:160px;height:40px}
+#b-alert{top:100px}#b-confirm{top:160px}#b-prompt{top:220px}#field{position:absolute;left:20px;top:300px;width:160px;height:30px}</style></head><body>
+<button id=b-alert>alert</button><button id=b-confirm>confirm</button><button id=b-prompt>prompt</button><input id=field>
+<script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth, ...data}));
+const by = id => document.getElementById(id);
+by('b-alert').addEventListener('click', () => { window.alert('hello from the page'); report('dialog', {result: 'alert closed'}); });
+by('b-confirm').addEventListener('click', () => report('dialog', {result: 'confirm=' + window.confirm('Continue?')}));
+by('b-prompt').addEventListener('click', () => report('dialog', {result: 'prompt=' + window.prompt('Your name?', 'guest')}));
+by('field').addEventListener('input', () => report('input', {v: by('field').value}));
+</script></body></html>"#;
+
+/// Asks before leaving once its field holds text. Chromium shows that
+/// question only after the user interacted with the page.
+const DIRTY_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;font:16px sans-serif}#field{position:absolute;left:20px;top:100px;width:160px;height:30px}
+#link{position:absolute;left:20px;top:160px;width:160px;height:40px;background:#08f;color:#fff}</style></head><body>
+<input id=field><a id=link href="/next">next</a>
+<script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth, ...data}));
+const field = document.getElementById('field');
+addEventListener('mousedown', e => report('down', {x: e.clientX, y: e.clientY, target: e.target.id}), true);
+addEventListener('keydown', e => report('keydown', {key: e.key, target: document.activeElement.id}), true);
+field.addEventListener('input', () => report('input', {v: field.value}));
+addEventListener('beforeunload', e => { if (field.value) { e.preventDefault(); e.returnValue = 'unsaved'; } });
+</script></body></html>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -1405,6 +1598,8 @@ fn fixture() -> Fixture {
             ),
             "/frame" => FRAME_PAGE.into(),
             "/frame-dest" => "<!doctype html><p>frame destination</p>".into(),
+            "/dialogs" => DIALOG_PAGE.into(),
+            "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
             "/script-pointer" => PAGE.replace("AUTO", "document.body.addEventListener('click', e => { if (!e.target.closest('a')) setTimeout(() => document.getElementById('link').click(), 100); });"),
@@ -3320,6 +3515,280 @@ fn live_cancelled_and_superseded_link_navigations_sync_at_most_the_latest() {
     assert_eq!(count(&fixture, "/slow"), 3);
     assert_eq!(count(&fixture, "/landed?go"), 3);
     assert!(loaded(&live.session().status(), &fixture, "/landed?go"));
+    live.close();
+}
+
+/// Reports of `DIALOG_PAGE` and `DIRTY_PAGE` dialogs, as `result` values.
+fn dialog_results(fixture: &Fixture) -> Vec<String> {
+    events(fixture, "dialog")
+        .into_iter()
+        .filter_map(|event| event.get("result").cloned())
+        .collect()
+}
+
+fn answer(live: &Live, device: usize, token: u64, accept: bool, text: Option<&str>) {
+    live.send(Command::AnswerDialog {
+        device,
+        token,
+        accept,
+        text: text.map(str::to_owned),
+    });
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_dialogs_wait_for_an_explicit_answer() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/dialogs")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/dialogs")
+    });
+    let open = |live: &Live, y: f64, kind: DialogKind| {
+        click(live, 0, 100.0, y);
+        let dialog = live
+            .wait("the dialog", Duration::from_secs(10), |s| {
+                s.devices[0].dialog.is_some()
+            })
+            .devices[0]
+            .dialog
+            .clone()
+            .unwrap();
+        assert_eq!(dialog.kind, kind);
+        dialog
+    };
+
+    // alert: the page stops, and so do its frames.
+    let alert = open(&live, 120.0, DialogKind::Alert);
+    assert_eq!(alert.message, "hello from the page");
+    thread::sleep(Duration::from_millis(300));
+    let frames = live.session().status().devices[0].frames;
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(live.session().status().devices[0].frames, frames);
+    // Typing does not answer it, and Go does not navigate past it.
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("a", Some("a"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    live.send(Command::NavigateAll {
+        url: fixture.url("/next"),
+    });
+    live.wait("peers navigate", Duration::from_secs(10), |s| {
+        s.devices[1..]
+            .iter()
+            .all(|device| device.url == fixture.url("/next") && !device.loading)
+    });
+    thread::sleep(Duration::from_millis(500));
+    let status = live.session().status();
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(alert.token)
+    );
+    assert_eq!(status.devices[0].url, fixture.url("/dialogs"));
+    assert_eq!(status.devices[0].error.as_deref(), Some(DIALOG_OPEN));
+    assert!(
+        dialog_results(&fixture).is_empty(),
+        "the dialog was answered"
+    );
+    assert_eq!(count(&fixture, "/next"), 2);
+    // A stale token answers nothing; the user's answer does.
+    answer(&live, 0, alert.token + 1000, true, None);
+    thread::sleep(Duration::from_millis(400));
+    assert!(live.session().status().devices[0].dialog.is_some());
+    answer(&live, 0, alert.token, true, None);
+    live.wait("alert answered", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none() && s.devices[0].error.is_none()
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture) == ["alert closed"]
+    }));
+    live.wait("frames resume", Duration::from_secs(5), |s| {
+        s.devices[0].frames > frames
+    });
+    assert_eq!(
+        live.session().status().devices[0].url,
+        fixture.url("/dialogs")
+    );
+    // Input reaches the page again. The caret report shows the field has
+    // focus before typing, as a key can overtake a click in Chromium.
+    click(&live, 0, 100.0, 315.0);
+    live.wait("the field's caret", Duration::from_secs(5), |s| {
+        s.devices[0].text_input.is_some()
+    });
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("b", Some("b"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        events(fixture, "input")
+            .iter()
+            .any(|event| event["v"] == "b")
+    }));
+
+    // confirm: cancel, then accept.
+    let confirm = open(&live, 180.0, DialogKind::Confirm);
+    assert_eq!(confirm.message, "Continue?");
+    answer(&live, 0, confirm.token, false, None);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("confirm=false")
+    }));
+    let confirm = open(&live, 180.0, DialogKind::Confirm);
+    answer(&live, 0, confirm.token, true, None);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("confirm=true")
+    }));
+
+    // prompt: the user's text, then cancel.
+    let prompt = open(&live, 240.0, DialogKind::Prompt);
+    assert_eq!(prompt.message, "Your name?");
+    assert_eq!(prompt.default_text, "guest");
+    answer(&live, 0, prompt.token, true, Some("Broxser"));
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("prompt=Broxser")
+    }));
+    let prompt = open(&live, 240.0, DialogKind::Prompt);
+    answer(&live, 0, prompt.token, false, None);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("prompt=null")
+    }));
+    assert_eq!(
+        dialog_results(&fixture),
+        [
+            "alert closed",
+            "confirm=false",
+            "confirm=true",
+            "prompt=Broxser",
+            "prompt=null"
+        ]
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_beforeunload_dialog_needs_an_explicit_leave_or_stay() {
+    let fixture = fixture();
+    let limits = Limits {
+        load: Duration::from_secs(3),
+        ..Limits::default()
+    };
+    let live = Live::start_with(workspace(fixture.url("/dirty")), limits);
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/dirty")
+    });
+    let dirty = |live: &Live| {
+        let typed = events(&fixture, "input").len();
+        click(live, 0, 100.0, 115.0);
+        // Chromium routes pointer events through its compositor and keys to
+        // the main thread directly; a key sent at once can overtake the click.
+        // The caret report shows the field has focus.
+        live.wait("the field's caret", Duration::from_secs(5), |s| {
+            s.devices[0].text_input.is_some()
+        });
+        for down in [true, false] {
+            live.send(Command::Key {
+                device: 0,
+                key: KeyInput::from_key("x", Some("x"), Modifiers::default(), down).unwrap(),
+            });
+        }
+        assert!(
+            fixture.wait_for(Duration::from_secs(5), |fixture| {
+                events(fixture, "input")
+                    .get(typed)
+                    .is_some_and(|event| event["v"] == "x" && event["w"] == "360")
+            }),
+            "typing did not reach the phone's field: input {:?} down {:?} keydown {:?} status {:#?}",
+            events(&fixture, "input"),
+            events(&fixture, "down"),
+            events(&fixture, "keydown"),
+            live.session().status().devices[0]
+        );
+    };
+    let asks = |live: &Live| {
+        let dialog = live
+            .wait("the question", Duration::from_secs(10), |s| {
+                s.devices[0].dialog.is_some()
+            })
+            .devices[0]
+            .dialog
+            .clone()
+            .unwrap();
+        assert_eq!(dialog.kind, DialogKind::BeforeUnload);
+        dialog
+    };
+
+    // Go: the peers leave; the dirty phone asks and waits past the load limit.
+    dirty(&live);
+    live.send(Command::NavigateAll {
+        url: fixture.url("/next"),
+    });
+    let question = asks(&live);
+    live.wait("peers leave", Duration::from_secs(10), |s| {
+        s.devices[1..]
+            .iter()
+            .all(|device| device.url == fixture.url("/next") && !device.loading)
+    });
+    thread::sleep(limits.load + Duration::from_secs(1));
+    let status = live.session().status();
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(question.token)
+    );
+    assert_eq!(status.devices[0].error, None, "the navigation was stopped");
+    assert_eq!(status.devices[0].url, fixture.url("/dirty"));
+    assert_eq!(count(&fixture, "/next"), 2);
+    // Stay: the page keeps its text and reports no failure.
+    answer(&live, 0, question.token, false, None);
+    live.wait("stayed", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none() && !s.devices[0].loading
+    });
+    thread::sleep(Duration::from_millis(500));
+    let status = live.session().status();
+    assert_eq!(status.devices[0].error, None, "{status:#?}");
+    assert_eq!(status.devices[0].url, fixture.url("/dirty"));
+    assert_eq!(count(&fixture, "/next"), 2);
+    // Leave: the same Go, answered the other way, navigates. Go loads every
+    // device once, so the peers load /next again.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/next"),
+    });
+    let question = asks(&live);
+    answer(&live, 0, question.token, true, None);
+    live.wait("left", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/next") && !s.devices[0].loading
+    });
+    assert_eq!(count(&fixture, "/next"), 5);
+
+    // The page's own link asks the same question.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/dirty"),
+    });
+    live.wait("dirty pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/dirty")
+    });
+    dirty(&live);
+    click(&live, 0, 100.0, 180.0);
+    let question = asks(&live);
+    answer(&live, 0, question.token, false, None);
+    live.wait("stayed again", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        live.session().status().devices[0].url,
+        fixture.url("/dirty")
+    );
+    assert_eq!(count(&fixture, "/next"), 5);
+    click(&live, 0, 100.0, 180.0);
+    let question = asks(&live);
+    answer(&live, 0, question.token, true, None);
+    live.wait("followed the link", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/next")
+    });
+    assert_eq!(count(&fixture, "/next"), 6);
     live.close();
 }
 

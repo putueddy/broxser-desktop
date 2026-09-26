@@ -326,6 +326,150 @@ typing_run() {
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Prints "X Y X0 Y0 X1 Y1", the centroid and bounding box (window coordinates)
+# of the pixels within TOLERANCE per channel of color RRGGBB in the window
+# region X Y WIDTH HEIGHT, as soon as at least 20 match within TIMEOUT seconds.
+# Fails once TIMEOUT passes without a match. With a ninth argument "absent" it
+# instead succeeds, printing nothing, once fewer than 20 pixels match.
+find_color() {
+  python3 - "$@" <<'PY'
+import ctypes, sys, time
+window = int(sys.argv[1], 0)
+x, y, width, height = (int(value) for value in sys.argv[2:6])
+wanted = int(sys.argv[6], 16)
+tolerance = int(sys.argv[7])
+deadline = time.monotonic() + float(sys.argv[8])
+absent = len(sys.argv) > 9 and sys.argv[9] == "absent"
+
+class XImage(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int) for name in ("width", "height", "xoffset", "format")]
+    _fields_ += [("data", ctypes.c_void_p)]
+    _fields_ += [(name, ctypes.c_int) for name in ("byte_order", "bitmap_unit",
+        "bitmap_bit_order", "bitmap_pad", "depth", "bytes_per_line", "bits_per_pixel")]
+
+xlib = ctypes.CDLL("libX11.so.6")
+xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+xlib.XOpenDisplay.restype = ctypes.c_void_p
+xlib.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int]
+xlib.XGetImage.restype = ctypes.POINTER(XImage)
+xlib.XFree.argtypes = [ctypes.c_void_p]
+display = xlib.XOpenDisplay(None)
+if not display:
+    sys.exit("cannot open the X display")
+target = ((wanted >> 16) & 255, (wanted >> 8) & 255, wanted & 255)
+while time.monotonic() < deadline:
+    image = xlib.XGetImage(display, window, x, y, width, height, 0xFFFFFFFF, 2)  # ZPixmap
+    if image:
+        stride = image.contents.bytes_per_line
+        pixels = ctypes.string_at(image.contents.data, stride * image.contents.height)
+        xlib.XFree(image.contents.data)
+        xlib.XFree(image)
+        hits = []
+        for row in range(height):
+            line = pixels[row * stride:row * stride + width * 4]
+            for column in range(width):
+                b, g, r = line[column * 4], line[column * 4 + 1], line[column * 4 + 2]
+                if abs(r - target[0]) <= tolerance and abs(g - target[1]) <= tolerance \
+                        and abs(b - target[2]) <= tolerance:
+                    hits.append((column, row))
+        if absent and len(hits) < 20:
+            sys.exit(0)
+        if not absent and len(hits) >= 20:
+            xs = [x + column for column, _ in hits]
+            ys = [y + row for _, row in hits]
+            print(sum(xs) // len(xs), sum(ys) // len(ys), min(xs), min(ys), max(xs), max(ys))
+            sys.exit(0)
+    time.sleep(0.2)
+sys.exit(1)
+PY
+}
+
+# Opens a page whose only button asks confirm(), clicks it in the phone frame
+# and answers the dialog Broxser shows on the device card (ADR 0014): OK, then
+# once more Cancel. The page reports each answer to the fixture. Only the
+# card's buttons answer a dialog; the run fails if the panel never appears, if
+# an answer is not reported, or if the panel stays. Every path closes the
+# desktop and checks for leftovers.
+dialog_run() {
+  local label=$1
+  local before app window= failure= panel button code=0 left_processes left_profiles
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/dialog.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    xdotool windowsize "$window" 1360 861 || true
+    xdotool mousemove --window "$window" 600 400 || true
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /dialog.html || true) -gt 0 ]] && break
+      sleep 0.1
+    done
+    # The phone card is the left column; its frame shows the page's blue button.
+    for answer in OK Cancel; do
+      [[ -n $failure ]] && break
+      if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+        failure="the phone frame did not show the page ($answer)"
+        break
+      fi
+      read -r x y _ < <(echo "$button")
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      # The dialog panel has an orange (WARN) border.
+      if ! panel=$(find_color "$window" 250 60 230 760 f2b872 6 10); then
+        failure="the dialog panel did not appear ($answer)"
+        break
+      fi
+      read -r _ _ x0 y0 x1 y1 < <(echo "$panel")
+      # OK is the accent-colored button, Cancel the raised one, inside the panel.
+      if [[ $answer == OK ]]; then
+        button=$(find_color "$window" $((x0 + 3)) $((y0 + 3)) $((x1 - x0 - 6)) $((y1 - y0 - 6)) 7ce29b 6 3) || true
+      else
+        button=$(find_color "$window" $((x0 + 3)) $((y0 + 3)) $((x1 - x0 - 6)) $((y1 - y0 - 6)) 252c29 6 3) || true
+      fi
+      if [[ -z $button ]]; then
+        failure="the $answer button was not found in the panel"
+        break
+      fi
+      read -r x y _ < <(echo "$button")
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      local expected
+      expected=$([[ $answer == OK ]] && echo true || echo false)
+      for _ in $(seq 100); do
+        [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "/event?dialog=$expected" || true) -gt 0 ]] && break
+        sleep 0.1
+      done
+      if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "/event?dialog=$expected" || true) -eq 0 ]]; then
+        failure="the page did not report confirm=$expected within 10 s"
+        break
+      fi
+      # The card repaints once the runtime reports the dialog closed.
+      if ! find_color "$window" 250 60 230 760 f2b872 6 5 absent; then
+        failure="the dialog panel stayed after $answer"
+        break
+      fi
+    done
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-OK and Cancel answered through the card}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -334,4 +478,5 @@ run "static SIGTERM during held request" "/hang" TERM --static --capture-on-star
 restart_run "live Restart clicked twice" stay
 restart_run "live Restart clicked twice, then Ctrl+Q" quit
 typing_run "typing while pages animate" animation.html
+dialog_run "dialog answered on the card"
 echo "desktop smoke passed"
