@@ -51,8 +51,9 @@ Jangan mengulang pembangunan live runtime, URL bar, basic input atau perbaikan
 `ERR_ABORTED`: uBlock bawaan Helium sudah diisolasi dari session context (ADR 0004).
 Jangan mengembalikan otorisasi sync berbasis “ada tombol ditekan baru-baru ini”,
 URL yang dipotong sebelum navigasi, atau input ke device tersembunyi (ADR 0006).
-Redirect ke URL final berbeda, SPA/hash/subframe navigation belum dicakup kontrak
-sync saat ini; penambahan dukungan itu memerlukan keputusan dan regresi tersendiri.
+Redirect, navigasi hash/SPA dan subframe kini diputuskan di ADR 0013 (P1.5): yang
+disinkronkan adalah URL link yang diklik, navigasi same-document ke URL itu ikut,
+subframe tidak; perluasan lain memerlukan keputusan dan regresi tersendiri.
 
 ### Milestone aktif P0 — runtime berhenti ketika aplikasi induk mati
 
@@ -195,7 +196,7 @@ IME lain, iframe/shadow DOM/password/editor canvas, serta callback commit-only
 ambigu setelah komposisi kehilangan target. Copy ke clipboard sistem dan
 pengukuran ulang shortcut tiap update Helium tetap pekerjaan terpisah.
 
-**Status P1.4 (26 September 2026, menunggu review PR):** keputusan ada di
+**Status P1.4 (26 September 2026, merged melalui PR #12):** keputusan ada di
 [ADR 0012](docs/adr/0012-live-frame-resources.md), pengukuran di
 `docs/validation.md`. Build release crash di atlas tekstur GPUI 0.2.2 saat mengetik
 selagi halaman beranimasi (3/3 run dengan 1500 tombol); patch vendor ketiga
@@ -212,7 +213,29 @@ HiDPI yang lebih tajam menjadi pilihan eksplisit terpisah. Latensi di kontainer
 software-rendering tetap di atas target p95 50 ms. Sisa di luar lingkup: kualifikasi
 hardware/GPU, Wayland multi-monitor dan fractional scale, window yang diminimalkan
 tetap streaming, serta deadlock cleanup crash handler Helium di bawah beban yang
-tercatat di validation; berikutnya P1.5 navigasi aplikasi modern.
+tercatat di validation. Pemeriksaan upstream sesudahnya (PR #13): Zed `main` sudah
+memperbaiki race atlas yang sama pada renderer wgpu penggantinya, tetapi belum ada
+rilis `gpui` sesudah 0.2.2, sehingga patch vendor tetap dipakai.
+
+**Status P1.5 (26 September 2026, menunggu review PR):** keputusan ada di
+[ADR 0013](docs/adr/0013-modern-navigation-sync.md), bukti di `docs/validation.md`.
+Probe CDP pada Helium 0.18.1.1 dan survei `main` `e2bf9cb` membuktikan bahwa link
+yang di-redirect server (302/307, berantai, lintas origin, ke fragment) dan link ke
+fragment dokumen lain tidak pernah disinkronkan karena URL commit dibandingkan
+dengan URL link, bahwa status device kehilangan fragment, dan bahwa link hash serta
+router History API/Navigation API hanya menghasilkan `navigatedWithinDocument`
+tanpa loader atau `beforeunload`, sehingga tidak pernah disinkronkan. Kini peer
+memuat URL link yang diklik dan mengikuti redirect-nya sendiri (URL hasil redirect
+tidak pernah dikirim ke peer), status device memuat fragment, dan navigasi
+same-document main frame ke URL aktivasi link yang masih hidup (dokumen sama, dalam
+10 detik) disinkronkan sekali. Halaman error, navigasi tanpa dokumen (204, download,
+koneksi putus, `window.stop`), link yang digantikan link lain, Go atau script,
+navigasi subframe, `a.click()` dari script, tombol yang mengubah URL, dan aktivasi
+yang basi (dokumen baru, hide, sync diubah, kedaluwarsa) tidak disinkronkan; semua
+kini punya tes fake CDP atau Helium. Sisa di luar lingkup: `history.back/forward`,
+navigasi lintas dokumen yang dimulai halaman, form, tab baru dan download, serta
+peer yang memuat route SPA sebagai dokumen penuh dari server. Berikutnya P1.6
+interaksi browser yang belum didukung.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -296,8 +319,10 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   (ADR 0007; merged melalui PR #6; sisa temp dir non-profil tercatat di status P0).
 - [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates
   (P1.1 deadline command dan navigasi live: ADR 0008, merged melalui PR #7; P1.2
-  transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, tombol
-  browser dan paste eksplisit: ADR 0010, PR menunggu review, komposisi IME belum).
+  transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, IME dan
+  paste eksplisit: ADR 0010/0011, merged melalui PR #10; P1.4 frame dan resource:
+  ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, PR
+  menunggu review).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

@@ -111,6 +111,11 @@ pub(crate) enum Reply {
         delay: Duration,
         cookie: Option<String>,
     },
+    /// A response without a body: a redirect to `location`, or 204 No Content.
+    Empty {
+        status: u16,
+        location: Option<String>,
+    },
     /// Headers and the start of a body, then hold the connection open.
     Stall,
     /// Hold the request open without any response.
@@ -284,6 +289,15 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n{cookie}Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
                 body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        Reply::Empty { status, location } => {
+            let location = location
+                .map(|location| format!("Location: {location}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\n{location}Content-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
             );
             let _ = stream.write_all(response.as_bytes());
         }

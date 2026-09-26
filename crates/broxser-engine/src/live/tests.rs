@@ -414,8 +414,8 @@ struct FakePeer {
     server: Option<thread::JoinHandle<()>>,
 }
 
-/// Method, session and command ID of every request, in arrival order.
-type Requests = Arc<Mutex<Vec<(String, Option<String>, u64)>>>;
+/// Method, session, command ID and parameters of every request, in arrival order.
+type Requests = Arc<Mutex<Vec<(String, Option<String>, u64, Value)>>>;
 
 impl FakePeer {
     fn start(root: &Path, hold: impl Fn(&str, Option<&str>) -> bool + Send + 'static) -> Self {
@@ -483,6 +483,7 @@ impl FakePeer {
                     method.clone(),
                     session.clone(),
                     request["id"].as_u64().unwrap(),
+                    request["params"].clone(),
                 ));
                 let result = match method.as_str() {
                     "Browser.getVersion" => json!({"product":"Fake/1.0", "protocolVersion":"1.3"}),
@@ -547,7 +548,7 @@ impl FakePeer {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(m, s, _)| m == method && s.as_deref() == Some(session))
+            .filter(|(m, s, _, _)| m == method && s.as_deref() == Some(session))
             .count()
     }
 
@@ -557,9 +558,20 @@ impl FakePeer {
             .unwrap()
             .iter()
             .rev()
-            .find(|(m, s, _)| m == method && s.as_deref() == Some(session))
+            .find(|(m, s, _, _)| m == method && s.as_deref() == Some(session))
             .unwrap()
             .2
+    }
+
+    /// The `url` parameter of every `Page.navigate` sent to `session`.
+    fn navigations(&self, session: &str) -> Vec<String> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, s, _, _)| m == "Page.navigate" && s.as_deref() == Some(session))
+            .map(|(_, _, _, params)| params["url"].as_str().unwrap_or_default().to_owned())
+            .collect()
     }
 
     /// Sends every held reply and stops holding, as a page that answers again.
@@ -740,6 +752,223 @@ fn ime_bindings_require_the_main_frame_isolated_context_and_live_token() {
         s.devices[0].text_input.is_none()
     });
     assert_eq!(peer.count("Input.insertText", "S0"), 1);
+    drop(live);
+}
+
+/// An event of the phone: session `S0`, main frame `T0`.
+fn phone(method: &str, params: Value) -> Value {
+    json!({"method": method, "sessionId": "S0", "params": params})
+}
+
+/// A report of the phone's link observer, registered by [`link_observer`].
+fn link_report(phase: &str, id: u64, url: &str) -> Value {
+    phone(
+        "Runtime.bindingCalled",
+        json!({
+            "name": LINK_BINDING,
+            "executionContextId": 7,
+            "payload": json!({"phase": phase, "id": id, "url": url}).to_string(),
+        }),
+    )
+}
+
+/// Registers the phone's link observer world and turns navigation sync on.
+fn link_observer(peer: &FakePeer, live: &LiveSession) {
+    peer.event(phone(
+        "Runtime.executionContextCreated",
+        json!({"context": {"id": 7, "name": LINK_WORLD, "auxData": {"frameId": "T0", "type": "isolated"}}}),
+    ));
+    assert!(live.send(Command::SetSync(SyncSettings {
+        navigation: true,
+        scroll: false,
+    })));
+    wait_for(live, "sync on", Duration::from_secs(2), |s| {
+        s.sync.navigation
+    });
+}
+
+/// A trusted click on a link to `url` that starts `loader`, in the order in
+/// which Helium reports it (P1.5 in `docs/validation.md`).
+fn follow_link(peer: &FakePeer, id: u64, url: &str, loader: &str) {
+    peer.event(link_report("C", id, url));
+    peer.event(phone(
+        "Page.frameRequestedNavigation",
+        json!({"frameId": "T0", "reason": "anchorClick", "disposition": "currentTab", "url": url}),
+    ));
+    peer.event(link_report("Y", id, url));
+    peer.event(phone(
+        "Page.frameStartedNavigating",
+        json!({"frameId": "T0", "loaderId": loader, "navigationType": "differentDocument", "url": url}),
+    ));
+}
+
+fn commit(loader: &str, url: &str, extra: Value) -> Value {
+    let mut frame = json!({"id": "T0", "loaderId": loader, "url": url});
+    if let (Some(frame), Some(extra)) = (frame.as_object_mut(), extra.as_object()) {
+        frame.extend(extra.clone());
+    }
+    phone("Page.frameNavigated", json!({"frame": frame}))
+}
+
+#[test]
+fn redirected_link_commit_synchronizes_the_link_and_keeps_fragments() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    link_observer(&peer, &live);
+    let origin = "http://127.0.0.1:4173";
+
+    // The server redirects the link's loader to another URL with a fragment.
+    follow_link(&peer, 1, &format!("{origin}/moved"), "L9");
+    peer.event(commit(
+        "L9",
+        &format!("{origin}/landed"),
+        json!({"urlFragment": "#part"}),
+    ));
+    wait_for(&live, "the full URL", Duration::from_secs(2), |s| {
+        s.devices[0].url == format!("{origin}/landed#part")
+    });
+    wait_for_requests(&peer, "Page.navigate", "S1", 2);
+    assert_eq!(
+        peer.navigations("S1")[1],
+        format!("{origin}/moved"),
+        "the tablet follows the link, not the phone's redirect target"
+    );
+
+    // `frame.url` of a link to another document's fragment lacks the fragment.
+    follow_link(&peer, 2, &format!("{origin}/next#part"), "L10");
+    peer.event(commit(
+        "L10",
+        &format!("{origin}/next"),
+        json!({"urlFragment": "#part"}),
+    ));
+    wait_for_requests(&peer, "Page.navigate", "S1", 3);
+    assert_eq!(peer.navigations("S1")[2], format!("{origin}/next#part"));
+
+    // An error page for the link's loader and a document of another loader
+    // are not destinations of the link.
+    follow_link(&peer, 3, &format!("{origin}/down"), "L11");
+    peer.event(commit(
+        "L11",
+        "chrome-error://chromewebdata/",
+        json!({"unreachableUrl": format!("{origin}/down")}),
+    ));
+    follow_link(&peer, 4, &format!("{origin}/slow"), "L12");
+    peer.event(commit("L13", &format!("{origin}/elsewhere"), json!({})));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        peer.navigations("S1").len(),
+        3,
+        "{:?}",
+        peer.navigations("S1")
+    );
+    assert_eq!(peer.navigations("S2").len(), 1, "sync left its session");
+    drop(live);
+}
+
+#[test]
+fn same_document_link_navigation_follows_only_a_live_activation() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(
+        root.path(),
+        Limits {
+            link_follow: Duration::from_millis(500),
+            ..Limits::default()
+        },
+    );
+    link_observer(&peer, &live);
+    let origin = "http://127.0.0.1:4173";
+    let within = |frame: &str, path: &str, kind: &str| {
+        phone(
+            "Page.navigatedWithinDocument",
+            json!({"frameId": frame, "url": format!("{origin}{path}"), "navigationType": kind}),
+        )
+    };
+    let activate =
+        |id: u64, path: &str| peer.event(link_report("C", id, &format!("{origin}{path}")));
+
+    // A router saves state on the current entry, then pushes the link's URL.
+    activate(1, "/spa");
+    peer.event(within("T0", "/", "historyApi"));
+    peer.event(within("T0", "/spa", "historyApi"));
+    wait_for_requests(&peer, "Page.navigate", "S1", 2);
+    assert_eq!(peer.navigations("S1")[1], format!("{origin}/spa"));
+    wait_for(&live, "the phone's route", Duration::from_secs(2), |s| {
+        s.devices[0].url == format!("{origin}/spa")
+    });
+
+    // An activation counts once.
+    peer.event(within("T0", "/spa", "historyApi"));
+    // A subframe's URL change is not the page's.
+    activate(2, "/frame");
+    peer.event(within("F1", "/frame", "historyApi"));
+    // A subframe's observer is not the main frame's.
+    peer.event(phone(
+        "Runtime.executionContextCreated",
+        json!({"context": {"id": 8, "name": LINK_WORLD, "auxData": {"frameId": "F1", "type": "isolated"}}}),
+    ));
+    peer.event(phone(
+        "Runtime.bindingCalled",
+        json!({"name": LINK_BINDING, "executionContextId": 8,
+            "payload": json!({"phase": "C", "id": 3, "url": format!("{origin}/sub")}).to_string()}),
+    ));
+    peer.event(within("T0", "/sub", "historyApi"));
+    // A newer activation replaces an older one.
+    activate(4, "/a");
+    activate(5, "/b");
+    peer.event(within("T0", "/a", "historyApi"));
+    // An activation does not outlive its document.
+    activate(6, "/c");
+    peer.event(commit("L20", &format!("{origin}/other"), json!({})));
+    peer.event(within("T0", "/c", "historyApi"));
+    // It expires.
+    activate(7, "/d");
+    thread::sleep(Duration::from_millis(700));
+    peer.event(within("T0", "/d", "historyApi"));
+    // Hiding the device ends it.
+    activate(8, "/e");
+    thread::sleep(Duration::from_millis(50));
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: false,
+    }));
+    wait_for_requests(&peer, "Page.stopScreencast", "S0", 1);
+    peer.event(within("T0", "/e", "historyApi"));
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: true,
+    }));
+    wait_for_requests(&peer, "Page.startScreencast", "S0", 2);
+    // So does switching sync on after it.
+    assert!(live.send(Command::SetSync(SyncSettings::default())));
+    wait_for(&live, "sync off", Duration::from_secs(2), |s| {
+        !s.sync.navigation
+    });
+    activate(9, "/f");
+    thread::sleep(Duration::from_millis(50));
+    assert!(live.send(Command::SetSync(SyncSettings {
+        navigation: true,
+        scroll: false,
+    })));
+    wait_for(&live, "sync on", Duration::from_secs(2), |s| {
+        s.sync.navigation
+    });
+    peer.event(within("T0", "/f", "historyApi"));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        peer.navigations("S1").len(),
+        2,
+        "{:?}",
+        peer.navigations("S1")
+    );
+
+    // A hash link: the fragment navigation follows a fresh activation.
+    activate(10, "/other#part");
+    peer.event(within("T0", "/other#part", "fragment"));
+    wait_for_requests(&peer, "Page.navigate", "S1", 3);
+    assert_eq!(peer.navigations("S1")[2], format!("{origin}/other#part"));
+    assert_eq!(peer.navigations("S2").len(), 1, "sync left its session");
     drop(live);
 }
 
@@ -1034,10 +1263,148 @@ field.addEventListener('keydown', e => {
 field.focus();
 </script></body></html>"#;
 
+/// Frame document of `/frames`: a link, a hash link and a History API link,
+/// each 50 px below the previous one. Its reports name the top window's width.
+const FRAME_PAGE: &str = r##"<!doctype html><html><head><style>body{margin:0}
+a{display:block;width:160px;height:40px;margin-bottom:10px;background:#08f;color:#fff}</style></head><body>
+<a id=a href="/frame-dest">frame link</a><a id=h href="#frame-part">frame hash</a><a id=s href="/frame-spa">frame spa</a>
+<p id=frame-part>part</p><script>
+const report = kind => fetch('/event?' + new URLSearchParams({kind, w: top.innerWidth}));
+addEventListener('hashchange', () => report('framehash'));
+s.addEventListener('click', e => { e.preventDefault(); history.pushState(null, '', s.href); report('framespa'); });
+</script></body></html>"##;
+
+/// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
+fn link_page(href: &str, script: &str) -> String {
+    PAGE.replace(
+        "AUTO",
+        &format!("const a = document.getElementById('link'); a.href = {href}; {script}"),
+    )
+}
+
+/// Script that adds `link2`, a second link 200 px below the first, to `href`.
+fn second_link(href: &str) -> String {
+    format!(
+        r##"document.body.insertAdjacentHTML('beforeend', '<a id=link2 href="{href}" style="position:absolute;left:20px;top:300px;width:160px;height:40px;background:#0a0;color:#fff">second</a>'); const link2 = document.getElementById('link2');"##
+    )
+}
+
+/// Script that replaces the link with a button of the same size and place.
+const BUTTON: &str = "const b = document.createElement('button'); b.textContent = 'button'; b.style.cssText = 'position:absolute;left:20px;top:100px;width:160px;height:40px'; a.style.display = 'none'; document.body.append(b);";
+
+/// Script that adds the `#part` target of hash links, far below the fold.
+const PART: &str = r#"document.body.insertAdjacentHTML('beforeend', '<div id=part style="position:absolute;top:3000px">part</div>');"#;
+
 fn fixture() -> Fixture {
     Fixture::start(|request, _| {
         let path = request.path.split('?').next().unwrap_or("/");
+        match path {
+            // `/r?status=302&to=<location>`: a redirect.
+            "/r" => {
+                let query = request.path.split_once('?').map_or("", |(_, query)| query);
+                let field = |name: &str| {
+                    query.split('&').find_map(|pair| {
+                        pair.split_once('=')
+                            .filter(|(key, _)| *key == name)
+                            .map(|(_, value)| query_value(value))
+                    })
+                };
+                return Reply::Empty {
+                    status: field("status").and_then(|s| s.parse().ok()).unwrap_or(302),
+                    location: field("to"),
+                };
+            }
+            "/nocontent" => {
+                return Reply::Empty {
+                    status: 204,
+                    location: None,
+                };
+            }
+            "/dropped" => return Reply::Drop,
+            _ => {}
+        }
         let body = match path {
+            "/redirect-chain" => link_page(
+                "'/r?status=307&to=' + encodeURIComponent('/r?status=302&to=' + encodeURIComponent('/landed'))",
+                "",
+            ),
+            "/redirect-fragment" => {
+                link_page("'/r?status=302&to=' + encodeURIComponent('/landed#part')", "")
+            }
+            "/redirect-away" => link_page(
+                "'/r?status=302&to=' + encodeURIComponent('http://localhost:' + location.port + '/landed')",
+                "",
+            ),
+            "/fragment-link" => link_page("'/landed#part'", ""),
+            "/landed" => PAGE.replace("AUTO", PART),
+            "/nocontent-link" => link_page("'/nocontent'", ""),
+            "/redirect-empty" => {
+                link_page("'/r?status=302&to=' + encodeURIComponent('/nocontent')", "")
+            }
+            "/dropped-link" => link_page("'/dropped'", ""),
+            "/stop-link" => link_page(
+                "'/slow'",
+                "a.addEventListener('click', () => setTimeout(() => window.stop(), 300));",
+            ),
+            "/two-links" => link_page("'/slow'", &second_link("/landed?second")),
+            "/go-supersede" => link_page("'/slow'", ""),
+            "/hash" => link_page("'#part'", PART),
+            "/spa" => link_page(
+                "'/spa-route'",
+                "a.addEventListener('click', e => { e.preventDefault(); history.pushState(null, '', a.href); });",
+            ),
+            // A router that saves state on the current entry, then pushes the
+            // link's URL after its data arrives.
+            "/spa-late" => link_page(
+                "'/spa-late-route'",
+                "a.addEventListener('click', e => { e.preventDefault(); history.replaceState({y: scrollY}, '', location.href); setTimeout(() => history.pushState(null, '', a.href), 1500); });",
+            ),
+            "/navigation-api" => link_page(
+                "'/nav-route'",
+                "navigation.addEventListener('navigate', e => { if (e.canIntercept && !e.hashChange && new URL(e.destination.url).pathname === '/nav-route') e.intercept({handler: async () => {}}); });",
+            ),
+            "/spa-keyboard" => link_page(
+                "'/spa-key-route'",
+                "a.addEventListener('click', e => { e.preventDefault(); history.pushState(null, '', a.href); }); a.focus();",
+            ),
+            "/spa-script" => link_page(
+                "'/next'",
+                "setTimeout(() => history.pushState(null, '', '/spa-script-route'), 300);",
+            ),
+            "/spa-button" => link_page(
+                "'/spa-button-route'",
+                &format!("{BUTTON} b.addEventListener('click', () => history.pushState(null, '', a.href));"),
+            ),
+            "/hash-script" => link_page(
+                "'#part'",
+                &format!("{PART} {BUTTON} b.addEventListener('click', () => {{ location.hash = 'part'; }});"),
+            ),
+            "/scripted-hash" => link_page(
+                "'#part'",
+                &format!("{PART} {BUTTON} b.addEventListener('click', () => a.click());"),
+            ),
+            "/spa-other" => link_page(
+                "'/spa-a'",
+                "a.addEventListener('click', e => { e.preventDefault(); history.pushState(null, '', '/spa-b'); });",
+            ),
+            "/spa-superseded" => link_page(
+                "'/spa-x'",
+                &format!(
+                    "a.addEventListener('click', e => e.preventDefault()); {} link2.addEventListener('click', e => {{ e.preventDefault(); history.pushState(null, '', a.href); }});",
+                    second_link("/spa-y")
+                ),
+            ),
+            "/spa-hidden" => link_page(
+                "'/spa-hidden-route'",
+                "a.addEventListener('click', e => { e.preventDefault(); setTimeout(() => history.pushState(null, '', a.href), 700); });",
+            ),
+            // Not scrollable: a frame's fragment navigation would scroll it.
+            "/frames" => PAGE.replace(
+                "AUTO",
+                r##"document.body.style.height = '600px'; document.body.insertAdjacentHTML('beforeend', '<iframe name=f src="/frame" style="position:absolute;left:20px;top:300px;width:300px;height:200px;border:0"></iframe><a id=link2 href="/frame-dest" target=f style="position:absolute;left:20px;top:520px;width:160px;height:40px;background:#0a0;color:#fff">into frame</a>');"##,
+            ),
+            "/frame" => FRAME_PAGE.into(),
+            "/frame-dest" => "<!doctype html><p>frame destination</p>".into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
             "/script-pointer" => PAGE.replace("AUTO", "document.body.addEventListener('click', e => { if (!e.target.closest('a')) setTimeout(() => document.getElementById('link').click(), 100); });"),
@@ -2584,6 +2951,375 @@ fn live_link_sync_rejects_canceled_and_nested_activations() {
             );
         }
     }
+    live.close();
+}
+
+/// Loads `path` on every device and waits until all of them show it.
+fn load_all(live: &Live, fixture: &Fixture, path: &str) {
+    live.send(Command::NavigateAll {
+        url: fixture.url(path),
+    });
+    live.wait(path, Duration::from_secs(10), |s| loaded(s, fixture, path));
+}
+
+fn sync_links(live: &Live, navigation: bool) {
+    live.send(Command::SetSync(SyncSettings {
+        navigation,
+        scroll: false,
+    }));
+    live.wait("sync setting", Duration::from_secs(5), |s| {
+        s.sync.navigation == navigation
+    });
+}
+
+/// Requests whose path, including the query, starts with `prefix`.
+fn count_prefix(fixture: &Fixture, prefix: &str) -> usize {
+    fixture
+        .requests()
+        .iter()
+        .filter(|request| request.path.starts_with(prefix))
+        .count()
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_link_sync_follows_redirects_and_fragments_with_the_link_url() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/redirect-chain")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/redirect-chain")
+    });
+    sync_links(&live, true);
+    let away = fixture.url("/landed").replace("127.0.0.1", "localhost");
+    for (start, link, landed) in [
+        ("/redirect-chain", "/r?status=307&", fixture.url("/landed")),
+        (
+            "/redirect-fragment",
+            "/r?status=302&to=%2Flanded%23part",
+            fixture.url("/landed#part"),
+        ),
+        ("/redirect-away", "/r?status=302&to=http", away),
+        ("/fragment-link", "/landed", fixture.url("/landed#part")),
+    ] {
+        if start != "/redirect-chain" {
+            load_all(&live, &fixture, start);
+        }
+        let (links, landings) = (
+            count_prefix(&fixture, link),
+            count_prefix(&fixture, "/landed"),
+        );
+        click(&live, 0, 100.0, 120.0);
+        live.wait(start, Duration::from_secs(10), |s| {
+            s.devices[..2]
+                .iter()
+                .all(|device| device.url == landed && !device.loading)
+        });
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            live.session().status().devices[2].url,
+            fixture.url(start),
+            "{start} left its session"
+        );
+        // The tablet requested the link itself and followed its own redirects.
+        assert_eq!(count_prefix(&fixture, link) - links, 2, "{start}: link");
+        assert_eq!(
+            count_prefix(&fixture, "/landed") - landings,
+            2,
+            "{start}: destination"
+        );
+    }
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_same_document_link_navigations_sync_within_the_session() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/hash")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/hash")
+    });
+    sync_links(&live, true);
+    // A hash link scrolls the tablet within its document: nothing is requested.
+    click(&live, 0, 100.0, 120.0);
+    let hashed = fixture.url("/hash#part");
+    live.wait(
+        "tablet follows the hash link",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == hashed && s.devices[1].url == hashed,
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(&fixture, "/hash"), 3);
+    assert_eq!(live.session().status().devices[2].url, fixture.url("/hash"));
+
+    // History API and Navigation API routers: the tablet loads the route.
+    for (start, route, keyboard) in [
+        ("/spa", "/spa-route", false),
+        ("/spa-late", "/spa-late-route", false),
+        ("/navigation-api", "/nav-route", false),
+        ("/spa-keyboard", "/spa-key-route", true),
+    ] {
+        load_all(&live, &fixture, start);
+        if keyboard {
+            for down in [true, false] {
+                live.send(Command::Key {
+                    device: 0,
+                    key: KeyInput::from_key("enter", None, Modifiers::default(), down).unwrap(),
+                });
+            }
+        } else {
+            click(&live, 0, 100.0, 120.0);
+        }
+        let url = fixture.url(route);
+        live.wait(route, Duration::from_secs(10), |s| {
+            s.devices[..2]
+                .iter()
+                .all(|device| device.url == url && !device.loading)
+        });
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(count(&fixture, route), 1, "only the tablet loads {route}");
+        assert_eq!(live.session().status().devices[2].url, fixture.url(start));
+    }
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_script_and_stale_same_document_changes_never_sync() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/")
+    });
+    sync_links(&live, true);
+    // Every device's own script changes its URL; nothing follows.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/spa-script"),
+    });
+    let route = fixture.url("/spa-script-route");
+    live.wait("scripts change URLs", Duration::from_secs(10), |s| {
+        s.devices.iter().all(|device| device.url == route)
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(count(&fixture, "/spa-script-route"), 0);
+
+    // A button, script hash changes, a script's click on a hash link, and a
+    // link whose router pushes another URL.
+    for (start, destination) in [
+        ("/spa-button", "/spa-button-route"),
+        ("/hash-script", "/hash-script#part"),
+        ("/scripted-hash", "/scripted-hash#part"),
+        ("/spa-other", "/spa-b"),
+    ] {
+        load_all(&live, &fixture, start);
+        click(&live, 0, 100.0, 120.0);
+        live.wait(destination, Duration::from_secs(10), |s| {
+            s.devices[0].url == fixture.url(destination)
+        });
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            live.session().status().devices[1].url,
+            fixture.url(start),
+            "{start} synchronized"
+        );
+        if !destination.contains('#') {
+            assert_eq!(count(&fixture, destination), 0, "{destination} was loaded");
+        }
+    }
+
+    // The second link's router pushes the first link's URL.
+    load_all(&live, &fixture, "/spa-superseded");
+    click(&live, 0, 100.0, 120.0);
+    click(&live, 0, 100.0, 320.0);
+    live.wait("the first link's URL", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/spa-x")
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/spa-superseded")
+    );
+    assert_eq!(count(&fixture, "/spa-x"), 0);
+
+    // The router pushes after the phone was hidden.
+    load_all(&live, &fixture, "/spa-hidden");
+    click(&live, 0, 100.0, 120.0);
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: false,
+    });
+    live.wait("hidden route", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/spa-hidden-route")
+    });
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: true,
+    });
+    live.wait("phone visible", Duration::from_secs(5), |s| {
+        s.devices[0].streaming
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/spa-hidden")
+    );
+    assert_eq!(count(&fixture, "/spa-hidden-route"), 0);
+
+    // The link was activated before sync was switched on. The router pushes
+    // 1.5 s after the click; the activation arrives within milliseconds.
+    sync_links(&live, false);
+    load_all(&live, &fixture, "/spa-late");
+    click(&live, 0, 100.0, 120.0);
+    thread::sleep(Duration::from_millis(300));
+    sync_links(&live, true);
+    live.wait("late route", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/spa-late-route")
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        live.session().status().devices[1].url,
+        fixture.url("/spa-late")
+    );
+    assert_eq!(count(&fixture, "/spa-late-route"), 0);
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_subframe_navigations_never_sync() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/frames")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/frames")
+    });
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |fixture| count(fixture, "/frame")
+            == 3)
+    );
+    sync_links(&live, true);
+    // The phone's frame follows a hash link, a History API link, a link, and
+    // a main-document link that targets the frame.
+    click(&live, 0, 100.0, 370.0);
+    click(&live, 0, 100.0, 420.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |fixture| {
+            !events(fixture, "framehash").is_empty() && !events(fixture, "framespa").is_empty()
+        }),
+        "frame reports {:?}",
+        fixture.requests()
+    );
+    click(&live, 0, 100.0, 320.0);
+    assert!(fixture.wait_for(Duration::from_secs(10), |fixture| count(
+        fixture,
+        "/frame-dest"
+    ) == 1));
+    click(&live, 0, 100.0, 540.0);
+    assert!(fixture.wait_for(Duration::from_secs(10), |fixture| count(
+        fixture,
+        "/frame-dest"
+    ) == 2));
+    thread::sleep(Duration::from_millis(700));
+    let status = live.session().status();
+    assert!(
+        status
+            .devices
+            .iter()
+            .all(|device| device.url == fixture.url("/frames")),
+        "{status:#?}"
+    );
+    for kind in ["framehash", "framespa"] {
+        assert!(
+            events(&fixture, kind)
+                .iter()
+                .all(|event| event["w"] == "360")
+        );
+    }
+    assert_eq!(count(&fixture, "/frame-dest"), 2);
+
+    // A main-frame link still synchronizes afterwards.
+    click(&live, 0, 100.0, 120.0);
+    let next = fixture.url("/next");
+    live.wait("tablet follows", Duration::from_secs(10), |s| {
+        s.devices[0].url == next && s.devices[1].url == next
+    });
+    assert_eq!(count(&fixture, "/next"), 2);
+    assert_eq!(
+        live.session().status().devices[2].url,
+        fixture.url("/frames")
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_cancelled_and_superseded_link_navigations_sync_at_most_the_latest() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/nocontent-link")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/nocontent-link")
+    });
+    sync_links(&live, true);
+    // No document: 204, a redirect to 204, a failed load, a load the page stops.
+    for (start, requested, settle) in [
+        ("/nocontent-link", "/nocontent", 700),
+        ("/redirect-empty", "/nocontent", 700),
+        ("/dropped-link", "/dropped", 1500),
+        ("/stop-link", "/slow", 3500),
+    ] {
+        if start != "/nocontent-link" {
+            load_all(&live, &fixture, start);
+        }
+        let before = count(&fixture, requested);
+        click(&live, 0, 100.0, 120.0);
+        thread::sleep(Duration::from_millis(settle));
+        let status = live.session().status();
+        assert_eq!(
+            status.devices[1].url,
+            fixture.url(start),
+            "{start} synchronized"
+        );
+        assert!(!status.devices[1].loading, "{start}: {status:#?}");
+        assert!(count(&fixture, requested) > before, "{start} did not load");
+    }
+    assert_eq!(
+        count(&fixture, "/slow"),
+        1,
+        "the tablet never requested /slow"
+    );
+
+    // A second link replaces the first; only the second synchronizes.
+    load_all(&live, &fixture, "/two-links");
+    click(&live, 0, 100.0, 120.0);
+    thread::sleep(Duration::from_millis(300));
+    click(&live, 0, 100.0, 320.0);
+    let second = fixture.url("/landed?second");
+    live.wait(
+        "tablet follows the second link",
+        Duration::from_secs(10),
+        |s| {
+            s.devices[..2]
+                .iter()
+                .all(|device| device.url == second && !device.loading)
+        },
+    );
+    thread::sleep(Duration::from_millis(3500));
+    assert_eq!(count(&fixture, "/slow"), 2);
+    assert_eq!(count(&fixture, "/landed?second"), 2);
+
+    // Go replaces a link that is still loading: every device loads Go once.
+    load_all(&live, &fixture, "/go-supersede");
+    click(&live, 0, 100.0, 120.0);
+    thread::sleep(Duration::from_millis(300));
+    live.send(Command::NavigateAll {
+        url: fixture.url("/landed?go"),
+    });
+    live.wait("Go", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/landed?go")
+    });
+    thread::sleep(Duration::from_millis(3500));
+    assert_eq!(count(&fixture, "/slow"), 3);
+    assert_eq!(count(&fixture, "/landed?go"), 3);
+    assert!(loaded(&live.session().status(), &fixture, "/landed?go"));
     live.close();
 }
 

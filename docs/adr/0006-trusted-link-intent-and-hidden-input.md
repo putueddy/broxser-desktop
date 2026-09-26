@@ -37,7 +37,10 @@ Visual clipping is presentation only and must never construct a new URL for a
 peer, Go or Restart. Redirects to a different destination are conservatively not
 mirrored by this implementation; that behavior needs its own policy and tests
 before support is widened. Modified clicks, downloads, new-tab targets and
-unsupported subframe navigation are outside this sync contract.
+unsupported subframe navigation are outside this sync contract. ADR 0013 widens
+this: peers follow the link's URL when its loader commits after redirects, and a
+same-document navigation to the URL of a live activation synchronizes; subframes
+stay outside.
 
 Hide pauses both streaming and page input. The desktop selects a visible
 alternative, or has no page-input target when every device is hidden. Selecting

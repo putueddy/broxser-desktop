@@ -1738,14 +1738,15 @@ impl<'a> Controller<'a> {
                 }
             }
         }
-        self.sync = settings;
-        if !settings.navigation {
+        // A link activated before navigation sync changed never synchronizes.
+        if settings.navigation != self.sync.navigation {
             for device in &mut self.devices {
                 device.link_intent = None;
                 device.requested_link = None;
                 device.link_navigation = None;
             }
         }
+        self.sync = settings;
         self.shared.update(|status| status.sync = settings);
         Ok(())
     }
@@ -2130,10 +2131,25 @@ impl<'a> Controller<'a> {
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
                 let url = text("url").unwrap_or_default().to_owned();
-                self.devices[index].link_intent = None;
-                self.devices[index].requested_link = None;
-                self.devices[index].link_navigation = None;
-                self.shared.device(index, |device| device.url = url);
+                let window = self.limits.link_follow;
+                let device = &mut self.devices[index];
+                device.requested_link = None;
+                device.link_navigation = None;
+                // A hash link, or a router's History API or Navigation API
+                // change, reaching the URL of the latest trusted link activation
+                // follows it (ADR 0013). A change to another URL, such as a
+                // router saving state on the current entry first, keeps it.
+                let followed = device
+                    .link_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.url == url)
+                    && device.link_intent.take().is_some_and(|intent| {
+                        intent.generation == device.generation && intent.at.elapsed() <= window
+                    });
+                self.shared.device(index, |device| device.url = url.clone());
+                if self.sync.navigation && followed && self.devices[index].visible {
+                    self.sync_navigation(index, url)?;
+                }
             }
             "Page.frameNavigated" => {
                 let Some(frame) = params.get("frame") else {
@@ -2145,11 +2161,13 @@ impl<'a> Controller<'a> {
                 {
                     return Ok(());
                 }
-                let url = frame
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+                let field = |name: &str| frame.get(name).and_then(Value::as_str);
+                // CDP reports the fragment apart from `url`.
+                let url = format!(
+                    "{}{}",
+                    field("url").unwrap_or_default(),
+                    field("urlFragment").unwrap_or_default()
+                );
                 // A new document answers input again; the old one's is moot.
                 self.forget_input(index);
                 self.invalidate_ime(index);
@@ -2174,11 +2192,15 @@ impl<'a> Controller<'a> {
                 let device = &mut self.devices[index];
                 device.generation += 1;
                 device.wheel = None;
-                let link = device.link_navigation.take().is_some_and(|link| {
+                // The link's own loader committed, possibly after server
+                // redirects. Peers load the link and follow their own
+                // redirects; a redirect target, which can carry a code or a
+                // token, never reaches them (ADR 0013). An error page is not
+                // a destination.
+                let link = device.link_navigation.take().filter(|link| {
                     link.confirmed
-                        && frame.get("loaderId").and_then(Value::as_str)
-                            == Some(link.loader.as_str())
-                        && url == link.url
+                        && field("loaderId") == Some(link.loader.as_str())
+                        && frame.get("unreachableUrl").is_none()
                 });
                 device.link_intent = None;
                 device.requested_link = None;
@@ -2187,11 +2209,14 @@ impl<'a> Controller<'a> {
                     self.start_stream(index)?;
                 }
                 self.shared.device(index, |device| {
-                    device.url = url.clone();
+                    device.url = url;
                     device.error = None;
                 });
-                if self.sync.navigation && link && self.devices[index].visible {
-                    self.sync_navigation(index, url)?;
+                if self.sync.navigation
+                    && self.devices[index].visible
+                    && let Some(link) = link
+                {
+                    self.sync_navigation(index, link.url)?;
                 }
             }
             "Page.javascriptDialogOpening" => {

@@ -25,6 +25,7 @@ fn fast_limits() -> Limits {
         startup: Duration::from_secs(1),
         command: Duration::from_secs(2),
         load: Duration::from_secs(2),
+        ..Limits::default()
     }
 }
 
