@@ -1,3 +1,4 @@
+mod ime;
 mod lifecycle;
 mod live_view;
 mod static_view;
@@ -91,6 +92,8 @@ fn main() -> Result<()> {
             cx.bind_keys([
                 KeyBinding::new("ctrl-q", Quit, None),
                 KeyBinding::new("ctrl-r", Refresh, None),
+                // Helium would reload the page itself, untracked (ADR 0010).
+                KeyBinding::new("f5", Refresh, None),
                 KeyBinding::new("ctrl-l", FocusUrl, None),
             ]);
             cx.on_window_closed(|cx| {

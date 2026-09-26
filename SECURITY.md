@@ -56,6 +56,20 @@ reach it seconds later; input already sent (at most 32 events) still arrives if
 the page recovers. A navigation Broxser started that gets no response in 30 seconds
 is stopped and never retried (ADR 0008).
 
+Sessions share the browser process, and Chromium keeps one clipboard and one
+selection buffer for all of them: before ADR 0010, a copy or a mere selection in one
+session could be pasted into another with Ctrl+V or a middle click. The engine now
+never forwards paste keys or middle-button presses to pages. Paste is explicit:
+Ctrl+V, Shift+Insert or Ctrl+Shift+V inserts the system clipboard's plain text, at
+most 65,536 characters without control characters other than tab and line breaks,
+into the selected visible device only, once per key press. Pages cannot read the
+browser clipboard through `navigator.clipboard.readText()` (denied in Helium
+0.18.1.1). Keys that Helium turns into browser commands are not forwarded either:
+before ADR 0010, Ctrl+W in one device closed another device of the same session,
+Ctrl+Shift+M stopped the browser, and other keys opened tabs and DevTools that
+Broxser never showed, or reloaded and navigated pages outside its deadlines. That
+list is measured per Helium release.
+
 Link sync requires a trusted link report from the device's isolated main-frame
 execution context and the matching browser navigation request/loader. The binding
 does not expose native capabilities to page scripts. A recent ordinary keypress

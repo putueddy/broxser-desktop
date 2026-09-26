@@ -3,6 +3,65 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.3 keyboard, browser keys and clipboard, 26 September 2026 (cloud container)
+
+Same container and toolchain as P1.2 below. The desktop and its browser ran as
+the unprivileged user `broxsertest` with the sandbox enabled. The audit, the
+measurements and the decision are in
+[ADR 0010](adr/0010-keyboard-identity-and-explicit-paste.md).
+
+### Before the change
+
+A scratch X11 harness, not committed, ran the debug desktop of `4c2d5c1` against a
+fixture text area that reports key, input and paste events, typed with xdotool and
+set the system clipboard with xclip. This Xvfb ignores keymap changes from
+clients, so German layout runs used a second Xvfb started with a private copy of
+the XKB data whose default layout is German. The results are the table in
+ADR 0010; in addition, with the window given X input focus:
+
+| Action on `4c2d5c1` | Result |
+| --- | --- |
+| German `/` held while the URL bar is clicked, Shift released first, then `/` twice in the page | The keyup reached the page at the click (371 ms); both later `/` were dropped |
+| German Shift+7 released Shift first, then another device and back, then `/` twice | The keyup reached the page 327 ms late, at the device switch; both later `/` were dropped |
+
+The engine then sent each key of ADR 0010's second table to a fresh Helium,
+focused in a text area and in the page body, and listed the browser's page
+targets through its loopback DevTools endpoint.
+
+### After the change
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 60 engine and 12 desktop tests, 6 of them new; format and strict Clippy; 24 live tests ignored by default |
+| Live Helium suite, four test threads | Passed 24 of 24 twice, in 48.6 s and 48.8 s, including the two new tests |
+| The browser-key live test without the engine's browser-key check | Failed: Ctrl+W closed the desktop device, and the text typed afterwards never arrived |
+| German `/` with Shift released first, three times, across a device switch | All three typed; each keyup 1–12 ms after its key-down |
+| German `/` held while the URL bar is clicked, Shift released first, then `/` twice | The keyup reached the page at the click (351 ms); both later `/` typed |
+| German dead keys `´` `e`, `^` `a` | `Dead` without text, then `é`; `Dead`, then `â` |
+| Ctrl+V with `pasted-from-system` in the system clipboard | Inserted as `insertText`; no `paste` event |
+| Ctrl+C in the Guest phone, Ctrl+V in the Admin desktop | The Admin page received the system clipboard's `system-clipboard`, not `secret-guest` |
+| Text selected in the Guest phone, middle click in the Admin desktop | No input in the Admin page |
+| Ctrl+V held for 1.5 s (auto-repeat on: 660 ms delay, 25 per second) | Pasted once |
+| 70,000 characters in the clipboard; no clipboard owner | Nothing pasted; the status bar showed "Nothing pasted: the clipboard text has 70000 characters, more than 65536." and "Nothing pasted: the clipboard holds no text." |
+| F2, Insert, F12 | F2 (113) and Insert (45) reached the page; F12 did not |
+| Ctrl+R, F5 | One document load each: Broxser's reload of the selected device |
+| Ctrl+W, Ctrl+Shift+M, Ctrl+U, Alt+F4 or F12 in the Guest phone, then `ok` | No device closed, the runtime kept running, no document load; `ok` arrived |
+| `navigator.clipboard.readText()` in the Admin page after a Guest copy, on a key press | Rejected: "Read permission denied" |
+| `scripts/desktop-smoke.sh` | Passed all seven runs; no process, profile or window left, and the known preview directory after SIGTERM |
+
+Limits:
+
+- Xvfb without a window manager never gives the window X input focus, and GPUI
+  then reports no focus changes: a key held while the URL bar was clicked was not
+  released in the page, on `4c2d5c1` and with the change. The rows above that
+  change focus ran after `xdotool windowfocus`, as a window manager would focus
+  the window.
+- Checked on X11 only, with US and German layouts, synthetic key events and no
+  input method installed; not on Wayland, physical keyboards or other layouts.
+- The browser keys were measured on Helium 0.18.1.1 only.
+- GPUI's 4-second X11 clipboard timeout for an owner that does not answer was not
+  reproduced.
+
 ## P1.2 restart and close transitions, 25 September 2026 (cloud container)
 
 Same container and toolchain as P1.1 below: Rust 1.98.1, GPUI 0.2.2, Helium
@@ -498,7 +557,7 @@ physical GPU, release build, `live.html` and a representative company app:
 - [ ] Window opens and draws without extra events; resize and move keep input mapping correct.
 - [ ] HiDPI and fractional scaling: frame sharpness, especially DPR>1 devices; click accuracy.
 - [ ] Input latency (target p95 below 50 ms) and CPU/GPU use with 3 and 8 devices.
-- [ ] Keyboard layouts, shortcuts (Ctrl+L/R/Q not reaching pages), IME (not supported yet).
+- [ ] Keyboard layouts, shortcuts (Ctrl+L/R/Q and F5 not reaching pages, browser keys dropped), paste from other apps, IME (not supported yet). Xvfb evidence is in the P1.3 section.
 - [ ] Touch devices with mouse input; text selection and drag inside pages.
 - [ ] Popups, downloads, permissions, file upload, JavaScript dialogs (unsupported, must fail visibly).
 - [ ] Close, window-manager close and `scripts/desktop-smoke.sh` on that desktop.
@@ -665,6 +724,122 @@ engine suite with Helium.
 | #12 | `76f5d26` (zero core limit) | Failed: systemd-coredump ignores the limit, crash not reported within 15 s; the other 9 passed |
 | #13 | `9e09830` (zero `coredump_filter`) | Passed: all 10 live tests, crash reported after 222 ms, reproducer 6 runs with no failure |
 
+## P1.3 native IME — 26 September 2026
+
+ADR 0011 extends PR #10 (`bcdb855`) with a selected-canvas input handler,
+target-bound CDP composition, and observed caret geometry. Verified on Linux with
+Helium 0.18.1.1 (`Chrome/154.0.8037.57`), GPUI 0.2.2 plus the two documented native
+IME patches, Fcitx5 5.1.22, Pinyin addons 5.1.14, libime 1.1.16, private Xvfb,
+and Mesa Lavapipe 26.2.2. Browser sandboxing remained enabled.
+
+| Check | Result |
+| --- | --- |
+| `CARGO_BUILD_JOBS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 63 engine + 24 desktop tests (96 total). 26 live tests ignored here and run separately |
+| `BROXSER_TEST_BROWSER="$PWD/.local/helium/helium" cargo test --locked -p broxser-engine -- --ignored --test-threads=2 --nocapture` | Passed: 26/26, 140.60 s |
+| `cargo build --locked -p broxser-desktop -j 2` | Passed; actual GUI executable used below |
+| Real Fcitx5/Pinyin XIM, extended scenario | Passed: inline preedit, `你好` twice, Escape cancellation, two `n` commits with no DOM key-up, then a textarea commit without changing the first input |
+| Candidate placement | Visually checked under the input caret, then the textarea caret, at 50% canvas scale in an actual GPUI X11 window |
+| Final native event trace | Six composition starts/ends, 28 updates, final input `你好你好nn`, textarea `你好`. No DOM key-down/up events were needed for those commits |
+| Close after native IME | Exit 0 and zero browser profiles remaining; private Fcitx/Xvfb processes stopped by the harness |
+| Vendored GPUI audit | Original crate SHA-256 verified; only `wayland/client.rs` and `x11/xim_handler.rs` differ from upstream source. License retained; transitive Cargo versions unchanged |
+| Python harness | `python3 -m py_compile scripts/ime-smoke.py` passed |
+
+Native command:
+
+```bash
+python3 scripts/ime-smoke.py \
+  --desktop target/debug/broxser-desktop --browser .local/helium/helium \
+  --output /tmp/broxser-ime-handoff-verified --capture-private-root --scenario extended
+```
+
+The Arch-hosted harness expects the seven pinned archives listed in its
+`PACKAGES` constant in `BROXSER_IME_PACKAGES` (default
+`/tmp/broxser-ime-runtime/packages`), plus `bsdtar`, Python, Fcitx5, D-Bus and
+ImageMagick. It verifies SHA-256 against the local authenticated `extra.db` before
+extracting the temporary runtime. Set `--packages`, `--runtime` and `--database`
+when using other retained locations; no packages are installed into the system.
+It creates private configuration, starts Fcitx with cloud Pinyin disabled,
+enables `UseOnTheSpot=True`, and waits for both the XIM server and active Pinyin
+context. Full-display capture is allowed only for the Xvfb server it creates.
+The host IME daemon and configuration are untouched.
+
+Logs, native `summary.json`, fixture events and reviewed screenshots are retained
+locally in `artifacts/p1-3-ime/` (ignored by Git). The actual private native run was
+`/tmp/broxser-ime-handoff-verified`; earlier passing extended evidence remains in
+`/tmp/broxser-ime-final-extended2`.
+
+Failures found and repaired during qualification:
+
+- The original XIM context was never focused: Fcitx saw no active context and
+  forwarded Latin keys. Sending `SetIcFocus` produced native commits. Fcitx's
+  default off-the-spot mode sends no application preedit; the private test
+  explicitly enables on-the-spot mode.
+- Empty cleanup after a commit created a phantom composition and swallowed the
+  next field's first word. Cleanup no longer creates an origin; pointer-down also
+  retires the old caret token before new composition can latch it. A queued old
+  status snapshot cannot rearm that token while the worker processes the click.
+- Review reproduced an old commit migrating after cancellation plus empty
+  preedit, inactive-window input, synthetic events preserving stale target tokens,
+  and a vertically misplaced caret in tall inputs. Regression coverage now
+  exercises these cases; native deletion records a boundary for the next preedit.
+- One full live run exposed `Runtime.evaluate` overtaking earlier key dispatch.
+  The target check now waits for preceding input responses (no longer within a
+  fixed 250 ms bound; see the next subsection). Another run exposed a
+  pre-existing link-test predicate accepting the previous `/next` status; it now
+  waits for the new source request before checking the unchanged no-sync
+  assertion. The complete final suite passed.
+- Initial sandbox-only runs could not bind fixture sockets; tests requiring
+  localhost/browser/window access were rerun outside that sandbox. Private Xvfb
+  initially lacked a usable Vulkan driver; a verified temporary Lavapipe package
+  supplied it. Formatting and Clippy findings were fixed before the passing run.
+
+Not qualified: native Wayland IME end-to-end, physical keyboards, other IME
+languages/engines, all fractional scales, password/iframe/shadow-root/canvas
+editors, surrounding-text replacement, or all cancellation callback orderings.
+In particular, after cancellation without a terminal callback, an ambiguous
+commit-only input is dropped rather than moved to a new target. Frames and
+candidate/DOM updates are asynchronous; a streamed preedit can trail the latest
+DOM update. GPUI's existing numeric-fallback warnings and the existing
+`proc-macro-error2` future-compatibility warning remain non-failing.
+
+### Slow answers before an IME commit (PR #10 CI, 26 September 2026)
+
+CI on `4f4e54d` failed `live_ime_rejects_scripted_focus_and_selection_after_synthetic_events`:
+after the three attacks, the two genuine `✓` commits never produced a value with
+both check marks. The 25 other live tests passed on that runner, which was also
+writing browser core dumps for the guardian tests. The identity check blocked the
+runtime for at most 250 ms, including the wait for the page's answer to earlier
+input; on timeout it dropped the IME action and invalidated its target, so the
+next commit was dropped as well.
+
+Reproduction in the cloud container (user `broxsertest`, sandbox on):
+
+| Check on `4f4e54d` | Result |
+| --- | --- |
+| The CI test alone five times, then twelve times beside six busy loops | Passed each time: load alone did not reproduce it |
+| Full live suite, four threads, three times | Passed 26 of 26 each time |
+| Scratch test with debug logging: the page answers the first commit after 400 ms, a second commit follows | The second commit was dropped after 251 ms with the first still unanswered; the page kept one `✓` |
+| New test `live_ime_waits_for_a_slow_page_without_dropping_or_reordering_input` | Failed: both commits dropped, only `x` typed |
+| New test `live_input_held_behind_an_ime_check_is_dropped_when_hidden` | Failed as expected without a hold: the commit was dropped at 250 ms and the key typed after it reached the page |
+
+The check now waits without blocking the runtime: the read is sent once earlier
+input is answered, its answer sends or drops the action, and later input to that
+device waits behind it in order under the ordinary input budget and deadline.
+Navigation, a new document, hiding, a crash or an unresponsive page drops the
+waiting action and that input (ADR 0011).
+
+| Check with the change | Result |
+| --- | --- |
+| The two new tests, three runs each | Passed: `✓✓x` with every reported value a prefix; after hide and show nothing held was sent, and the next commit arrived alone |
+| The three older IME live tests | Passed |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 63 engine and 24 desktop tests; format and strict Clippy; 28 live tests ignored by default |
+| Live Helium suite, four test threads | Passed 28 of 28 twice, in 40.3 s and 40.0 s |
+| Same suite beside six busy loops on the four cores | Passed 28 of 28 in 90.9 s |
+| `scripts/desktop-smoke.sh` under Xvfb with the rebuilt desktop | Passed all seven runs; no browser process or profile left, and the known preview directory after SIGTERM |
+
+Not rerun: the native Fcitx5 smoke, since Fcitx5 is not installed in this
+container. The desktop code did not change.
+
 ## Open gates
 
 - The M1 manual desktop checklist above, on Wayland and a physical GPU.
@@ -678,6 +853,10 @@ engine suite with Helium.
   the kill scenarios on company desktops, distros and kernels.
 - Physical GPU, Wayland compositors, fractional scaling, IME and accessibility
   need a real desktop session; the cloud check above is X11 on software Vulkan.
+- Input methods: ADR 0011 qualifies Fcitx5/Pinyin over XIM with a native input
+  handler, preedit, commit and caret placement. Native Wayland IME, physical
+  keyboards, other language engines and complex editors remain unqualified.
+  The browser keys that the engine drops must be measured again on each Helium update.
 - Before a team rollout: multiple distro/GPU combinations, SPA readiness,
   popup/download/clipboard behavior, permission policy, persistent storage
   isolation, engine updates and rollback. Performance budgets in System Design are

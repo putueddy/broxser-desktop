@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use broxser_core::{MAX_DEVICES, SyncAction, SyncEvent, SyncRouter, Workspace, validate_url};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -68,6 +68,8 @@ const LINK_OBSERVER: &str = r#"(() => {
     pending = null;
   }, true);
 })();"#;
+mod ime;
+use ime::{IME_BINDING, IME_OBSERVER, IME_WORLD, parse_caret_report, valid_ime_action};
 const JPEG_QUALITY: u32 = 80;
 /// Largest frame edge requested before the UI reports its display size.
 const DEFAULT_FRAME_EDGE: u32 = 2048;
@@ -202,6 +204,36 @@ pub struct DeviceStatus {
     pub dropped_frames: u64,
     /// Windows the page opened; they are not displayed yet.
     pub popups: u32,
+    /// Current main-frame editable caret. Cleared whenever its target is unsafe.
+    pub text_input: Option<TextInputState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaretRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextInputState {
+    /// Engine-assigned token; old tokens cannot type into a new focus or anchor.
+    pub target: u64,
+    pub caret: CaretRect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImeAction {
+    /// UTF-16 code-unit offsets within `text`.
+    Preedit {
+        text: String,
+        selection: std::ops::Range<usize>,
+    },
+    Commit {
+        text: String,
+    },
+    Cancel,
 }
 
 /// Opt-in synchronization inside one session. Pointer and key synchronization
@@ -240,6 +272,18 @@ pub enum Command {
         device: usize,
         key: KeyInput,
     },
+    /// Explicit paste: inserts `text`, as [`paste_text`] returns it, into the
+    /// focused element of the device, like an input method commit. The page
+    /// gets no `paste` event.
+    InsertText {
+        device: usize,
+        text: String,
+    },
+    Ime {
+        device: usize,
+        target: u64,
+        action: ImeAction,
+    },
     /// Hidden devices stop their screencast and keep no frame.
     SetVisible {
         device: usize,
@@ -257,6 +301,20 @@ pub enum Command {
     CrashForTest {
         device: usize,
     },
+}
+
+impl Command {
+    /// The device this page input goes to; other commands have none.
+    fn input_device(&self) -> Option<usize> {
+        match *self {
+            Self::Pointer { device, .. }
+            | Self::Wheel { device, .. }
+            | Self::Key { device, .. }
+            | Self::InsertText { device, .. }
+            | Self::Ime { device, .. } => Some(device),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +393,26 @@ impl KeyInput {
                 text.map(str::to_owned),
             )
         };
+        if let Some(number) = function_key(name) {
+            let key = format!("F{number}");
+            return Some(Self {
+                down,
+                code: key.clone(),
+                key,
+                text: None,
+                key_code: 111 + number,
+                modifiers,
+            });
+        }
+        let shortcut = modifiers.control || modifiers.alt || modifiers.meta;
+        // The one character the key press types, if any.
+        let typed = typed
+            .filter(|typed| typed.chars().count() == 1 && !typed.chars().any(char::is_control));
+        let mut chars = name.chars();
+        let single = match (chars.next(), chars.next()) {
+            (Some(base), None) => Some(base),
+            _ => None,
+        };
         let (key, code, key_code, text) = match name {
             "enter" => named("Enter", "Enter", 13, Some("\r")),
             "backspace" => named("Backspace", "Backspace", 8, None),
@@ -350,32 +428,33 @@ impl KeyInput {
             "end" => named("End", "End", 35, None),
             "pageup" => named("PageUp", "PageUp", 33, None),
             "pagedown" => named("PageDown", "PageDown", 34, None),
-            _ => {
-                let mut chars = name.chars();
-                let (Some(base), None) = (chars.next(), chars.next()) else {
-                    return None;
-                };
-                if base.is_control() {
-                    return None;
+            "insert" => named("Insert", "Insert", 45, None),
+            // A dead key starts a composition and types nothing itself.
+            _ if name.starts_with("dead_") => named("Dead", "", 0, None),
+            _ => match (single, typed) {
+                (Some(base), _) if base.is_control() => return None,
+                // Without a character, GPUI's name is only a guess at the key's
+                // position; without a shortcut modifier this is a dead key.
+                (Some(_), None) if !shortcut => named("Dead", "", 0, None),
+                (Some(base), typed) => {
+                    let typed = typed.map_or_else(|| base.to_string(), str::to_owned);
+                    let (code, key_code) = match base {
+                        'a'..='z' => (
+                            format!("Key{}", base.to_ascii_uppercase()),
+                            u32::from(base.to_ascii_uppercase()),
+                        ),
+                        '0'..='9' => (format!("Digit{base}"), u32::from(base)),
+                        _ => (String::new(), 0),
+                    };
+                    (typed.clone(), code, key_code, Some(typed))
                 }
-                let typed = typed
-                    .filter(|typed| {
-                        typed.chars().count() == 1 && !typed.chars().any(char::is_control)
-                    })
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| base.to_string());
-                let (code, key_code) = match base {
-                    'a'..='z' => (
-                        format!("Key{}", base.to_ascii_uppercase()),
-                        u32::from(base.to_ascii_uppercase()),
-                    ),
-                    '0'..='9' => (format!("Digit{base}"), u32::from(base)),
-                    _ => (String::new(), 0),
-                };
-                (typed.clone(), code, key_code, Some(typed))
-            }
+                // A composed character, named after its keysym (`eacute`); its
+                // physical key is unknown.
+                (None, Some(typed)) => (typed.to_owned(), String::new(), 0, Some(typed.to_owned())),
+                (None, None) => return None,
+            },
         };
-        let text = text.filter(|_| !(modifiers.control || modifiers.alt || modifiers.meta));
+        let text = text.filter(|_| !shortcut);
         Some(Self {
             down,
             key,
@@ -385,6 +464,99 @@ impl KeyInput {
             modifiers,
         })
     }
+}
+
+/// Function keys F1 to F12, as GPUI names them (`f1`).
+fn function_key(name: &str) -> Option<u32> {
+    name.strip_prefix('f')?
+        .parse()
+        .ok()
+        .filter(|number| (1..=12).contains(number))
+}
+
+/// Ctrl+V, Ctrl+Shift+V and Shift+Insert. Pages never receive them: Chromium
+/// would paste its own clipboard, which every session of the browser shares.
+/// A paste inserts the system clipboard's text instead (ADR 0010).
+pub fn is_paste_key(key: &KeyInput) -> bool {
+    let Modifiers {
+        alt,
+        control,
+        meta,
+        shift,
+    } = key.modifiers;
+    !alt && !meta
+        && ((control && key.code == "KeyV") || (shift && !control && key.code == "Insert"))
+}
+
+/// Key presses that Helium 0.18.1.1 turns into browser commands, whether or
+/// not the page handles them (ADR 0010): they close a device's tab or its
+/// window with every device of the session in it, quit, crash the browser
+/// (Ctrl+Shift+M), open tabs, browser pages or DevTools that Broxser neither
+/// shows nor tracks, or reload and navigate outside Broxser's commands.
+fn is_browser_key(key: &KeyInput) -> bool {
+    let Modifiers {
+        alt,
+        control,
+        meta,
+        shift,
+    } = key.modifiers;
+    let code = key.code.as_str();
+    if meta {
+        return false;
+    }
+    match (control, alt, shift) {
+        _ if code == "F5" => true,
+        (false, false, _) => code == "F12",
+        (true, false, false) => matches!(
+            code,
+            "KeyW" | "KeyT" | "KeyN" | "KeyR" | "KeyU" | "KeyJ" | "F4"
+        ),
+        (true, false, true) => matches!(
+            code,
+            "KeyW"
+                | "KeyT"
+                | "KeyN"
+                | "KeyQ"
+                | "KeyR"
+                | "KeyO"
+                | "KeyM"
+                | "KeyA"
+                | "KeyI"
+                | "KeyJ"
+                | "Delete"
+        ),
+        (false, true, false) => matches!(code, "F4" | "ArrowLeft" | "ArrowRight" | "Home"),
+        _ => false,
+    }
+}
+
+/// Longest text one paste inserts, in characters.
+pub const MAX_PASTE_CHARS: usize = 65_536;
+
+/// Why clipboard text cannot be pasted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteRejected {
+    /// Nothing remains without control characters.
+    Empty,
+    /// The text has this many characters, more than [`MAX_PASTE_CHARS`].
+    TooLong(usize),
+}
+
+/// Clipboard text as [`Command::InsertText`] inserts it: without control
+/// characters other than tab and line breaks, at most [`MAX_PASTE_CHARS`].
+pub fn paste_text(text: &str) -> Result<String, PasteRejected> {
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let length = text.chars().count();
+    if length > MAX_PASTE_CHARS {
+        return Err(PasteRejected::TooLong(length));
+    }
+    if text.is_empty() {
+        return Err(PasteRejected::Empty);
+    }
+    Ok(text)
 }
 
 /// Maps a point in UI pixels to CSS pixels of a device viewport. `image` is the
@@ -491,6 +663,7 @@ struct Controller<'a> {
     router: SyncRouter,
     sync: SyncSettings,
     pending: HashMap<u64, Pending>,
+    next_ime_target: u64,
 }
 
 struct LinkIntent {
@@ -528,6 +701,17 @@ struct LiveDevice {
     /// Increments on every committed cross-document navigation.
     generation: u64,
     link_context: Option<i64>,
+    ime_context: Option<i64>,
+    ime_anchor: Option<u64>,
+    ime_blocked_anchor: Option<u64>,
+    ime_target: Option<u64>,
+    composing: bool,
+    /// The IME action whose editable identity check is outstanding.
+    ime_check: Option<ImeCheck>,
+    /// Input that arrived after that action, in order. It is sent once the
+    /// check has sent or dropped the action; a navigation, a new document,
+    /// hiding, a crash or overload drops it instead.
+    held_input: VecDeque<Command>,
     link_intent: Option<LinkIntent>,
     requested_link: Option<LinkCandidate>,
     link_navigation: Option<LinkNavigation>,
@@ -575,6 +759,17 @@ struct Wheel {
     generation: u64,
 }
 
+/// An IME action waiting for a read of the current editable identity in the
+/// isolated world. A script can move focus before its next animation-frame
+/// report arrives; the read rejects that. It waits without blocking the
+/// runtime, under the deadlines of ordinary input (ADR 0011).
+struct ImeCheck {
+    target: u64,
+    action: ImeAction,
+    /// The read, sent once the page has answered earlier input.
+    read: Option<u64>,
+}
+
 /// A command whose answer the live loop waits for without blocking.
 enum Pending {
     /// The command of a device's [`Navigation`].
@@ -591,6 +786,10 @@ enum Pending {
     Input {
         device: usize,
     },
+    /// The identity read of a device's [`ImeCheck`].
+    ImeRead {
+        device: usize,
+    },
 }
 
 impl Pending {
@@ -599,7 +798,8 @@ impl Pending {
             Self::Navigate { device }
             | Self::Wheel { device }
             | Self::Move { device }
-            | Self::Input { device } => device,
+            | Self::Input { device }
+            | Self::ImeRead { device } => device,
         }
     }
 }
@@ -633,6 +833,7 @@ impl<'a> Controller<'a> {
             router: SyncRouter::new(workspace).map_err(|error| anyhow!("{error}"))?,
             sync: SyncSettings::default(),
             pending: HashMap::new(),
+            next_ime_target: 0,
         })
     }
 
@@ -645,6 +846,10 @@ impl<'a> Controller<'a> {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Ok(()),
                 }
+            }
+            for index in 0..self.devices.len() {
+                self.release_input(index)?;
+                self.read_ime_target(index)?;
             }
             self.flush_input()?;
             if self.cdp.read_until(Instant::now() + LIVE_POLL)? {
@@ -707,6 +912,13 @@ impl<'a> Controller<'a> {
                 limit: (physical(device.width), physical(device.height)),
                 generation: 0,
                 link_context: None,
+                ime_context: None,
+                ime_anchor: None,
+                ime_blocked_anchor: None,
+                ime_target: None,
+                composing: false,
+                ime_check: None,
+                held_input: VecDeque::new(),
                 link_intent: None,
                 requested_link: None,
                 link_navigation: None,
@@ -736,6 +948,16 @@ impl<'a> Controller<'a> {
                 json!({"source": LINK_OBSERVER, "worldName": LINK_WORLD, "runImmediately": true}),
                 Some(&self.devices.last().unwrap().session.clone()),
             )?;
+            self.command(
+                "Runtime.addBinding",
+                json!({"name": IME_BINDING, "executionContextName": IME_WORLD}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
+            self.command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source": IME_OBSERVER, "worldName": IME_WORLD, "runImmediately": true}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
         }
         self.cdp.set_poll_interval(LIVE_POLL)?;
         self.shared
@@ -751,6 +973,20 @@ impl<'a> Controller<'a> {
     }
 
     fn handle(&mut self, command: Command) -> Result<()> {
+        if let Some(index) = command
+            .input_device()
+            .filter(|&index| index < self.devices.len())
+        {
+            self.release_input(index)?;
+            if self.devices[index].ime_check.is_some() {
+                self.hold_input(index, command);
+                return Ok(());
+            }
+        }
+        self.dispatch(command)
+    }
+
+    fn dispatch(&mut self, command: Command) -> Result<()> {
         let count = self.devices.len();
         match command {
             Command::NavigateAll { url } => {
@@ -777,19 +1013,39 @@ impl<'a> Controller<'a> {
                 delta_y,
             } if device < count => self.wheel(device, x, y, delta_x, delta_y),
             Command::Key { device, key } if device < count => self.key(device, &key)?,
+            Command::InsertText { device, text } if device < count => {
+                self.insert_text(device, &text)?;
+            }
+            Command::Ime {
+                device,
+                target,
+                action,
+            } if device < count => {
+                self.ime(device, target, action)?;
+            }
             Command::SetVisible { device, visible } if device < count => {
-                self.devices[device].visible = visible;
                 if visible {
+                    self.devices[device].visible = true;
                     self.cdp.send_detached(
                         "Input.setIgnoreInputEvents",
                         json!({"ignore": false}),
                         Some(&self.devices[device].session.clone()),
                     )?;
                     self.start_stream(device)?;
+                    if let Some(context) = self.devices[device].ime_context {
+                        self.cdp.send_detached(
+                            "Runtime.evaluate",
+                            json!({"expression":"globalThis.__broxserImeRefresh?.()", "contextId":context, "silent":true}),
+                            Some(&self.devices[device].session.clone()),
+                        )?;
+                    }
                 } else {
+                    self.clear_ime(device, true)?;
+                    self.devices[device].visible = false;
                     let state = &mut self.devices[device];
                     state.pointer_move = None;
                     state.wheel = None;
+                    state.held_input.clear();
                     state.link_intent = None;
                     state.requested_link = None;
                     state.link_navigation = None;
@@ -845,6 +1101,9 @@ impl<'a> Controller<'a> {
     /// the browser cancels that navigation, and its late answer must not
     /// describe this one.
     fn start_navigation(&mut self, index: usize, method: &str, params: Value) -> Result<()> {
+        self.clear_ime(index, true)?;
+        // Input held for the current document never reaches the next one.
+        self.devices[index].held_input.clear();
         self.forget_navigation(index);
         let session = self.devices[index].session.clone();
         let id = self.cdp.send(method, params, Some(&session))?;
@@ -910,6 +1169,7 @@ impl<'a> Controller<'a> {
         device.move_in_flight = false;
         device.wheel_in_flight = false;
         device.unresponsive = false;
+        device.held_input.clear();
     }
 
     /// The main frame of device `index` committed or stopped loading. That
@@ -941,13 +1201,16 @@ impl<'a> Controller<'a> {
     }
 
     /// Reports that the page of device `index` leaves input unanswered, and
-    /// drops its coalesced move and wheel. An error already shown, such as an
-    /// open dialog or a crash, explains more and stays.
+    /// drops its coalesced move and wheel and the input held behind an IME
+    /// action. An error already shown, such as an open dialog or a crash,
+    /// explains more and stays.
     fn set_unresponsive(&mut self, index: usize) {
+        self.invalidate_ime(index);
         let device = &mut self.devices[index];
         device.unresponsive = true;
         device.pointer_move = None;
         device.wheel = None;
+        device.held_input.clear();
         self.shared.device(index, |status| {
             status
                 .error
@@ -1025,8 +1288,17 @@ impl<'a> Controller<'a> {
     }
 
     fn pointer(&mut self, index: usize, event: PointerEvent) -> Result<()> {
-        if !self.input_allowed(index) {
+        // A middle click would paste Chromium's selection buffer, which every
+        // session of the browser shares (ADR 0010).
+        if event.button == PointerButton::Middle || !self.input_allowed(index) {
             return Ok(());
+        }
+        if event.kind == PointerKind::Down {
+            self.devices[index].ime_blocked_anchor = self.devices[index].ime_anchor;
+            self.clear_ime(index, true)?;
+            if !self.input_allowed(index) {
+                return Ok(());
+            }
         }
         let device = &mut self.devices[index];
         if event.kind == PointerKind::Move {
@@ -1110,7 +1382,7 @@ impl<'a> Controller<'a> {
     }
 
     fn key(&mut self, index: usize, key: &KeyInput) -> Result<()> {
-        if !self.input_allowed(index) {
+        if is_paste_key(key) || is_browser_key(key) || !self.input_allowed(index) {
             return Ok(());
         }
         if key.key.is_empty()
@@ -1146,6 +1418,203 @@ impl<'a> Controller<'a> {
             .cdp
             .send("Input.dispatchKeyEvent", params, Some(&session))?;
         self.track(id, Pending::Input { device: index })
+    }
+
+    /// Inserts pasted text into the focused element of device `index`. Only
+    /// text that [`paste_text`] would return unchanged is inserted.
+    fn insert_text(&mut self, index: usize, text: &str) -> Result<()> {
+        if paste_text(text).as_deref() != Ok(text) || !self.input_allowed(index) {
+            return Ok(());
+        }
+        let session = self.devices[index].session.clone();
+        let id = self
+            .cdp
+            .send("Input.insertText", json!({"text": text}), Some(&session))?;
+        self.track(id, Pending::Input { device: index })
+    }
+
+    /// Starts the identity check of an IME action. Input to the device that
+    /// follows waits until the check has sent or dropped the action.
+    fn ime(&mut self, index: usize, target: u64, action: ImeAction) -> Result<()> {
+        if self.devices[index].ime_target != Some(target)
+            || !valid_ime_action(&action)
+            || !self.input_allowed(index)
+        {
+            return Ok(());
+        }
+        self.devices[index].ime_check = Some(ImeCheck {
+            target,
+            action,
+            read: None,
+        });
+        self.read_ime_target(index)
+    }
+
+    /// Reads the current editable identity in its trusted isolated context for
+    /// the waiting IME action of device `index`. Input dispatch and
+    /// Runtime.evaluate use different renderer queues, so the read waits until
+    /// the page has answered earlier input; otherwise it could overtake a key
+    /// or click that moves focus. It returns only an identity, never page text
+    /// or a password.
+    fn read_ime_target(&mut self, index: usize) -> Result<()> {
+        let device = &self.devices[index];
+        let Some(check) = &device.ime_check else {
+            return Ok(());
+        };
+        if check.read.is_some() || device.unanswered > 0 {
+            return Ok(());
+        }
+        let (Some(context), Some(_)) = (device.ime_context, device.ime_anchor) else {
+            self.devices[index].ime_check = None;
+            return Ok(());
+        };
+        let session = device.session.clone();
+        let id = self.cdp.send(
+            "Runtime.evaluate",
+            json!({
+                "expression": "globalThis.__broxserImeCurrent?.() ?? 0",
+                "contextId": context,
+                "returnByValue": true,
+                "silent": true,
+            }),
+            Some(&session),
+        )?;
+        self.track(id, Pending::ImeRead { device: index })?;
+        if let Some(check) = &mut self.devices[index].ime_check {
+            check.read = Some(id);
+        }
+        Ok(())
+    }
+
+    /// Sends the waiting IME action of device `index` if read `id` found its
+    /// target still current; otherwise the action is dropped.
+    fn ime_target_read(&mut self, index: usize, id: u64, response: Value) -> Result<()> {
+        let device = &mut self.devices[index];
+        if device.ime_check.as_ref().and_then(|check| check.read) != Some(id) {
+            return Ok(());
+        }
+        let Some(check) = device.ime_check.take() else {
+            return Ok(());
+        };
+        let anchor = parse_response(response, "Runtime.evaluate")
+            .ok()
+            .and_then(|result| result.pointer("/result/value").and_then(Value::as_u64));
+        if anchor.is_none() || anchor != device.ime_anchor {
+            self.invalidate_ime(index);
+            return Ok(());
+        }
+        if device.ime_target != Some(check.target) || !self.input_allowed(index) {
+            return Ok(());
+        }
+        let session = self.devices[index].session.clone();
+        let (method, params) = match check.action {
+            ImeAction::Preedit { text, selection } => {
+                self.devices[index].composing = true;
+                (
+                    "Input.imeSetComposition",
+                    json!({
+                        "text": text,
+                        "selectionStart": selection.start,
+                        "selectionEnd": selection.end,
+                    }),
+                )
+            }
+            ImeAction::Commit { text } => {
+                self.devices[index].composing = false;
+                ("Input.insertText", json!({"text": text}))
+            }
+            ImeAction::Cancel => {
+                self.devices[index].composing = false;
+                (
+                    "Input.imeSetComposition",
+                    json!({
+                        "text": "", "selectionStart": 0, "selectionEnd": 0,
+                    }),
+                )
+            }
+        };
+        let id = self.cdp.send(method, params, Some(&session))?;
+        self.track(id, Pending::Input { device: index })
+    }
+
+    /// Holds input to device `index` behind its waiting IME action. As for
+    /// sent input, only the newest move and the summed wheel wait. A page that
+    /// leaves too much input waiting is not responding; the held input is dropped.
+    fn hold_input(&mut self, index: usize, command: Command) {
+        let device = &mut self.devices[index];
+        match (device.held_input.back_mut(), &command) {
+            (Some(Command::Pointer { event: held, .. }), Command::Pointer { event, .. })
+                if held.kind == PointerKind::Move && event.kind == PointerKind::Move =>
+            {
+                *held = *event;
+                return;
+            }
+            (
+                Some(Command::Wheel {
+                    x: held_x,
+                    y: held_y,
+                    delta_x: held_delta_x,
+                    delta_y: held_delta_y,
+                    ..
+                }),
+                Command::Wheel {
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                    ..
+                },
+            ) => {
+                (*held_x, *held_y) = (*x, *y);
+                *held_delta_x += delta_x;
+                *held_delta_y += delta_y;
+                return;
+            }
+            _ => {}
+        }
+        if device.unanswered + device.held_input.len() >= MAX_UNANSWERED_INPUT {
+            self.set_unresponsive(index);
+            return;
+        }
+        device.held_input.push_back(command);
+    }
+
+    /// Sends the input held behind a decided IME action, in order, until
+    /// another IME action waits for its own check.
+    fn release_input(&mut self, index: usize) -> Result<()> {
+        while self.devices[index].ime_check.is_none()
+            && let Some(command) = self.devices[index].held_input.pop_front()
+        {
+            self.dispatch(command)?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_ime(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        let had_target = device.ime_target.is_some();
+        device.ime_anchor = None;
+        device.ime_target = None;
+        // A waiting action is dropped; a late answer to its read is ignored.
+        device.ime_check = None;
+        device.composing = false;
+        if had_target {
+            self.shared.device(index, |status| status.text_input = None);
+        }
+    }
+
+    fn clear_ime(&mut self, index: usize, cancel: bool) -> Result<()> {
+        if cancel && self.devices[index].composing && self.input_allowed(index) {
+            let session = self.devices[index].session.clone();
+            let id = self.cdp.send(
+                "Input.imeSetComposition",
+                json!({"text": "", "selectionStart": 0, "selectionEnd": 0}),
+                Some(&session),
+            )?;
+            self.track(id, Pending::Input { device: index })?;
+        }
+        self.invalidate_ime(index);
+        Ok(())
     }
 
     /// Sends coalesced pointer moves and wheel deltas, one in flight per device.
@@ -1323,6 +1792,10 @@ impl<'a> Controller<'a> {
                     }
                     self.answered(device);
                 }
+                Some(Pending::ImeRead { device }) => {
+                    self.answered(device);
+                    self.ime_target_read(device, id, response)?;
+                }
                 None => {}
             }
         }
@@ -1367,6 +1840,7 @@ impl<'a> Controller<'a> {
                     // gone; the error below describes the device instead.
                     self.forget_input(index);
                     self.forget_navigation(index);
+                    self.invalidate_ime(index);
                     self.devices[index].streaming = false;
                     self.shared.device(index, |device| {
                         device.loading = false;
@@ -1392,18 +1866,32 @@ impl<'a> Controller<'a> {
         match event.method.as_str() {
             "Runtime.executionContextCreated" => {
                 if let Some(context) = params.get("context")
-                    && context.get("name").and_then(Value::as_str) == Some(LINK_WORLD)
                     && context.pointer("/auxData/frameId").and_then(Value::as_str)
                         == Some(self.devices[index].target_id.as_str())
                     && context.pointer("/auxData/type").and_then(Value::as_str) == Some("isolated")
                 {
-                    self.devices[index].link_context = context
+                    let id = context
                         .get("id")
                         .and_then(Value::as_i64)
                         .filter(|id| *id > 0);
+                    match context.get("name").and_then(Value::as_str) {
+                        Some(LINK_WORLD) => self.devices[index].link_context = id,
+                        Some(IME_WORLD) => {
+                            self.invalidate_ime(index);
+                            self.devices[index].ime_context = id;
+                            self.devices[index].ime_blocked_anchor = None;
+                        }
+                        _ => {}
+                    }
                 }
             }
             "Runtime.executionContextDestroyed" => {
+                if self.devices[index].ime_context.is_some_and(|id| {
+                    params.get("executionContextId").and_then(Value::as_i64) == Some(id)
+                }) {
+                    self.devices[index].ime_context = None;
+                    self.invalidate_ime(index);
+                }
                 if self.devices[index].link_context.is_some_and(|id| {
                     params.get("executionContextId").and_then(Value::as_i64) == Some(id)
                 }) {
@@ -1414,6 +1902,44 @@ impl<'a> Controller<'a> {
             "Runtime.executionContextsCleared" => {
                 self.devices[index].link_context = None;
                 self.devices[index].link_intent = None;
+                self.devices[index].ime_context = None;
+                self.invalidate_ime(index);
+            }
+            "Runtime.bindingCalled"
+                if text("name") == Some(IME_BINDING)
+                    && self.devices[index].ime_context.is_some_and(|id| {
+                        params.get("executionContextId").and_then(Value::as_i64) == Some(id)
+                    })
+                    && self.devices[index].visible =>
+            {
+                match text("payload")
+                    .and_then(|payload| parse_caret_report(payload, self.devices[index].css))
+                {
+                    None => self.clear_ime(index, true)?,
+                    Some(None) => self.clear_ime(index, true)?,
+                    Some(Some((anchor, caret))) => {
+                        if self.devices[index]
+                            .ime_blocked_anchor
+                            .is_some_and(|blocked| anchor <= blocked)
+                        {
+                            return Ok(());
+                        }
+                        self.devices[index].ime_blocked_anchor = None;
+                        if self.devices[index].ime_anchor != Some(anchor) {
+                            self.clear_ime(index, true)?;
+                            self.next_ime_target = self
+                                .next_ime_target
+                                .checked_add(1)
+                                .ok_or_else(|| anyhow!("IME target token exhausted"))?;
+                            self.devices[index].ime_anchor = Some(anchor);
+                            self.devices[index].ime_target = Some(self.next_ime_target);
+                        }
+                        let target = self.devices[index].ime_target.unwrap();
+                        self.shared.device(index, |status| {
+                            status.text_input = Some(TextInputState { target, caret });
+                        });
+                    }
+                }
             }
             "Runtime.bindingCalled"
                 if text("name") == Some(LINK_BINDING)
@@ -1493,6 +2019,7 @@ impl<'a> Controller<'a> {
             "Page.frameRequestedNavigation"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
+                self.clear_ime(index, true)?;
                 let sync_navigation = self.sync.navigation;
                 let device = &mut self.devices[index];
                 let url = text("url");
@@ -1608,6 +2135,7 @@ impl<'a> Controller<'a> {
                     .to_owned();
                 // A new document answers input again; the old one's is moot.
                 self.forget_input(index);
+                self.invalidate_ime(index);
                 let matches_reload =
                     self.devices[index]
                         .navigation
@@ -1752,7 +2280,8 @@ fn mouse_params(event: PointerEvent, css: (f64, f64)) -> Value {
             PointerButton::Middle => "middle",
             PointerButton::Right => "right",
         },
-        "buttons": event.buttons,
+        // Middle presses never reach pages (ADR 0010), so neither does its bit.
+        "buttons": event.buttons & !4,
         "clickCount": event.click_count,
         "modifiers": event.modifiers.cdp(),
     })

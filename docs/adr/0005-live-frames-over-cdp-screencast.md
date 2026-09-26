@@ -22,7 +22,10 @@ blocking browser I/O stays off the GPUI thread and nothing leaks on close.
   time, and drops the previous image from GPUI's sprite atlas when it replaces it.
 - Input uses `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent` in CSS pixels,
   mapped from the painted frame bounds. Pointer moves and wheel deltas are
-  coalesced with one dispatch in flight per device.
+  coalesced with one dispatch in flight per device. ADR 0010 pairs key releases
+  by press, keeps keys that Helium turns into browser commands, paste keys and
+  middle clicks from pages, and pastes system clipboard text with
+  `Input.insertText`.
 - Sync reuses the core router and stays inside one session and visible devices.
   ADR 0006 replaces the initial recent-input heuristic with isolated-world trusted
   link intent matched to the navigation request and loader. Scripted links after
@@ -57,9 +60,11 @@ canvas scale. See `docs/validation.md` for numbers.
   browser with a zero core limit and `coredump_filter` (see `SECURITY.md`).
 - Only the latest frame is shown; animation smoothness and input latency have not
   been measured on real hardware.
-- IME, page clipboard, touch gestures, drag and drop, popups, downloads,
-  permissions, file upload, JavaScript dialogs and accessibility are not
-  supported. Each needs its own gate.
+- Rich or page-initiated clipboard access, touch gestures, drag and drop,
+  popups, downloads, permissions, file upload, JavaScript dialogs and
+  accessibility are not supported. Each needs its own gate; ADR 0010 covers
+  plain-text paste only. ADR 0011 adds native IME composition and caret placement
+  for standard main-frame editable controls, qualified with Fcitx5/Pinyin over XIM.
 
 ## Options for later
 

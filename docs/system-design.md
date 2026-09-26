@@ -151,6 +151,30 @@ tidak ada browser yang dimulai, lalu window ditutup. Setiap runtime punya
 generation; wake-up dan frame hasil decode dari generation lama dibuang tanpa
 mengubah state runtime baru.
 
+Keyboard mengikuti ADR 0010. Setiap key-down di window dicatat sebelum shortcut
+dan elemen menanganinya; hanya key-down terakhir yang dihitung repeat, dan key-up
+yang namanya berubah (Shift dilepas lebih dulu, karakter komposisi) mengakhiri
+tekanan terakhir yang namanya dapat berubah. Key yang dilepas lebih awal di halaman
+yang disembunyikan, tidak dipilih lagi atau kehilangan fokus tetap tercatat
+ditekan, sehingga repeat-nya tidak masuk ke halaman lain. Engine tidak meneruskan
+tombol yang oleh Helium dijadikan perintah browser (menutup tab atau window,
+membuka tab, DevTools, reload, navigasi riwayat), tombol paste, maupun klik tengah;
+clipboard dan selection buffer browser dipakai bersama semua session. Paste
+menyisipkan teks clipboard sistem dengan `Input.insertText` ke device terpilih
+yang terlihat.
+
+ADR 0011 menambahkan input handler native pada canvas device terpilih. Preedit
+memakai `Input.imeSetComposition`, commit memakai `Input.insertText`, dan teks
+commit tidak masuk pencatatan tombol fisik atau menunggu key-up. Komposisi terikat
+ke device, token editable engine dan generation runtime. Observer main frame
+terisolasi mengirim identitas fokus dan geometri caret yang divalidasi, tanpa
+menyalin teks halaman ke host. Geometri CSS dipetakan melalui batas frame yang
+benar-benar dilukis, termasuk zoom, untuk posisi kandidat IME. Komposisi yang
+kehilangan target dibatalkan; callback lama tidak boleh diteruskan ke device baru.
+Password, iframe, closed shadow root, editor canvas dan penggantian surrounding
+text belum dicakup. GPUI 0.2.2 dipertahankan sebagai source vendored dengan patch
+commit ASCII Wayland agar semua commit melewati input handler native.
+
 Startup dibatasi 15 detik, setiap command 15 detik dan load 30 detik. Ini deadline
 per operasi, bukan SLA total job. Cancellation dicek paling lambat setiap 500 ms;
 menutup window membatalkan capture dan menunggu cleanup. Deadline global job masih
@@ -339,6 +363,11 @@ Status 25 September 2026: P0 cleanup saat proses induk mati diimplementasikan
 (ADR 0007) dan lulus reproducer fake browser, Helium live, CLI serta window X11 di
 cloud. Preview mode statis dan direktori socket Chromium di temp dir belum tercakup;
 kualifikasi pada desktop dan distro perusahaan masih diperlukan.
+
+Status 26 September 2026: P1.1 (ADR 0008) dan P1.2 (ADR 0009) sudah di-merge. P1.3
+keyboard, tombol browser dan paste eksplisit (ADR 0010) lulus tes Helium live dan
+window X11 dengan layout US dan Jerman; komposisi IME dan copy ke clipboard sistem
+belum, dan daftar tombol browser harus diukur ulang pada setiap update Helium.
 
 Keputusan saat ini: lanjutkan foundation dan bukti integrasi, pertahankan runtime
 eksternal dan konfigurasi portabel. Full embedding perlu keputusan baru berdasarkan

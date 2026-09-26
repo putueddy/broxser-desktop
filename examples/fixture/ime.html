@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Broxser IME fixture</title>
+  <style>
+    body { margin: 0; padding: 16px; font: 16px sans-serif; color: #17202a; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { margin: 8px 0; }
+    label { display: block; margin: 14px 0 4px; }
+    input, textarea, [contenteditable] { box-sizing: border-box; width: 95%; padding: 8px; border: 2px solid #4768b0; font: 18px sans-serif; }
+    textarea { height: 70px; }
+    [contenteditable] { min-height: 42px; }
+    #spacer { height: 600px; background: linear-gradient(#fff, #e5edff); }
+    #events { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px monospace; max-height: 250px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h1>Broxser IME fixture</h1>
+  <p>Compose Pinyin in each field. This page records native and DOM events on the local fixture server.</p>
+  <label for="one">Input</label><input id="one" autocomplete="off" spellcheck="false" autofocus>
+  <label for="two">Textarea</label><textarea id="two" spellcheck="false"></textarea>
+  <label for="three">Contenteditable</label><div id="three" contenteditable="true" spellcheck="false"></div>
+  <div id="spacer">Scroll to test a caret far below the initial viewport.</div>
+  <label for="four">Scrolled input</label><input id="four" autocomplete="off" spellcheck="false">
+  <p id="events"></p>
+  <script>
+    (() => {
+      const fields = [...document.querySelectorAll('input, textarea, [contenteditable]')];
+      const log = document.getElementById('events');
+      const pageId = crypto.randomUUID();
+      let serial = 0;
+      function snapshot(el, event) {
+        const r = el.getBoundingClientRect();
+        const selection = el.matches('input, textarea')
+          ? { start: el.selectionStart, end: el.selectionEnd }
+          : (() => { const s = getSelection(); return { anchorOffset: s.anchorOffset, focusOffset: s.focusOffset }; })();
+        const data = {
+          serial: ++serial, at: performance.now(), type: event.type, target: el.id,
+          pageId, viewport: { width: innerWidth, height: innerHeight },
+          value: el.value ?? el.textContent, data: event.data ?? null,
+          inputType: event.inputType ?? null, isComposing: event.isComposing ?? null,
+          key: event.key ?? null, code: event.code ?? null, repeat: event.repeat ?? null,
+          selection, rect: { x: r.x, y: r.y, width: r.width, height: r.height },
+          scroll: { x: scrollX, y: scrollY }, scale: devicePixelRatio,
+          pointer: event.type === 'click' ? { x: event.clientX, y: event.clientY } : null,
+        };
+        log.textContent = JSON.stringify(data) + '\n' + log.textContent.slice(0, 12000);
+        fetch('/event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data), keepalive: true }).catch(() => {});
+      }
+      for (const el of fields) {
+        for (const type of ['focus', 'blur', 'keydown', 'keyup', 'compositionstart',
+                            'compositionupdate', 'compositionend', 'beforeinput', 'input']) {
+          el.addEventListener(type, e => snapshot(el, e));
+        }
+        el.addEventListener('click', e => snapshot(el, e));
+      }
+      addEventListener('scroll', () => {
+        const el = document.activeElement;
+        if (fields.includes(el)) snapshot(el, { type: 'scroll' });
+      });
+    })();
+  </script>
+</body>
+</html>
