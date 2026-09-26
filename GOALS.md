@@ -203,7 +203,9 @@ memperbaikinya dan `scripts/desktop-smoke.sh` kini mengetik selama animasi. Devi
 yang ter-scroll keluar canvas kini tidak di-upload dan screencast-nya dijeda tanpa
 semantik hide: dengan 8 device beranimasi (5 di luar layar) CPU browser turun dari
 170% ke 97%, PSS desktop dari 198 ke 156 MB dan p95 latensi dari 318 ke 173 ms.
-Frame limit dikirim ulang saat scale window berubah. Frame tetap berukuran CSS:
+Frame limit dikirim ulang saat scale window berubah. Sesi 117 menit dengan 3 device
+beranimasi dan ketikan berkala tetap ter-render tanpa crash; PSS desktop tetap
+154–157 MB. Frame tetap berukuran CSS:
 `--force-device-scale-factor=2` memberi frame HiDPI dengan input benar, tetapi
 menaikkan CPU browser sekitar 64% pada ukuran tampilan yang sama, sehingga mode
 HiDPI yang lebih tajam menjadi pilihan eksplisit terpisah. Latensi di kontainer

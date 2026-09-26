@@ -95,6 +95,30 @@ forced scale factor raised browser CPU from about 75% to 124%, browser PSS by ab
 CSS size: sharp while zoom × window scale is at most 1, upscaled above it, for
 example above 50% zoom on a 2× display. ADR 0012 records the trade-off.
 
+### Long session
+
+The release build of this change ran the three-device workspace on the animation
+fixture on its own Xvfb display. A scratch harness typed 20 characters into the
+phone, then sampled CPU and PSS of the desktop and its browser tree for 50 s, and
+checked that the window was still drawn, 140 times: 117 minutes from 08:18 to
+10:16 UTC. Two earlier attempts were cut off after 23 and 4 samples, when the
+cloud container was reclaimed while this session was idle; their desktop logs were
+empty and the window was drawn at every sample.
+
+| Measure | Result |
+| --- | --- |
+| Window | Alive and drawn at all 140 samples; 15 processes throughout |
+| Desktop PSS | 154–157 MB at every sample outside the overlap below; mean 155.8 MB over the first ten samples, 156.9 MB over the last ten |
+| Browser PSS | 445–469 MB during the first ten samples, 467–473 MB up to sample 33, 475–481 MB in samples 61–100, 476–482 MB in samples 101–140 |
+| CPU | Median 177.5% desktop, 72.1% browser outside the overlap |
+| End | Ctrl+Q exit 0, no panic, no browser process or profile left |
+
+Samples 34–60 overlapped the smoke and review runs below on the same four cores:
+desktop CPU fell to 98% and PSS to 112 MB, because shared pages were split with the
+other processes. Browser memory rose by about 8 MB after warm-up and did not rise
+over the last 40 samples (34 minutes); a session of several hours on a real
+desktop remains to be measured.
+
 ### Automated checks
 
 | Check | Result |
