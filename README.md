@@ -101,6 +101,11 @@ batas validasi ditolak untuk sync tanpa dipotong. Peer memuat URL link yang
 diklik dan mengikuti redirect-nya sendiri; navigasi hash dan router SPA ke URL
 link yang baru diklik ikut disinkronkan (ADR 0013). Link subframe, navigasi yang
 dimulai script, download dan pembukaan tab baru tidak dicakup kontrak sync ini.
+Dialog JavaScript (`alert`, `confirm`, `prompt`, `beforeunload`) tampil di kartu
+device dan hanya dijawab lewat tombolnya; selama terbuka, input dan navigasi ke
+device itu ditahan, tidak dijawab otomatis (ADR 0014). Popup, download, upload,
+permission dan input touch belum didukung dan berperilaku seperti default browser
+headless; status auditnya ada di `docs/validation.md`.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable

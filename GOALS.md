@@ -234,8 +234,27 @@ navigasi subframe, `a.click()` dari script, tombol yang mengubah URL, dan aktiva
 yang basi (dokumen baru, hide, sync diubah, kedaluwarsa) tidak disinkronkan; semua
 kini punya tes fake CDP atau Helium. Sisa di luar lingkup: `history.back/forward`,
 navigasi lintas dokumen yang dimulai halaman, form, tab baru dan download, serta
-peer yang memuat route SPA sebagai dokumen penuh dari server. Berikutnya P1.6
-interaksi browser yang belum didukung.
+peer yang memuat route SPA sebagai dokumen penuh dari server.
+
+**Status P1.6 (26 September 2026, dipecah per kapabilitas; PR pertama menunggu
+review):** audit seluruh kapabilitas ada di `docs/validation.md` (P1.6). Probe CDP
+pada Helium 0.18.1.1 dan run `main` `6495c2b` membuktikan bahwa dialog JavaScript
+membekukan halaman dan frame-nya, bahwa Go/Reload/sync membatalkan dialog diam-diam
+(navigasi menutupnya dengan hasil *cancel*), bahwa klik yang membuka dialog dihitung
+sebagai halaman *not responding*, dan bahwa Go pada halaman dengan `beforeunload`
+berakhir pada error deadline sementara pertanyaannya tetap terbuka. Kini
+([ADR 0014](docs/adr/0014-javascript-dialogs.md)) dialog tampil di kartu device
+dengan pesan halaman dan hanya jawaban yang dimilikinya (OK; Cancel/OK; Cancel/OK
+dengan field teks; Stay/Leave); jawaban memakai token dialog sehingga jawaban yang
+terlambat tidak mengenai dialog berikutnya; input ke device itu dibuang selama
+dialog terbuka; navigasi Broxser untuk device itu ditolak dengan pesan; deadline
+*not responding* dan navigasi dijeda; Stay mengakhiri navigasi Broxser tanpa error
+dan Leave melanjutkannya. Tidak ada jawaban otomatis. Kapabilitas berikutnya,
+masing-masing PR sendiri: popup (tutup dan laporkan URL), download dan pemilih file
+(blokir dan laporkan; tetapkan `setDownloadBehavior deny` per context), permission
+notifikasi (tolak eksplisit agar promise tidak menggantung), input touch untuk
+device touch (`Input.dispatchTouchEvent`), lalu dokumentasi batas hover/pointer
+media, drag/drop dan aksesibilitas.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -322,7 +341,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, IME dan
   paste eksplisit: ADR 0010/0011, merged melalui PR #10; P1.4 frame dan resource:
   ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, PR
-  menunggu review).
+  menunggu review; P1.6 dialog JavaScript: ADR 0014, PR menunggu review, kapabilitas
+  lain menyusul).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

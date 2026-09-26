@@ -3,6 +3,85 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.6 unsupported browser interactions, 26 September 2026 (cloud container)
+
+Same container as P1.5: Helium 0.18.1.1 (Chrome/154.0.8037.57), headless, run by
+the unprivileged user `broxsertest` with the sandbox enabled and the profile seeded
+as in ADR 0004. P1.6 is split per capability; this section records the audit of all
+of them and the first change, JavaScript dialogs
+([ADR 0014](adr/0014-javascript-dialogs.md)).
+
+### Audit: what happens today
+
+A scratch Node script, not committed, drove one page target with Broxser's setup
+(device metrics, focus emulation, screencast) and clicked fixture pages through
+`Input.dispatchMouseEvent`. `main` at `6495c2b` handled only
+`Page.javascriptDialogOpening` (an error text) and counted popups.
+
+| Capability | Helium 0.18.1.1 | Broxser on `main` |
+| --- | --- | --- |
+| `alert`, `confirm`, `prompt` | The page stops. The click that opened the dialog stays unanswered, later pointer input and `Input.insertText` are held until the dialog closes, keys are answered and dropped, `Runtime.evaluate` blocks, no screencast frames. No key event variant, mouse event or 8 s of waiting closes it. `Page.navigate` closes it (result false) and navigates | "The page opened a JavaScript dialog, which Broxser cannot show yet"; frozen frame; Go, Reload and link sync cancelled the dialog silently; the held click counted toward "not responding" |
+| `beforeunload` (page with user interaction) | A link click or `Page.navigate` opens it; navigate waits for the answer, accept continues it, decline answers `net::ERR_ABORTED`; `Page.stopLoading` aborts the navigation and leaves the dialog open | Go on a dirty page: after the 30 s deadline "Navigation got no response…; loading stopped, not retried" with the page still frozen behind the question |
+| `window.open`, `target=_blank`, named popup | `Page.windowOpen` and `Target.targetCreated` (type page, `openerId` = the device, same browser context); the popup loads and keeps running unseen; `Target.closeTarget` closes it and the opener sees `closed` | Counts "N popup(s) not shown"; never closes them |
+| Download link, `download` attribute | `Page.downloadWillBegin` then `downloadProgress canceled` at once; no file anywhere; with `Browser.setDownloadBehavior deny` the same plus `Browser.downloadWillBegin` | Nothing shown; no download behavior set, so the outcome is headless Chromium's default |
+| `<input type=file>` click, scripted `.click()` | Nothing happens; with `Page.setInterceptFileChooserDialog`, `Page.fileChooserOpened` and still nothing | Nothing shown |
+| Geolocation; `Notification.requestPermission()`; `getUserMedia`; clipboard read; fullscreen; `print()` | Denied at once; never resolves (resolves "denied" after `Browser.setPermission denied`); `NotFoundError` (no devices here); `NotAllowedError`; `TypeError`; returns at once | Nothing shown; the page sees the browser's answers |
+| Touch device (`mobile`, touch emulation) | Mouse events arrive as `pointerType=mouse`, no `touchstart`; media `(pointer: coarse)`, `(hover: none)`. `Input.dispatchTouchEvent` gives `pointerType=touch`, `touchstart`/`touchend`, a swipe scrolls; `Input.emulateTouchFromMouseEvent` taps produced nothing | Pointer input is mouse input on every device |
+| Mouse device | `(hover: none)` and `(pointer: none)`: headless has no pointer device; `Emulation.setEmulatedMedia` accepts hover/pointer features without effect | Pages see no hover capability (QA fidelity, P1.7) |
+| HTML5 drag and drop; text selection by drag | `dragstart`, `dragenter`, `drop` with data, `dragend` through mouse events; selection works on the mouse device, not on the touch device | Works as the browser does |
+| Accessibility | — | GPUI 0.2.2 exposes no accessibility tree on Linux; the page's tree is not read |
+
+The first probe run without the ADR 0004 preference again showed the bundled
+blocker reloading a page.
+
+### JavaScript dialogs: before the change
+
+A temporary test through the live runtime on `main` at `6495c2b`, with the new
+fixture pages:
+
+| Step | Result |
+| --- | --- |
+| Click the alert button | Error text shown; 0 frames in the next second |
+| Type `a` into the device | The dialog stays (typing never answers a dialog) |
+| Click the confirm button, then Go | The phone navigated with the others; the page reported `alert closed` (the navigation cancelled the dialog) and never saw its confirm |
+| Type into a page that asks before leaving, then Go with a 3 s load limit | After 4.5 s: "Navigation got no response within 3 seconds; loading stopped, not retried", URL unchanged, 0 frames in the next second, typing changed nothing: the question stayed open behind a frozen frame |
+
+### JavaScript dialogs: after the change
+
+| Check | Result |
+| --- | --- |
+| `dialog_blocks_input_and_navigation_until_the_user_answers` (fake CDP) | Passed: kind, bounded message (`MAX_DIALOG_CHARS` + `…`), no "not responding" past the command limit, keys and text dropped, Go refused for the device with the report and sent to the others, stale token ignored, `Page.handleJavaScriptDialog {accept:false}`, close clears the report, prompt default and `promptText` |
+| `live_dialogs_wait_for_an_explicit_answer` (Helium) | Passed: alert freezes frames; typing and Go leave it open (peers navigate, the phone reports the refusal); a stale token answers nothing; OK resumes the page and its frames and typing reaches the field; confirm false and true, prompt "Broxser" and null, each reported by the page |
+| `live_beforeunload_dialog_needs_an_explicit_leave_or_stay` (Helium, 3 s load limit) | Passed: Go on a dirty page asks and waits 4 s past the limit without an error; Stay keeps the page without an error; Leave navigates; the page's own link asks the same question, Stay and Leave |
+| Both live tests in parallel, 2 threads | 3 of 3 runs passed after the fix below; before it, 1 of 4 and 2 of 2 runs failed |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 66 engine and 24 desktop tests; fmt and strict Clippy; 36 live tests ignored by default |
+| Live Helium suite (`--ignored`, 4 threads) | 36 of 36 passed in 59.0 s. A first run passed 35 and failed `hidden_devices_reject_input_and_sync_without_replay` at its cleanup check, "browser processes still running": two crash handler processes, a renderer and a zombie of one browser stayed until the handlers were killed by hand, the cleanup deadlock recorded under P1.4; the test passed alone |
+| `scripts/desktop-smoke.sh` (debug build, Xvfb, no window manager) | 9 of 9 runs passed, including the new "dialog answered on the card": the card shows "The page asks", the message and Cancel/OK above the frozen frame; OK then Cancel make the page report `confirm=true` and `confirm=false`, and the panel disappears each time; no browser process, profile or window left |
+
+The parallel failures were a test problem worth recording: the test clicked a
+field and typed at once, and under load the key was processed before the click.
+Chromium routes pointer events through its compositor thread and key events to
+the renderer's main thread directly, so a key sent right after a click can overtake
+it. The tests now wait for the field's caret report (ADR 0011) before typing.
+
+The smoke run finds the page's blue button and the panel's orange border in the
+window with XGetImage, clicks them, and reads the page's answers from the fixture
+log. A first version checked that the panel was gone by looking for its border
+once, right after the page's report, before the card had repainted; it now waits
+for the border to be absent.
+
+### Limits
+
+- Popups, downloads, uploads, permissions, touch input and hover media, drag and
+  drop and accessibility keep today's behavior; each is a separate decision. The
+  audit above is their evidence.
+- A prompt's text field is the URL bar's single-line field: no IME composition,
+  partial selection or copy.
+- Dialogs opened by a subframe are reported for the device like the main frame's;
+  the panel does not say which frame asked.
+- A dialog on a hidden device is answered only after showing the device; hiding
+  does not answer it.
+
 ## P1.5 modern application navigation, 26 September 2026 (cloud container)
 
 Same container as P1.4: Helium 0.18.1.1 (Chrome/154.0.8037.57, protocol 1.3),

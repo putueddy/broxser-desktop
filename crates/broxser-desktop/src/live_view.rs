@@ -10,9 +10,9 @@ use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE,
 use anyhow::{Context as _, Result};
 use broxser_core::{Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, Frame, ImeAction, KeyInput, LiveSession,
-    MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent, PointerKind,
-    RuntimeState, Status, SyncSettings, is_paste_key, paste_text, to_viewport,
+    BrowserOptions, Cancellation, Command, DialogKind, DialogState, Frame, ImeAction, KeyInput,
+    LiveSession, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent,
+    PointerKind, RuntimeState, Status, SyncSettings, is_paste_key, paste_text, to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -143,6 +143,15 @@ struct DeviceView {
     /// Held buttons as a CDP bitmask, and the last mapped pointer position.
     buttons: u8,
     last_point: Option<(f64, f64)>,
+    /// Text field of the open prompt dialog; it lives while that dialog does.
+    prompt: Option<PromptField>,
+}
+
+struct PromptField {
+    token: u64,
+    input: Entity<UrlInput>,
+    /// Enter in the field accepts the prompt with its text.
+    _submit: Subscription,
 }
 
 /// Whether the last paint showed part of a device frame in the scrolled canvas,
@@ -361,6 +370,7 @@ impl LiveView {
                     .update(cx, |input, cx| input.show(&url, window, cx));
             }
             self.status = status;
+            self.sync_prompts(cx);
             if former_caret != next_caret {
                 window.invalidate_character_coordinates();
             }
@@ -426,6 +436,148 @@ impl LiveView {
             self.notice = Some("The live runtime is not accepting commands.".into());
         }
         accepted
+    }
+
+    /// Gives each open prompt dialog a text field prefilled with the page's
+    /// proposal, and drops the field once its dialog is gone.
+    fn sync_prompts(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.devices.len() {
+            let prompt = self.status.devices.get(index).and_then(|status| {
+                status
+                    .dialog
+                    .as_ref()
+                    .filter(|dialog| dialog.kind == DialogKind::Prompt)
+            });
+            let current = self.devices[index].prompt.as_ref().map(|field| field.token);
+            match prompt {
+                Some(dialog) if current != Some(dialog.token) => {
+                    let token = dialog.token;
+                    let default_text = dialog.default_text.clone();
+                    let input = cx.new(|cx| UrlInput::new(default_text, cx));
+                    let submit = cx.subscribe(&input, move |view, _, event: &UrlEvent, cx| {
+                        let UrlEvent::Submit(text) = event;
+                        view.answer_dialog(index, token, true, Some(text.clone()), cx);
+                    });
+                    self.devices[index].prompt = Some(PromptField {
+                        token,
+                        input,
+                        _submit: submit,
+                    });
+                }
+                Some(_) => {}
+                None => self.devices[index].prompt = None,
+            }
+        }
+    }
+
+    /// The user's answer to the dialog `token` of device `index`. An accepted
+    /// prompt takes `text`, or the field's text when `text` is `None`.
+    fn answer_dialog(
+        &mut self,
+        index: usize,
+        token: u64,
+        accept: bool,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = match text {
+            Some(text) => Some(text),
+            None if accept => self
+                .devices
+                .get(index)
+                .and_then(|device| device.prompt.as_ref())
+                .filter(|field| field.token == token)
+                .map(|field| field.input.read(cx).text().to_owned()),
+            None => None,
+        };
+        self.notice = None;
+        self.send(Command::AnswerDialog {
+            device: index,
+            token,
+            accept,
+            text,
+        });
+        cx.notify();
+    }
+
+    /// The device's open dialog. Only these buttons, or Enter in the prompt's
+    /// field, answer it (ADR 0014).
+    fn dialog_panel(
+        &self,
+        index: usize,
+        dialog: &DialogState,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let token = dialog.token;
+        let (title, message): (&str, SharedString) = match dialog.kind {
+            DialogKind::Alert => ("The page says", dialog.message.clone().into()),
+            DialogKind::Confirm => ("The page asks", dialog.message.clone().into()),
+            DialogKind::Prompt => ("The page asks for text", dialog.message.clone().into()),
+            DialogKind::BeforeUnload => (
+                "Leave this page?",
+                "The page may have changes you have not saved.".into(),
+            ),
+        };
+        let button = |id: &'static str, label: &'static str, accept: bool, primary: bool| {
+            div()
+                .id((id, index))
+                .cursor_pointer()
+                .rounded_md()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .bg(rgb(if primary { ACCENT } else { RAISED }))
+                .text_color(rgb(if primary { BG } else { TEXT }))
+                .child(label)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.answer_dialog(index, token, accept, None, cx)
+                }))
+        };
+        let buttons = match dialog.kind {
+            DialogKind::Alert => vec![button("dialog-ok", "OK", true, true)],
+            DialogKind::Confirm | DialogKind::Prompt => vec![
+                button("dialog-cancel", "Cancel", false, false),
+                button("dialog-ok", "OK", true, true),
+            ],
+            DialogKind::BeforeUnload => vec![
+                button("dialog-stay", "Stay", false, true),
+                button("dialog-leave", "Leave", true, false),
+            ],
+        };
+        let field = self.devices[index]
+            .prompt
+            .as_ref()
+            .filter(|field| field.token == token)
+            .map(|field| field.input.clone());
+        div()
+            .w(px(width))
+            .mb_3()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(WARN))
+            .bg(rgb(SURFACE))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(WARN))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .max_h(px(120.))
+                    .overflow_hidden()
+                    .child(message),
+            )
+            .when_some(field, |this, field| this.child(field))
+            .child(div().flex().gap_2().justify_end().children(buttons))
+            .into_any_element()
     }
 
     fn navigate(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1087,6 +1239,9 @@ impl LiveView {
                             .child(state),
                     ),
             )
+            .when_some(status.dialog.clone(), |this, dialog| {
+                this.child(self.dialog_panel(index, &dialog, width.max(180.), cx))
+            })
             .child(
                 div()
                     .id(("frame", index))

@@ -27,9 +27,10 @@ pub use capture::{CaptureFrame, CaptureReport, capture_workspace};
 pub use cdp::{Cancellation, Cancelled};
 pub use guardian::run_guardian_if_requested;
 pub use live::{
-    CaretRect, Command, DeviceStatus, Frame, ImeAction, KeyInput, LiveSession, MAX_PASTE_CHARS,
-    Modifiers, PasteRejected, PointerButton, PointerEvent, PointerKind, RuntimeState, Status,
-    SyncSettings, TextInputState, is_paste_key, paste_text, to_viewport,
+    CaretRect, Command, DeviceStatus, DialogKind, DialogState, Frame, ImeAction, KeyInput,
+    LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton,
+    PointerEvent, PointerKind, RuntimeState, Status, SyncSettings, TextInputState, is_paste_key,
+    paste_text, to_viewport,
 };
 
 /// Per-operation deadlines. These are not an SLA for a whole job.
