@@ -154,7 +154,7 @@ berjalan. Sisa di luar lingkup: navigasi yang dimulai halaman tidak dihentikan,
 tidak ada deadline load setelah commit di live, heartbeat browser, dan deadline job
 capture.
 
-**Status P1.2 (25 September 2026, menunggu review PR):** keputusan ada di
+**Status P1.2 (25 September 2026, merged melalui PR #9):** keputusan ada di
 [ADR 0009](docs/adr/0009-serialized-live-runtime-transitions.md). Reproducer window
 X11 pada `f947727` membuktikan bahwa Restart yang diklik dua kali meluncurkan dua
 browser dan menghentikan satu lewat drop di thread UI, dan bahwa Restart yang
@@ -166,6 +166,22 @@ Frame lama tidak tercapai dari UI pada kecepatan manusia; generation dan unit te
 menjaganya. `scripts/desktop-smoke.sh` kini menguji Restart ganda, dengan dan tanpa
 Ctrl+Q. Sisa di luar lingkup: Restart untuk runtime yang masih berjalan, serta
 pemeriksaan Wayland dan GPU fisik untuk jalur ini.
+
+**Status P1.3 (26 September 2026, sebagian; menunggu review PR):** keputusan dan
+pengukuran ada di [ADR 0010](docs/adr/0010-keyboard-identity-and-explicit-paste.md).
+Reproducer window X11 pada `4c2d5c1` membuktikan bahwa key-up yang namanya berubah
+(Shift dilepas lebih dulu pada layout Jerman) membuat tombol macet dan tekanan
+berikutnya hilang, dead key mengetik tebakan ASCII dan karakter komposisi hilang,
+Ctrl+V atau klik tengah menempelkan salinan dari session lain, Ctrl+W di phone
+menutup tablet, dan Ctrl+Shift+M menghentikan seluruh runtime. Kini setiap tekanan
+di window dicatat dan dipasangkan dengan key-up-nya, repeat hanya key-down terakhir,
+dead key dan karakter komposisi dikirim benar, F-key diteruskan, tombol yang oleh
+Helium dijadikan perintah browser serta tombol paste dan klik tengah tidak
+diteruskan, dan paste menyisipkan teks clipboard sistem hanya ke device terpilih
+yang terlihat. Sisa: komposisi IME dan penempatan caret (butuh input handler pada
+canvas dan IME untuk verifikasi), copy ke clipboard sistem, pengukuran ulang daftar
+tombol browser pada setiap update Helium, serta pemeriksaan Wayland dan keyboard
+fisik.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -249,7 +265,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   (ADR 0007; merged melalui PR #6; sisa temp dir non-profil tercatat di status P0).
 - [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates
   (P1.1 deadline command dan navigasi live: ADR 0008, merged melalui PR #7; P1.2
-  transisi Restart dan close: ADR 0009, PR menunggu review).
+  transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, tombol
+  browser dan paste eksplisit: ADR 0010, PR menunggu review, komposisi IME belum).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

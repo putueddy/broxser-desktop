@@ -7,9 +7,9 @@ serta gunakan halamannya dari satu window native.
 **Status: spike M1.** Desktop menampilkan **frame live** dari Helium headless (CDP
 screencast) untuk setiap device, dengan URL bar, reload, input pointer/wheel/keyboard
 dan sync link/scroll opt-in di dalam satu session. Ini frame streaming ke window
-native, bukan browser tertanam: IME, clipboard halaman, popup, download, permission,
-dialog JavaScript dan aksesibilitas belum didukung, dan frame device DPR>1 tiba pada
-resolusi CSS. Belum ada persistent login, DevTools panel atau console aggregator.
+native, bukan browser tertanam: IME, copy ke clipboard sistem, paste selain teks,
+popup, download, permission, dialog JavaScript dan aksesibilitas belum didukung, dan
+frame device DPR>1 tiba pada resolusi CSS. Belum ada persistent login, DevTools panel atau console aggregator.
 Ini belum pengganti Sizzy. Mode capture statis tetap tersedia lewat `--static`.
 
 Masalah halaman lambat yang dulu menghasilkan `net::ERR_ABORTED` sudah dijelaskan:
@@ -57,8 +57,9 @@ deterministik untuk capture statis.
 | --- | --- |
 | `Ctrl+L`, ketik, `Enter` / **Go** | Navigasi semua device satu kali; tanpa skema diawali `http://` |
 | Klik device | Memilih device; pointer dan wheel ke device di bawah kursor |
-| Keyboard | Ke device terpilih yang terlihat; `Ctrl+Q/R/L` tetap pintasan Broxser |
-| **Reload** / `Ctrl+R` | Reload device terpilih saja |
+| Keyboard | Ke device terpilih yang terlihat; `Ctrl+Q/R/L` dan `F5` tetap pintasan Broxser. Tombol yang oleh Helium dijadikan perintah browser (menutup tab/window seperti `Ctrl+W` atau `Alt+F4`, tab baru, DevTools, reload, `Alt+←`) tidak diteruskan ke halaman |
+| `Ctrl+V` / `Shift+Insert` / `Ctrl+Shift+V` | Menyisipkan teks clipboard sistem (maks. 65.536 karakter) ke device terpilih yang terlihat, sekali per tekan; halaman tidak menerima event `paste` dan tidak pernah membaca clipboard browser yang dipakai bersama semua session. Klik tengah tidak diteruskan |
+| **Reload** / `Ctrl+R` / `F5` | Reload device terpilih saja |
 | **Sync links** / **Sync scroll** | Opt-in, hanya antar-device terlihat dalam session yang sama; link memerlukan aktivasi tepercaya dan navigasi yang cocok |
 | **Hide** di sidebar | Menghentikan stream dan input; memilih device terlihat lain, atau tanpa target keyboard bila semuanya disembunyikan |
 | `+` / `−` | Skala tampilan; frame diminta sebesar ukuran tampilan |
@@ -72,7 +73,7 @@ event tak terjawab, ditandai *not responding*: input baru untuk device itu dibua
 bukan diantrekan, sampai halaman menjawab lagi. Device lain tetap berjalan. Lihat
 [ADR 0008](docs/adr/0008-live-command-and-navigation-deadlines.md).
 
-Mode statis: tambahkan `--static`, lalu **Capture previews** atau `Ctrl+R`; opsi
+Mode statis: tambahkan `--static`, lalu **Capture previews**, `Ctrl+R` atau `F5`; opsi
 `--capture-on-start` hanya untuk mode ini. Menutup window saat capture berjalan
 membatalkannya dan menunggu cleanup (sekitar setengah detik). URL dapat diganti
 lewat `--url http://localhost:3000` atau file workspace.
@@ -208,9 +209,10 @@ dan backup; bukan janji bahwa API framework hari ini akan tetap sama sampai 2036
 
 Handoff dan backlog aktif untuk Claude Code ada di [GOALS.md](GOALS.md). Cleanup
 ketika proses induk mati (P0) diimplementasikan melalui guardian dan lease profil,
-deadline command dan navigasi live (P1.1) melalui ADR 0008, dan transisi restart
-runtime (P1.2) melalui ADR 0009; prioritas berikutnya ialah kualifikasi keyboard,
-IME dan clipboard, resource, serta workflow harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
+deadline command dan navigasi live (P1.1) melalui ADR 0008, transisi restart
+runtime (P1.2) melalui ADR 0009, serta keyboard, tombol browser dan paste
+eksplisit (P1.3) melalui ADR 0010; prioritas berikutnya ialah komposisi IME,
+resource, serta workflow harian M2. Regresi UI X11 dan Wayland 112,5% sudah diperiksa; matriks
 hardware dan pengukuran performa lebih luas masih diperlukan sebelum pilot dan
 evaluasi penggantian subscription.
 Biaya maintenance internal perlu dibandingkan dengan penghematan seat berdasarkan

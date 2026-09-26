@@ -53,6 +53,9 @@ navigation requested by the user, rather than forwarded or synchronized page inp
 Released keys stay suppressed until their matching key-up, including X11 repeats
 whose GPUI `is_held` flag is false. GPUI does not expose physical keycodes; unusual
 keyboard layouts and lost OS key-up events remain platform qualification limits.
+ADR 0010 replaces the name-only match: every press in the window is tracked, a
+release under another name ends the latest press whose name can change, and only
+the latest key-down counts as repeating.
 
 ## Related transport guarantees
 
