@@ -249,8 +249,19 @@ dengan field teks; Stay/Leave); jawaban memakai token dialog sehingga jawaban ya
 terlambat tidak mengenai dialog berikutnya; input ke device itu dibuang selama
 dialog terbuka; navigasi Broxser untuk device itu ditolak dengan pesan; deadline
 *not responding* dan navigasi dijeda; Stay mengakhiri navigasi Broxser tanpa error
-dan Leave melanjutkannya. Tidak ada jawaban otomatis. Kapabilitas berikutnya,
-masing-masing PR sendiri: popup (tutup dan laporkan URL), download dan pemilih file
+dan Leave melanjutkannya. Tidak ada jawaban otomatis.
+
+Kapabilitas kedua, popup ([ADR 0015](docs/adr/0015-popups-closed-and-reported.md),
+PR terpisah): run pada `06e0f5d` membuktikan bahwa jendela yang dibuka halaman
+berjalan tanpa terlihat dengan cookie session, memindahkan opener-nya (phone
+berpindah ke `/hijacked`) dan tetap hidup setelah halaman pembukanya pergi. Kini
+setiap target page dengan opener di context session Broxser ditutup begitu browser
+melaporkannya, device pembukanya menampilkan "Closed a window the page opened"
+dengan alamatnya, dan hanya "Open here" (token, alamat HTTP(S) utuh dalam batas
+navigasi) yang memuat alamat itu di device tersebut. Request dokumen pertama
+jendela tetap terkirim dan script-nya sesekali sempat mulai; auto-attach level
+browser yang menahan jendela sebelum berjalan tercatat sebagai opsi yang lebih
+kuat. Kapabilitas berikutnya, masing-masing PR sendiri: download dan pemilih file
 (blokir dan laporkan; tetapkan `setDownloadBehavior deny` per context), permission
 notifikasi (tolak eksplisit agar promise tidak menggantung), input touch untuk
 device touch (`Input.dispatchTouchEvent`), lalu dokumentasi batas hover/pointer
@@ -341,8 +352,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, IME dan
   paste eksplisit: ADR 0010/0011, merged melalui PR #10; P1.4 frame dan resource:
   ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, merged
-  melalui PR #13; P1.6 dialog JavaScript: ADR 0014, PR #14 menunggu review,
-  kapabilitas lain menyusul).
+  melalui PR #13; P1.6 dialog JavaScript: ADR 0014, PR #14 menunggu review; popup:
+  ADR 0015, PR menyusul setelah PR #14; kapabilitas lain menyusul).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

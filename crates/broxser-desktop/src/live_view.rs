@@ -12,8 +12,8 @@ use broxser_core::{Workspace, validate_url};
 use broxser_engine::{
     BrowserOptions, Cancellation, Command, DialogKind, DialogState, Frame, ImeAction, KeyInput,
     LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton,
-    PointerEvent, PointerKind, RuntimeState, Status, SyncSettings, is_paste_key, paste_text,
-    to_viewport,
+    PointerEvent, PointerKind, PopupState, RuntimeState, Status, SyncSettings, is_paste_key,
+    paste_text, to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -157,6 +157,8 @@ struct DeviceView {
     last_point: Option<(f64, f64)>,
     /// Text field of the open prompt dialog; it lives while that dialog does.
     prompt: Option<PromptField>,
+    /// Token of the closed-window report the user dismissed.
+    dismissed_popup: Option<u64>,
 }
 
 struct PromptField {
@@ -1432,12 +1434,101 @@ impl LiveView {
                         "{} frames · {} replaced",
                         status.frames, status.dropped_frames
                     ))
-                    .child(if status.popups > 0 {
-                        format!("{} popup(s) not shown", status.popups)
-                    } else if status.streaming {
-                        "Streaming".into()
-                    } else {
-                        "Paused".into()
+                    .child(match (status.popups, status.streaming) {
+                        (0, true) => "Streaming".to_owned(),
+                        (0, false) => "Paused".to_owned(),
+                        (closed, true) => format!("Streaming · {closed} window(s) closed"),
+                        (closed, false) => format!("Paused · {closed} window(s) closed"),
+                    }),
+            )
+            .when_some(
+                status
+                    .popup
+                    .clone()
+                    .filter(|popup| view.dismissed_popup != Some(popup.token)),
+                |this, popup| this.child(self.popup_notice(index, &popup, width.max(180.), cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The latest window the device's page opened, which Broxser closed
+    /// (ADR 0015). Opening it loads its URL in this device; nothing opens it
+    /// otherwise.
+    fn popup_notice(
+        &self,
+        index: usize,
+        popup: &PopupState,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let token = popup.token;
+        let url: SharedString = if popup.url.is_empty() {
+            "(no address)".into()
+        } else {
+            popup.url.clone().into()
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id((id, index))
+                .cursor_pointer()
+                .rounded_md()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .bg(rgb(if primary { ACCENT } else { RAISED }))
+                .text_color(rgb(if primary { BG } else { TEXT }))
+                .child(label)
+        };
+        div()
+            .w(px(width))
+            .mt_2()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_xs()
+            .child(
+                div()
+                    .text_color(rgb(MUTED))
+                    .child("Closed a window the page opened"),
+            )
+            .child(
+                div()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(url),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        button("popup-dismiss", "Dismiss", false).on_click(cx.listener(
+                            move |view, _, _, cx| {
+                                view.devices[index].dismissed_popup = Some(token);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(popup.openable, |this| {
+                        this.child(
+                            button("popup-open", "Open here", true).on_click(cx.listener(
+                                move |view, _, _, cx| {
+                                    view.notice = None;
+                                    view.send(Command::OpenPopup {
+                                        device: index,
+                                        token,
+                                    });
+                                    cx.notify();
+                                },
+                            )),
+                        )
                     }),
             )
             .into_any_element()

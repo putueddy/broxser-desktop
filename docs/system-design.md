@@ -199,7 +199,10 @@ bukan jaringan: engine melaporkan jenis, pesan (dibatasi, hanya ditampilkan) dan
 token dialog; desktop menampilkannya di kartu device dengan jawaban yang dimiliki
 dialog itu, dan hanya `Command::AnswerDialog` dengan token yang cocok yang
 menjawabnya. Selama dialog terbuka, input ke device itu dibuang, navigasi Broxser
-untuknya ditolak dengan pesan, dan kedua deadline dijeda (ADR 0014).
+untuknya ditolak dengan pesan, dan kedua deadline dijeda (ADR 0014). Jendela yang
+dibuka halaman di context session Broxser ditutup begitu browser melaporkannya
+dan dilaporkan pada device pembukanya dengan alamat dan token; hanya
+`Command::OpenPopup` yang memuat alamat utuhnya di device itu (ADR 0015).
 
 ## 6. API and data contracts
 

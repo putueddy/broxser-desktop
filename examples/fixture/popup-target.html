@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broxser popup target</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #16a34a; }
+</style>
+</head>
+<body>
+<script>
+  // The smoke check reads these reports from the fixture server's request log:
+  // "popup" while the page runs as a window with an opener, "page" when a device
+  // loaded it itself.
+  const role = window.opener ? 'popup' : 'page';
+  setInterval(() => fetch('/event?popup-alive=' + role), 250);
+</script>
+</body>
+</html>
