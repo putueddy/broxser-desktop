@@ -982,7 +982,8 @@ const KEYS_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport conten
 <script>
 const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth, ...data}));
 addEventListener('mousedown', e => report('down', {button: e.button, buttons: e.buttons}), true);
-area.addEventListener('keydown', e => report('keydown', {key: e.key, code: e.code}));
+let keys = 0;
+area.addEventListener('keydown', e => report('keydown', {key: e.key, code: e.code, n: ++keys}));
 area.addEventListener('paste', e => report('paste', {data: e.clipboardData.getData('text')}));
 area.addEventListener('input', e => report('input', {v: area.value, type: e.inputType}));
 </script></body></html>"#;
@@ -1750,6 +1751,18 @@ fn live_session_input_reaches_the_right_device() {
     live.close();
 }
 
+/// Keys in the order the page's listener saw them. Each report is its own
+/// request, so reports can reach the fixture out of order.
+fn reported_keys(events: &[HashMap<String, String>]) -> Vec<String> {
+    let mut events: Vec<&HashMap<String, String>> = events.iter().collect();
+    events.sort_by_key(|event| {
+        event["n"]
+            .parse::<u32>()
+            .expect("key reports carry their order")
+    });
+    events.iter().map(|event| event["key"].clone()).collect()
+}
+
 fn has_input(fixture: &Fixture, width: &str, value: &str) -> bool {
     events(fixture, "input")
         .iter()
@@ -1877,11 +1890,7 @@ fn live_paste_is_explicit_and_never_reads_the_shared_browser_clipboard() {
         has_input(fixture, "1000", "pasted é\n2é")
     }));
     assert!(fixture.wait_for(Duration::from_secs(5), |_| {
-        let keys: Vec<String> = desktop("keydown")
-            .into_iter()
-            .map(|event| event["key"].clone())
-            .collect();
-        keys == ["é", "F2"]
+        reported_keys(&desktop("keydown")) == ["é", "F2"]
     }));
 
     // Nothing is inserted into a hidden device, or later when it is shown,
@@ -2064,11 +2073,11 @@ fn live_browser_command_keys_never_reach_the_browser() {
             (fixture.url("/keys").as_str(), None)
         );
     }
-    let keys: Vec<String> = events(&fixture, "keydown")
-        .iter()
-        .map(|event| event["key"].clone())
-        .collect();
-    assert_eq!(keys, ["o", "k"], "browser keys must not reach pages");
+    assert_eq!(
+        reported_keys(&events(&fixture, "keydown")),
+        ["o", "k"],
+        "browser keys must not reach pages"
+    );
     assert_eq!(count(&fixture, "/keys"), 3, "no reload and no view-source");
     assert_eq!(
         count(
