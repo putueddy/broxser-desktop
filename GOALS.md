@@ -217,7 +217,7 @@ tercatat di validation. Pemeriksaan upstream sesudahnya (PR #13): Zed `main` sud
 memperbaiki race atlas yang sama pada renderer wgpu penggantinya, tetapi belum ada
 rilis `gpui` sesudah 0.2.2, sehingga patch vendor tetap dipakai.
 
-**Status P1.5 (26 September 2026, menunggu review PR):** keputusan ada di
+**Status P1.5 (26 September 2026, merged melalui PR #13):** keputusan ada di
 [ADR 0013](docs/adr/0013-modern-navigation-sync.md), bukti di `docs/validation.md`.
 Probe CDP pada Helium 0.18.1.1 dan survei `main` `e2bf9cb` membuktikan bahwa link
 yang di-redirect server (302/307, berantai, lintas origin, ke fragment) dan link ke
@@ -340,9 +340,9 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   (P1.1 deadline command dan navigasi live: ADR 0008, merged melalui PR #7; P1.2
   transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, IME dan
   paste eksplisit: ADR 0010/0011, merged melalui PR #10; P1.4 frame dan resource:
-  ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, PR
-  menunggu review; P1.6 dialog JavaScript: ADR 0014, PR menunggu review, kapabilitas
-  lain menyusul).
+  ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, merged
+  melalui PR #13; P1.6 dialog JavaScript: ADR 0014, PR #14 menunggu review,
+  kapabilitas lain menyusul).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.
