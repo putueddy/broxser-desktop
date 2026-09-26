@@ -56,8 +56,207 @@ fn keys_map_to_dom_values_and_text() {
     )
     .unwrap();
     assert!(control.text.is_none(), "shortcuts must not insert text");
-    assert!(KeyInput::from_key("f5", None, none, true).is_none());
+    assert_eq!(control.key, "c");
+    for (name, key, key_code) in [
+        ("f5", "F5", 116),
+        ("f12", "F12", 123),
+        ("insert", "Insert", 45),
+    ] {
+        let named = KeyInput::from_key(name, None, none, true).unwrap();
+        assert_eq!(
+            (
+                named.key.as_str(),
+                named.code.as_str(),
+                named.key_code,
+                named.text
+            ),
+            (key, key, key_code, None)
+        );
+    }
+    assert!(KeyInput::from_key("f13", None, none, true).is_none());
+    assert!(KeyInput::from_key("back", None, none, true).is_none());
     assert!(KeyInput::from_key("\u{7}", None, none, true).is_none());
+}
+
+/// GPUI names a dead key `dead_acute`, or guesses an ASCII name for its
+/// position without a character (`'`), and names the composed character
+/// after its keysym (`eacute`). Measured on a German X11 layout (ADR 0010).
+#[test]
+fn dead_keys_type_nothing_and_composed_characters_are_typed() {
+    let none = Modifiers::default();
+    for (name, down) in [("dead_acute", true), ("dead_acute", false), ("'", true)] {
+        let dead = KeyInput::from_key(name, None, none, down).unwrap();
+        assert_eq!(
+            (
+                dead.key.as_str(),
+                dead.code.as_str(),
+                dead.key_code,
+                dead.text
+            ),
+            ("Dead", "", 0, None),
+            "{name}"
+        );
+    }
+    let composed = KeyInput::from_key("eacute", Some("é"), none, true).unwrap();
+    assert_eq!(
+        (
+            composed.key.as_str(),
+            composed.code.as_str(),
+            composed.key_code
+        ),
+        ("é", "", 0)
+    );
+    assert_eq!(composed.text.as_deref(), Some("é"));
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    let shortcut = KeyInput::from_key("eacute", Some("é"), control, true).unwrap();
+    assert_eq!(shortcut.text, None);
+    // With a shortcut modifier the ASCII name is the key, as before.
+    let guessed = KeyInput::from_key("'", None, control, true).unwrap();
+    assert_eq!(guessed.key, "'");
+    // A German key typing a non-ASCII character keeps working.
+    let umlaut = KeyInput::from_key(";", Some("ö"), none, true).unwrap();
+    assert_eq!(
+        (umlaut.key.as_str(), umlaut.text.as_deref()),
+        ("ö", Some("ö"))
+    );
+}
+
+#[test]
+fn paste_keys_are_recognized_and_pasted_text_is_bounded() {
+    let key =
+        |name: &str, modifiers: Modifiers| KeyInput::from_key(name, None, modifiers, true).unwrap();
+    let none = Modifiers::default();
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    let shift = Modifiers {
+        shift: true,
+        ..none
+    };
+    assert!(is_paste_key(&key("v", control)));
+    assert!(is_paste_key(&key(
+        "v",
+        Modifiers {
+            shift: true,
+            ..control
+        }
+    )));
+    assert!(is_paste_key(&key("insert", shift)));
+    for (name, modifiers) in [
+        ("v", none),
+        (
+            "v",
+            Modifiers {
+                alt: true,
+                ..control
+            },
+        ),
+        ("v", Modifiers { meta: true, ..none }),
+        ("insert", control),
+        ("insert", none),
+        ("c", control),
+    ] {
+        assert!(!is_paste_key(&key(name, modifiers)), "{name} {modifiers:?}");
+    }
+    assert_eq!(
+        paste_text("a\u{0}b\r\nc\td\u{7f}").as_deref(),
+        Ok("ab\r\nc\td")
+    );
+    assert_eq!(paste_text(""), Err(PasteRejected::Empty));
+    assert_eq!(paste_text("\u{7}\u{1b}"), Err(PasteRejected::Empty));
+    let longest = "x".repeat(MAX_PASTE_CHARS);
+    assert_eq!(paste_text(&longest).as_deref(), Ok(longest.as_str()));
+    assert_eq!(
+        paste_text(&format!("{longest}é")),
+        Err(PasteRejected::TooLong(MAX_PASTE_CHARS + 1))
+    );
+}
+
+#[test]
+fn keys_that_helium_turns_into_browser_commands_are_recognized() {
+    let key = |name: &str, modifiers: Modifiers| {
+        let shortcut = modifiers.control || modifiers.alt || modifiers.meta;
+        let typed = (name.chars().count() == 1 && !shortcut).then_some(name);
+        KeyInput::from_key(name, typed, modifiers, true).unwrap()
+    };
+    let none = Modifiers::default();
+    let shift = Modifiers {
+        shift: true,
+        ..none
+    };
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    let control_shift = Modifiers {
+        shift: true,
+        ..control
+    };
+    let alt = Modifiers { alt: true, ..none };
+    for (name, modifiers) in [
+        ("w", control),
+        ("f4", control),
+        ("w", control_shift),
+        ("f4", alt),
+        ("q", control_shift),
+        ("m", control_shift),
+        ("t", control),
+        ("n", control),
+        ("n", control_shift),
+        ("t", control_shift),
+        ("u", control),
+        ("j", control),
+        ("o", control_shift),
+        ("delete", control_shift),
+        ("a", control_shift),
+        ("f12", none),
+        ("i", control_shift),
+        ("j", control_shift),
+        ("f5", none),
+        ("f5", shift),
+        ("f5", control),
+        ("r", control),
+        ("r", control_shift),
+        ("left", alt),
+        ("right", alt),
+        ("home", alt),
+    ] {
+        assert!(
+            is_browser_key(&key(name, modifiers)),
+            "{name} {modifiers:?}"
+        );
+    }
+    for (name, modifiers) in [
+        ("a", control),
+        ("c", control),
+        ("x", control),
+        ("z", control),
+        ("z", control_shift),
+        ("c", control_shift),
+        ("s", control),
+        ("p", control),
+        ("f", control),
+        ("h", control),
+        ("l", control),
+        ("tab", control),
+        ("left", control),
+        ("w", none),
+        ("r", shift),
+        ("f4", none),
+        ("f1", none),
+        ("f2", none),
+        ("escape", none),
+        ("f12", Modifiers { meta: true, ..none }),
+    ] {
+        assert!(
+            !is_browser_key(&key(name, modifiers)),
+            "{name} {modifiers:?}"
+        );
+    }
 }
 
 #[test]
@@ -671,6 +870,18 @@ document.getElementById('field').addEventListener('input', e => report('input', 
 AUTO
 </script></body></html>"#;
 
+/// Reports what reaches a text area: keys, pastes, input and mouse buttons.
+const KEYS_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>html,body{margin:0}#area{position:absolute;left:20px;top:200px;width:300px;height:80px}</style></head><body>
+<textarea id=area></textarea>
+<script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth, ...data}));
+addEventListener('mousedown', e => report('down', {button: e.button, buttons: e.buttons}), true);
+area.addEventListener('keydown', e => report('keydown', {key: e.key, code: e.code}));
+area.addEventListener('paste', e => report('paste', {data: e.clipboardData.getData('text')}));
+area.addEventListener('input', e => report('input', {v: area.value, type: e.inputType}));
+</script></body></html>"#;
+
 fn fixture() -> Fixture {
     Fixture::start(|request, _| {
         let path = request.path.split('?').next().unwrap_or("/");
@@ -687,6 +898,7 @@ fn fixture() -> Fixture {
             "/parent-editable" => "<div contenteditable=true><a id=a href=/next style='display:block;width:160px;height:40px'>edit</a></div><a id=hidden href=/next style='display:none'>hidden</a><script>a.addEventListener('click',e=>{if(e.isTrusted)hidden.click()});</script>".into(),
             "/nested-button" => "<a href=/next style='display:block;width:160px;height:40px'><button id=b style='width:160px;height:40px'>button</button></a><script>b.addEventListener('click',e=>{if(e.isTrusted)document.querySelector('a').click()});</script>".into(),
             "/keyboard" => PAGE.replace("AUTO", "document.getElementById('link').href = '/keyboard-dest'; document.getElementById('link').focus();"),
+            "/keys" => KEYS_PAGE.into(),
             "/slowstart" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow';"),
             "/supersede" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow'; document.getElementById('link').addEventListener('click', () => setTimeout(() => location.href = '/supersede-dest', 100));"),
             "/longstart" => PAGE.replace("AUTO", &format!("document.getElementById('link').href = '/long?token={}';", "x".repeat(2300))),
@@ -906,11 +1118,28 @@ fn events(fixture: &Fixture, kind: &str) -> Vec<HashMap<String, String>> {
             query
                 .split('&')
                 .filter_map(|pair| pair.split_once('='))
-                .map(|(key, value)| (key.to_owned(), value.replace("%2F", "/")))
+                .map(|(key, value)| (key.to_owned(), query_value(value)))
                 .collect::<HashMap<_, _>>()
         })
         .filter(|event| event.get("kind").map(String::as_str) == Some(kind))
         .collect()
+}
+
+/// Decodes a `URLSearchParams` value.
+fn query_value(value: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut input = value.bytes();
+    while let Some(byte) = input.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let hex: String = input.by_ref().take(2).map(char::from).collect();
+                bytes.push(u8::from_str_radix(&hex, 16).unwrap());
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
 fn click(live: &Live, device: usize, x: f64, y: f64) {
@@ -1080,6 +1309,338 @@ fn live_session_input_reaches_the_right_device() {
         "typed text did not reach the desktop input"
     );
     assert_eq!(count(&fixture, "/"), 3, "input must not navigate");
+    live.close();
+}
+
+fn has_input(fixture: &Fixture, width: &str, value: &str) -> bool {
+    events(fixture, "input")
+        .iter()
+        .any(|event| event["w"] == width && event["v"] == value)
+}
+
+/// Before ADR 0010 a copy in the Guest phone was pasted into the Admin
+/// desktop by Ctrl+V, and a selection there by a middle click.
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_paste_is_explicit_and_never_reads_the_shared_browser_clipboard() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/keys")));
+    live.wait("pages", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/keys")
+    });
+    let none = Modifiers::default();
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    let press = |device: usize, name: &str, typed: Option<&str>, modifiers: Modifiers| {
+        for down in [true, false] {
+            let key = KeyInput::from_key(name, typed, modifiers, down).unwrap();
+            live.send(Command::Key { device, key });
+        }
+    };
+    let pointer = |device: usize, kind, button, buttons| {
+        live.send(Command::Pointer {
+            device,
+            event: PointerEvent {
+                kind,
+                x: 60.0,
+                y: 230.0,
+                button,
+                buttons,
+                click_count: 1,
+                modifiers: none,
+            },
+        });
+    };
+    click(&live, 0, 40.0, 210.0);
+    click(&live, 2, 40.0, 210.0);
+    assert!(fixture.wait_for(
+        Duration::from_secs(5),
+        |fixture| events(fixture, "down").len() == 2
+    ));
+
+    // Copied and still selected in the Guest phone: the browser's clipboard
+    // and selection buffer, which all sessions of the browser share.
+    for name in ["s", "e", "c", "r", "e", "t"] {
+        press(0, name, Some(name), none);
+    }
+    press(0, "a", None, control);
+    press(0, "c", None, control);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        has_input(fixture, "360", "secret")
+    }));
+
+    // Paste keys and middle clicks in the Admin desktop reach no page.
+    press(2, "v", None, control);
+    press(
+        2,
+        "v",
+        None,
+        Modifiers {
+            shift: true,
+            ..control
+        },
+    );
+    press(
+        2,
+        "insert",
+        None,
+        Modifiers {
+            shift: true,
+            ..none
+        },
+    );
+    pointer(2, PointerKind::Down, PointerButton::Middle, 4);
+    pointer(2, PointerKind::Up, PointerButton::Middle, 0);
+    // A left click with the middle button still held shows no middle button.
+    pointer(2, PointerKind::Down, PointerButton::Left, 5);
+    pointer(2, PointerKind::Up, PointerButton::Left, 4);
+    // An explicit paste inserts exactly its text into the focused element.
+    let pasted = "pasted é\n2";
+    live.send(Command::InsertText {
+        device: 2,
+        text: pasted.into(),
+    });
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| has_input(
+            fixture, "1000", pasted
+        )),
+        "inserted text did not reach the desktop"
+    );
+    thread::sleep(Duration::from_millis(400));
+    let desktop = |kind: &str| -> Vec<HashMap<String, String>> {
+        events(&fixture, kind)
+            .into_iter()
+            .filter(|event| event["w"] == "1000")
+            .collect()
+    };
+    assert_eq!(desktop("keydown"), [], "paste keys must not reach the page");
+    assert_eq!(events(&fixture, "paste"), [], "no page reads a clipboard");
+    let inputs = desktop("input");
+    assert!(
+        inputs.iter().all(|event| event["v"] == pasted),
+        "only the inserted text arrives: {inputs:?}"
+    );
+    let downs: Vec<(String, String)> = desktop("down")
+        .into_iter()
+        .map(|event| (event["button"].clone(), event["buttons"].clone()))
+        .collect();
+    assert_eq!(
+        downs,
+        [("0".into(), "1".into()), ("0".into(), "1".into())],
+        "middle presses must not reach the page"
+    );
+
+    // Composed characters and function keys reach the page.
+    press(2, "eacute", Some("é"), none);
+    press(2, "f2", None, none);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        has_input(fixture, "1000", "pasted é\n2é")
+    }));
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        let keys: Vec<String> = desktop("keydown")
+            .into_iter()
+            .map(|event| event["key"].clone())
+            .collect();
+        keys == ["é", "F2"]
+    }));
+
+    // Nothing is inserted into a hidden device, or later when it is shown,
+    // and text that a paste would not produce is not inserted.
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: false,
+    });
+    live.wait("phone hidden", Duration::from_secs(5), |status| {
+        !status.devices[0].streaming
+    });
+    live.send(Command::InsertText {
+        device: 0,
+        text: "hidden".into(),
+    });
+    live.send(Command::InsertText {
+        device: 2,
+        text: "bell\u{7}".into(),
+    });
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: true,
+    });
+    live.wait("phone visible", Duration::from_secs(5), |status| {
+        status.devices[0].streaming
+    });
+    thread::sleep(Duration::from_millis(500));
+    let inputs = events(&fixture, "input");
+    assert!(
+        inputs
+            .iter()
+            .all(|event| !event["v"].contains("hidden") && !event["v"].contains("bell")),
+        "{inputs:?}"
+    );
+    assert_eq!(count(&fixture, "/keys"), 3, "input must not reload pages");
+    live.close();
+}
+
+/// Page targets of the test's own browser, from its loopback DevTools endpoint.
+fn page_targets(root: &Path) -> Vec<String> {
+    use std::io::{Read, Write};
+    let port = std::fs::read_dir(root)
+        .unwrap()
+        .find_map(|entry| {
+            std::fs::read_to_string(entry.ok()?.path().join("DevToolsActivePort")).ok()
+        })
+        .and_then(|contents| contents.lines().next()?.parse::<u16>().ok())
+        .expect("DevToolsActivePort");
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    // The endpoint may keep the connection open after the response.
+    let mut response = Vec::new();
+    let mut buffer = [0; 16384];
+    let body = loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "DevTools endpoint closed the connection early");
+        response.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&response);
+        if let Some((head, body)) = text.split_once("\r\n\r\n")
+            && let Some(length) = head.lines().find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            && body.len() >= length
+        {
+            break body[..length].to_owned();
+        }
+    };
+    let targets: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let mut pages: Vec<String> = targets
+        .iter()
+        .filter(|target| target["type"] == "page")
+        .map(|target| target["url"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    pages.sort();
+    pages
+}
+
+/// Before ADR 0010 these keys closed devices (Alt+F4 in the Guest tablet
+/// also closed the Guest phone), crashed the browser (Ctrl+Shift+M), opened
+/// tabs, browser pages and DevTools that Broxser never showed, and reloaded or
+/// navigated pages outside Broxser's commands (Helium 0.18.1.1).
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_browser_command_keys_never_reach_the_browser() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/second")));
+    live.wait("pages", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/second")
+    });
+    // History to go back to.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/keys"),
+    });
+    live.wait("keys pages", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/keys")
+    });
+    let pages = page_targets(live.root.path());
+    click(&live, 1, 40.0, 210.0);
+    click(&live, 2, 40.0, 210.0);
+    assert!(fixture.wait_for(
+        Duration::from_secs(5),
+        |fixture| events(fixture, "down").len() == 2
+    ));
+    let none = Modifiers::default();
+    let shift = Modifiers {
+        shift: true,
+        ..none
+    };
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    let control_shift = Modifiers {
+        shift: true,
+        ..control
+    };
+    let alt = Modifiers { alt: true, ..none };
+    let press = |device: usize, name: &str, typed: Option<&str>, modifiers: Modifiers| {
+        for down in [true, false] {
+            let key = KeyInput::from_key(name, typed, modifiers, down).unwrap();
+            live.send(Command::Key { device, key });
+        }
+    };
+    press(1, "f4", None, alt);
+    for (name, modifiers) in [
+        ("w", control),
+        ("f4", control),
+        ("w", control_shift),
+        ("f4", alt),
+        ("t", control),
+        ("n", control),
+        ("n", control_shift),
+        ("t", control_shift),
+        ("u", control),
+        ("j", control),
+        ("o", control_shift),
+        ("delete", control_shift),
+        ("a", control_shift),
+        ("m", control_shift),
+        ("f12", none),
+        ("i", control_shift),
+        ("j", control_shift),
+        ("f5", none),
+        ("f5", shift),
+        ("f5", control),
+        ("r", control),
+        ("r", control_shift),
+        ("left", alt),
+        ("right", alt),
+        ("home", alt),
+        ("q", control_shift),
+    ] {
+        press(2, name, None, modifiers);
+    }
+    press(2, "o", Some("o"), none);
+    press(2, "k", Some("k"), none);
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |fixture| has_input(
+            fixture, "1000", "ok"
+        )),
+        "typing after the browser keys did not arrive"
+    );
+    thread::sleep(Duration::from_millis(1500));
+    let status = live.session().status();
+    assert!(running(&status), "{status:#?}");
+    for device in &status.devices {
+        assert_eq!(
+            (device.url.as_str(), device.error.as_deref()),
+            (fixture.url("/keys").as_str(), None)
+        );
+    }
+    let keys: Vec<String> = events(&fixture, "keydown")
+        .iter()
+        .map(|event| event["key"].clone())
+        .collect();
+    assert_eq!(keys, ["o", "k"], "browser keys must not reach pages");
+    assert_eq!(count(&fixture, "/keys"), 3, "no reload and no view-source");
+    assert_eq!(
+        count(
+            &fixture,
+            "/.well-known/appspecific/com.chrome.devtools.json"
+        ),
+        0,
+        "no DevTools"
+    );
+    assert_eq!(page_targets(live.root.path()), pages, "no hidden tabs");
     live.close();
 }
 
