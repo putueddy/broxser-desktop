@@ -110,6 +110,7 @@ Measurements and reproductions are in `docs/validation.md` (P1.4).
   (pause, input while paused, hide and show while off screen, change while paused,
   fresh frame on resume).
 - Desktop: `scripts/desktop-smoke.sh` with a release build, including the run that
-  types 1500 keys while every page animates.
+  types 1500 keys after the phone and tablet frames were seen animating in the
+  window for 20 s. It fails when the browser or the fixture never gets that far.
 - Before/after measurements with three and eight devices and a long session are in
   `docs/validation.md`.

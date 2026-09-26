@@ -37,6 +37,26 @@ run whose window took longer than 30 s to draw is excluded below.
 A debug build of `main` did not panic in a 150-press run or two 1500-key runs; it
 rarely reaches the race, so the smoke run needs a release build to cover it.
 
+Review of the first smoke run found that it typed even when its readiness wait
+timed out, so it passed with `BROXSER_HELIUM_BIN=/bin/false` and no fixture request
+at all. It also left the desktop running when no window appeared. The run now
+requires a fixture request and then reads the phone and tablet frames from the
+window with XGetImage: each must change in six consecutive half seconds, which a
+page that only finishes loading does not. It types only after that, and every path
+closes the desktop and checks for leftovers. Requiring three fixture requests was
+dropped: the two Guest devices share one browser context and often loaded the page
+from its cache. A scratch copy of the script ran only this function:
+
+| Case | Result |
+| --- | --- |
+| `BROXSER_HELIUM_BIN=/bin/false` | Failed: no fixture request within 30 s |
+| Static `index.html`; held `/hang` | Failed: the phone frame did not animate |
+| Animation fixture, release build with the patch | Passed 3 of 3 |
+| Animation fixture, release build of `main` | Failed 2 of 2: the desktop panicked while typing |
+| Same, typing at once instead of after 20 s of animation | The desktop panicked in 2 of 4 runs, so the run waits 20 s |
+
+No case left a browser process, profile, window or temporary directory.
+
 ### Before and after, default zoom
 
 Averages of two runs; the eight-device static page has one "before" run.
@@ -82,7 +102,7 @@ example above 50% zoom on a 2× display. ADR 0012 records the trade-off.
 | `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 63 engine and 24 desktop tests; format and strict Clippy; 29 live tests ignored by default |
 | Live Helium suite, four threads, beside the long session | Passed 29 of 29 twice (68.8 s, 64.1 s). One more run failed the cleanup check of `live_ime_rejects_scripted_focus_and_selection_after_synthetic_events`; see the next subsection |
 | New `live_off_screen_devices_pause_frames_keep_input_and_resume_fresh` | Passed 3 of 3; without the on-screen check in `start_stream` it failed, because showing the device restarted its stream while off screen |
-| `scripts/desktop-smoke.sh` with the debug and the release build | Passed all eight runs each; no browser process, profile or window left, and the known preview directory after SIGTERM |
+| `scripts/desktop-smoke.sh` with the debug and the release build | Passed all eight runs each, before and after the typing run's readiness fix; no browser process, profile or window left, and the known preview directory after SIGTERM |
 
 ### Browser cleanup deadlock under load (not changed here)
 
