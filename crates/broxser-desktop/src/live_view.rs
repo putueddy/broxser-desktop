@@ -48,6 +48,8 @@ pub(crate) struct LiveView {
     url: Entity<UrlInput>,
     /// Display pixels per CSS pixel.
     scale: f32,
+    /// Window scale factor of the frame limits last sent.
+    limit_scale: f32,
     sync: SyncSettings,
     focus: FocusHandle,
     /// Restart and close, one at a time, and the current runtime's generation.
@@ -56,6 +58,7 @@ pub(crate) struct LiveView {
     _url_events: Subscription,
     _focus_out: Subscription,
     _window_activation: Subscription,
+    _window_bounds: Subscription,
     _key_presses: Subscription,
 }
 
@@ -133,12 +136,33 @@ struct DeviceView {
     decoding: Option<u64>,
     /// Frame bounds from the last paint, used to map pointer positions.
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    on_screen: Rc<OnScreen>,
     hidden: bool,
     /// A queued engine snapshot must not restore the caret preceding a click.
     invalidated_ime_target: Option<u64>,
     /// Held buttons as a CDP bitmask, and the last mapped pointer position.
     buttons: u8,
     last_point: Option<(f64, f64)>,
+}
+
+/// Whether the last paint showed part of a device frame in the scrolled canvas,
+/// and what the runtime was last told. The runtime pauses the screencast of a
+/// device that is not on screen. Both start true, as the runtime does.
+struct OnScreen {
+    painted: Cell<bool>,
+    sent: Cell<bool>,
+    /// A paint has scheduled [`LiveView::sync_on_screen`] for this device.
+    pending: Cell<bool>,
+}
+
+impl Default for OnScreen {
+    fn default() -> Self {
+        Self {
+            painted: Cell::new(true),
+            sent: Cell::new(true),
+            pending: Cell::new(false),
+        }
+    }
 }
 
 impl DeviceView {
@@ -179,6 +203,13 @@ impl LiveView {
                 window.invalidate_character_coordinates();
             }
         });
+        // Moving to a display with another scale changes the physical size of
+        // every frame; GPUI reports it as a bounds change.
+        let window_bounds = cx.observe_window_bounds(window, |view, window, _| {
+            if window.scale_factor() != view.limit_scale {
+                view.send_frame_limits(window);
+            }
+        });
         // Before shortcuts and elements, so every press pairs with its release.
         let pressing = cx.entity().downgrade();
         let key_presses = cx.intercept_keystrokes(move |event, _, cx| {
@@ -207,6 +238,7 @@ impl LiveView {
             ime: ImeBuffer::default(),
             url,
             scale: 0.5,
+            limit_scale: window.scale_factor(),
             sync: SyncSettings::default(),
             focus,
             lifecycle: Lifecycle::default(),
@@ -214,6 +246,7 @@ impl LiveView {
             _url_events: url_events,
             _focus_out: focus_out,
             _window_activation: window_activation,
+            _window_bounds: window_bounds,
             _key_presses: key_presses,
         };
         view.start(window, cx);
@@ -250,6 +283,12 @@ impl LiveView {
                 self.session = Some(session);
                 self.status = Status::default();
                 self.notice = None;
+                // A new runtime streams every visible device; the next paint
+                // pauses those still off screen.
+                for device in &self.devices {
+                    device.on_screen.sent.set(true);
+                }
+                cx.notify();
             }
             Err(error) => {
                 self.notice = Some(format!("{error:#}"));
@@ -563,9 +602,29 @@ impl LiveView {
         cx.notify();
     }
 
+    /// Pauses the screencast of a device whose frame the scrolled canvas no
+    /// longer shows, and resumes it once it does. A command the runtime does
+    /// not accept is sent after a later paint.
+    fn sync_on_screen(&mut self, index: usize) {
+        let on_screen = Rc::clone(&self.devices[index].on_screen);
+        on_screen.pending.set(false);
+        let shown = on_screen.painted.get();
+        if shown != on_screen.sent.get()
+            && self.session.as_ref().is_some_and(|session| {
+                session.send(Command::SetOnScreen {
+                    device: index,
+                    on_screen: shown,
+                })
+            })
+        {
+            on_screen.sent.set(shown);
+        }
+    }
+
     /// Asks for frames no larger than they are displayed, in physical pixels.
     fn send_frame_limits(&mut self, window: &Window) {
-        let factor = self.scale * window.scale_factor();
+        self.limit_scale = window.scale_factor();
+        let factor = self.scale * self.limit_scale;
         let limits: Vec<Command> = self
             .workspace
             .devices
@@ -955,6 +1014,7 @@ impl LiveView {
         let width = device.width as f32 * self.scale;
         let height = device.height as f32 * self.scale;
         let bounds = Rc::clone(&view.bounds);
+        let on_screen = Rc::clone(&view.on_screen);
         let image = view.image.clone();
         let selected = self.selected == Some(index);
         let focus = self.focus.clone();
@@ -969,7 +1029,14 @@ impl LiveView {
                 if selected {
                     window.handle_input(&focus, ElementInputHandler::new(area, entity.clone()), cx);
                 }
-                if let Some(image) = image {
+                let shown = area.intersects(&window.content_mask().bounds);
+                on_screen.painted.set(shown);
+                if shown != on_screen.sent.get() && !on_screen.pending.replace(true) {
+                    let entity = entity.clone();
+                    cx.defer(move |cx| entity.update(cx, |view, _| view.sync_on_screen(index)));
+                }
+                // GPUI uploads every painted image, including clipped ones.
+                if shown && let Some(image) = image {
                     let _ = window.paint_image(area, Corners::default(), image, 0, false);
                 }
             },

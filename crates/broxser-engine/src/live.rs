@@ -289,6 +289,12 @@ pub enum Command {
         device: usize,
         visible: bool,
     },
+    /// A device whose frame lies outside the visible canvas pauses its
+    /// screencast. Unlike hiding, input, sync and IME stay as they are.
+    SetOnScreen {
+        device: usize,
+        on_screen: bool,
+    },
     /// Largest frame worth encoding, in physical pixels of the display.
     SetFrameLimit {
         device: usize,
@@ -696,6 +702,8 @@ struct LiveDevice {
     session: String,
     css: (f64, f64),
     visible: bool,
+    /// The UI shows part of the frame; otherwise the screencast pauses.
+    on_screen: bool,
     streaming: bool,
     limit: (u32, u32),
     /// Increments on every committed cross-document navigation.
@@ -908,6 +916,7 @@ impl<'a> Controller<'a> {
                 session,
                 css: (f64::from(device.width), f64::from(device.height)),
                 visible: true,
+                on_screen: true,
                 streaming: false,
                 limit: (physical(device.width), physical(device.height)),
                 generation: 0,
@@ -1054,6 +1063,14 @@ impl<'a> Controller<'a> {
                         json!({"ignore": true}),
                         Some(&state.session.clone()),
                     )?;
+                    self.stop_stream(device)?;
+                }
+            }
+            Command::SetOnScreen { device, on_screen } if device < count => {
+                self.devices[device].on_screen = on_screen;
+                if on_screen {
+                    self.start_stream(device)?;
+                } else {
                     self.stop_stream(device)?;
                 }
             }
@@ -1675,7 +1692,7 @@ impl<'a> Controller<'a> {
 
     fn start_stream(&mut self, index: usize) -> Result<()> {
         let device = &mut self.devices[index];
-        if !device.visible || device.streaming {
+        if !device.visible || !device.on_screen || device.streaming {
             return Ok(());
         }
         device.streaming = true;
