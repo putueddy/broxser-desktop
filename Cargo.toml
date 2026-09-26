@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/broxser-core", "crates/broxser-engine", "crates/broxser-cli", "crates/broxser-desktop"]
+exclude = ["vendor/gpui-0.2.2"]
 default-members = ["crates/broxser-core", "crates/broxser-engine", "crates/broxser-cli"]
 resolver = "3"
 
@@ -25,6 +26,10 @@ tempfile = "3"
 thiserror = "2"
 tungstenite = "0.30"
 url = "2.5"
+
+# Keep native IME commits out of physical key tracking (ADR 0011).
+[patch.crates-io]
+gpui = { path = "vendor/gpui-0.2.2" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

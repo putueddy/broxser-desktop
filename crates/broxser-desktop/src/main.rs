@@ -1,3 +1,4 @@
+mod ime;
 mod lifecycle;
 mod live_view;
 mod static_view;

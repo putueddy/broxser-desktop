@@ -504,6 +504,7 @@ impl FakePeer {
                             "loaderId": format!("L{loaders}")
                         })
                     }
+                    "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
                     _ => json!({}),
                 };
                 let reply = |result: Value| {
@@ -636,6 +637,110 @@ fn fake_live(root: &Path, limits: Limits) -> LiveSession {
     .unwrap();
     wait_for(&live, "the runtime", Duration::from_secs(10), running);
     live
+}
+
+#[test]
+fn ime_bindings_require_the_main_frame_isolated_context_and_live_token() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    let report = |anchor| {
+        json!({"method":"Runtime.bindingCalled","sessionId":"S0","params":{
+            "name":IME_BINDING,"executionContextId":42,
+            "payload":format!("{{\"active\":true,\"anchor\":{anchor},\"x\":20,\"y\":40,\"width\":1,\"height\":18}}")
+        }})
+    };
+    peer.event(report(1));
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        live.status().devices[0].text_input,
+        None,
+        "unregistered binding"
+    );
+    peer.event(
+        json!({"method":"Runtime.executionContextCreated","sessionId":"S0","params":{"context":{
+            "id":42,"name":IME_WORLD,"auxData":{"frameId":"not-main","type":"isolated"}
+        }}}),
+    );
+    peer.event(report(1));
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        live.status().devices[0].text_input,
+        None,
+        "subframe context"
+    );
+    peer.event(
+        json!({"method":"Runtime.executionContextCreated","sessionId":"S0","params":{"context":{
+            "id":42,"name":IME_WORLD,"auxData":{"frameId":"T0","type":"isolated"}
+        }}}),
+    );
+    peer.event(json!({"method":"Runtime.bindingCalled","sessionId":"S0","params":{
+        "name":IME_BINDING,"executionContextId":42,"payload":"{\"active\":true,\"anchor\":1,\"x\":1e400,\"y\":40,\"width\":1,\"height\":18}"
+    }}));
+    assert_eq!(
+        live.status().devices[0].text_input,
+        None,
+        "malformed geometry"
+    );
+    peer.event(report(1));
+    let first = wait_for(&live, "valid IME caret", Duration::from_secs(2), |s| {
+        s.devices[0].text_input.is_some()
+    })
+    .devices[0]
+        .text_input
+        .unwrap();
+    assert!(live.send(Command::Ime {
+        device: 0,
+        target: first.target,
+        action: ImeAction::Commit { text: "a".into() }
+    }));
+    wait_for_requests(&peer, "Input.insertText", "S0", 1);
+    assert_eq!(peer.count("Input.insertText", "S1"), 0);
+
+    peer.event(report(2));
+    let second = wait_for(&live, "new anchor", Duration::from_secs(2), |s| {
+        s.devices[0]
+            .text_input
+            .is_some_and(|state| state.target != first.target)
+    })
+    .devices[0]
+        .text_input
+        .unwrap();
+    assert!(live.send(Command::Ime {
+        device: 0,
+        target: first.target,
+        action: ImeAction::Commit {
+            text: "stale".into()
+        }
+    }));
+    assert!(live.send(Command::Ime {
+        device: 0,
+        target: second.target,
+        action: ImeAction::Commit {
+            text: "changed".into()
+        }
+    }));
+    wait_for(
+        &live,
+        "changed anchor rejected by immediate read",
+        Duration::from_secs(2),
+        |s| s.devices[0].text_input.is_none(),
+    );
+    assert_eq!(peer.count("Input.insertText", "S0"), 1);
+
+    peer.event(report(1));
+    wait_for(&live, "caret restored", Duration::from_secs(2), |s| {
+        s.devices[0].text_input.is_some()
+    });
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: false
+    }));
+    wait_for(&live, "hidden caret cleared", Duration::from_secs(2), |s| {
+        s.devices[0].text_input.is_none()
+    });
+    assert_eq!(peer.count("Input.insertText", "S0"), 1);
+    drop(live);
 }
 
 fn send_keys(live: &LiveSession, device: usize, presses: usize) {
@@ -882,6 +987,37 @@ area.addEventListener('paste', e => report('paste', {data: e.clipboardData.getDa
 area.addEventListener('input', e => report('input', {v: area.value, type: e.inputType}));
 </script></body></html>"#;
 
+const IME_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0}input{position:absolute;left:20px;top:40px;width:240px;height:32px;font:18px sans-serif}
+textarea{position:absolute;left:20px;top:100px;width:240px;height:70px;font:18px sans-serif}
+#editor{position:absolute;left:20px;top:200px;width:240px;height:70px;font:18px sans-serif;border:1px solid;padding:4px}
+#secret{position:absolute;left:20px;top:300px;width:240px;height:32px}
+#right,#center{position:absolute;left:20px;width:240px;height:32px;font:18px monospace}
+#right{top:350px;text-align:right}#center{top:400px;text-align:center}</style></head><body>
+<input id=field><textarea id=area></textarea><div id=editor contenteditable></div><input id=secret type=password>
+<input id=right value=abcd><input id=center value=abcd><script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind,w:innerWidth,...data}));
+for (const el of [field,area,editor,secret]) for (const kind of ['compositionstart','compositionupdate','compositionend','input'])
+  el.addEventListener(kind,e=>report(kind,{id:el.id,value:el===secret?'':el.value??el.textContent,data:e.data||''}));
+for (const el of [right,center]) el.addEventListener('focus',()=>setTimeout(()=>el.setSelectionRange(2,2),40));
+field.focus();
+</script></body></html>"#;
+
+const IME_ATTACK_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0}#field{position:absolute;left:20px;top:40px;width:240px;height:32px;font:18px monospace}
+#tall{position:absolute;left:20px;top:160px;width:240px;height:100px;font:18px monospace}</style></head><body>
+<input id=field value=abcdef><input id=other><input id=tall value=abcdef><script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind,w:innerWidth,...data}));
+field.addEventListener('input',e=>report('input',{value:field.value,trusted:e.isTrusted}));
+field.addEventListener('keydown',e=>{
+  if(e.key==='F2') {field.setSelectionRange(5,5);field.dispatchEvent(new Event('input',{bubbles:true}));}
+  if(e.key==='F3') {field.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));field.setSelectionRange(3,3);}
+  if(e.key==='F4') {other.focus();field.focus();}
+  if(['F2','F3','F4'].includes(e.key)) report('attack',{key:e.key});
+});
+field.focus();field.setSelectionRange(1,1);
+</script></body></html>"#;
+
 fn fixture() -> Fixture {
     Fixture::start(|request, _| {
         let path = request.path.split('?').next().unwrap_or("/");
@@ -899,6 +1035,8 @@ fn fixture() -> Fixture {
             "/nested-button" => "<a href=/next style='display:block;width:160px;height:40px'><button id=b style='width:160px;height:40px'>button</button></a><script>b.addEventListener('click',e=>{if(e.isTrusted)document.querySelector('a').click()});</script>".into(),
             "/keyboard" => PAGE.replace("AUTO", "document.getElementById('link').href = '/keyboard-dest'; document.getElementById('link').focus();"),
             "/keys" => KEYS_PAGE.into(),
+            "/ime" => IME_PAGE.into(),
+            "/ime-attacks" => IME_ATTACK_PAGE.into(),
             "/slowstart" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow';"),
             "/supersede" => PAGE.replace("AUTO", "document.getElementById('link').href = '/slow'; document.getElementById('link').addEventListener('click', () => setTimeout(() => location.href = '/supersede-dest', 100));"),
             "/longstart" => PAGE.replace("AUTO", &format!("document.getElementById('link').href = '/long?token={}';", "x".repeat(2300))),
@@ -1098,6 +1236,306 @@ fn loaded(status: &Status, fixture: &Fixture, path: &str) -> bool {
             .devices
             .iter()
             .all(|device| device.url == fixture.url(path) && !device.loading && device.frames > 0)
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_ime_composition_targets_caret_and_visibility() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/ime")));
+    let status = live.wait("IME targets", Duration::from_secs(30), |status| {
+        loaded(status, &fixture, "/ime") && status.devices.iter().all(|d| d.text_input.is_some())
+    });
+    let phone = status.devices[0].text_input.unwrap();
+    let desktop = status.devices[2].text_input.unwrap();
+    assert_ne!(phone.target, desktop.target);
+    assert!((15.0..280.0).contains(&phone.caret.x));
+    assert!((35.0..80.0).contains(&phone.caret.y));
+
+    live.send(Command::Ime {
+        device: 0,
+        target: phone.target,
+        action: ImeAction::Preedit {
+            text: "に".into(),
+            selection: 0..1,
+        },
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "compositionstart")
+            .iter()
+            .any(|e| e["w"] == "360")
+    }));
+    live.send(Command::Ime {
+        device: 0,
+        target: phone.target,
+        action: ImeAction::Preedit {
+            text: "日本".into(),
+            selection: 0..2,
+        },
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "compositionupdate")
+            .iter()
+            .any(|e| e["w"] == "360" && e["data"] == "日本")
+    }));
+    live.send(Command::Ime {
+        device: 0,
+        target: phone.target,
+        action: ImeAction::Commit {
+            text: "日本".into(),
+        },
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "input")
+            .iter()
+            .any(|e| e["w"] == "360" && e["value"] == "日本")
+    }));
+    assert!(events(&fixture, "input").iter().all(|e| e["w"] != "1000"));
+
+    let next = live
+        .wait("caret after commit", Duration::from_secs(5), |s| {
+            s.devices[0]
+                .text_input
+                .is_some_and(|t| t.caret.x > phone.caret.x)
+        })
+        .devices[0]
+        .text_input
+        .unwrap();
+    assert!(
+        next.caret.x > phone.caret.x,
+        "caret should move after typing"
+    );
+    assert_eq!(next.target, phone.target, "own input keeps the token");
+
+    // GPUI can deliver identical committed text twice without any key-up.
+    for _ in 0..2 {
+        live.send(Command::Ime {
+            device: 2,
+            target: desktop.target,
+            action: ImeAction::Commit { text: "é".into() },
+        });
+    }
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "input")
+            .iter()
+            .any(|e| e["w"] == "1000" && e["value"] == "éé")
+    }));
+
+    click(&live, 0, 40.0, 120.0);
+    let latest = live
+        .wait("textarea target", Duration::from_secs(5), |s| {
+            s.devices[0]
+                .text_input
+                .is_some_and(|t| t.target != phone.target && t.caret.y > 95.0)
+        })
+        .devices[0]
+        .text_input
+        .unwrap();
+    live.send(Command::Ime {
+        device: 0,
+        target: phone.target,
+        action: ImeAction::Commit {
+            text: "stale".into(),
+        },
+    });
+    live.send(Command::Ime {
+        device: 0,
+        target: latest.target,
+        action: ImeAction::Commit {
+            text: "日本".into(),
+        },
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "input")
+            .iter()
+            .any(|e| e["w"] == "360" && e["id"] == "area" && e["value"] == "日本")
+    }));
+    live.send(Command::Ime {
+        device: 0,
+        target: latest.target,
+        action: ImeAction::Preedit {
+            text: "x".into(),
+            selection: 0..1,
+        },
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "compositionupdate")
+            .iter()
+            .any(|e| e["w"] == "360" && e["data"] == "x")
+    }));
+    let ended_before = events(&fixture, "compositionend").len();
+    live.send(Command::Ime {
+        device: 0,
+        target: latest.target,
+        action: ImeAction::Cancel,
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "compositionend").len() > ended_before
+    }));
+    click(&live, 0, 40.0, 220.0);
+    let editor = live
+        .wait("empty contenteditable caret", Duration::from_secs(5), |s| {
+            s.devices[0].text_input.is_some_and(|t| {
+                t.target != latest.target && t.caret.y > 200.0 && t.caret.height > 0.0
+            })
+        })
+        .devices[0]
+        .text_input
+        .unwrap();
+    live.send(Command::Ime {
+        device: 0,
+        target: editor.target,
+        action: ImeAction::Commit { text: "z".into() },
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "input")
+            .iter()
+            .any(|e| e["w"] == "360" && e["id"] == "editor" && e["value"] == "z")
+    }));
+    click(&live, 0, 40.0, 315.0);
+    live.wait("password focus omits caret", Duration::from_secs(5), |s| {
+        s.devices[0].text_input.is_none()
+    });
+    live.send(Command::Ime {
+        device: 0,
+        target: editor.target,
+        action: ImeAction::Commit {
+            text: "stale".into(),
+        },
+    });
+    click(&live, 0, 40.0, 220.0);
+    let editor_again = live
+        .wait("editable focus restored", Duration::from_secs(5), |s| {
+            s.devices[0]
+                .text_input
+                .is_some_and(|t| t.target != editor.target)
+        })
+        .devices[0]
+        .text_input
+        .unwrap();
+    click(&live, 0, 235.0, 365.0);
+    live.wait("right-aligned input caret", Duration::from_secs(5), |s| {
+        s.devices[0]
+            .text_input
+            .is_some_and(|t| t.target != editor_again.target && t.caret.y > 350.0)
+    });
+    thread::sleep(Duration::from_millis(150));
+    let right = live.session().status().devices[0].text_input.unwrap();
+    assert!(
+        (220.0..250.0).contains(&right.caret.x),
+        "right caret: {right:?}"
+    );
+    click(&live, 0, 140.0, 415.0);
+    live.wait("center-aligned input caret", Duration::from_secs(5), |s| {
+        s.devices[0]
+            .text_input
+            .is_some_and(|t| t.target != right.target && t.caret.y > 400.0)
+    });
+    thread::sleep(Duration::from_millis(150));
+    let center = live.session().status().devices[0].text_input.unwrap();
+    assert!(
+        (125.0..155.0).contains(&center.caret.x),
+        "center caret: {center:?}"
+    );
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: false,
+    });
+    live.wait("hidden IME target", Duration::from_secs(5), |s| {
+        s.devices[0].text_input.is_none()
+    });
+    live.send(Command::Ime {
+        device: 0,
+        target: center.target,
+        action: ImeAction::Commit {
+            text: "hidden".into(),
+        },
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !events(&fixture, "input")
+            .iter()
+            .any(|e| e["value"].contains("stale") || e["value"].contains("hidden"))
+    );
+    assert!(
+        events(&fixture, "input")
+            .iter()
+            .all(|e| e["id"] != "secret")
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_ime_rejects_scripted_focus_and_selection_after_synthetic_events() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/ime-attacks")));
+    let status = live.wait("editable attack target", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/ime-attacks") && s.devices[0].text_input.is_some()
+    });
+    let mut target = status.devices[0].text_input.unwrap().target;
+    for key in ["F2", "F3", "F4"] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key(&key.to_lowercase(), None, Modifiers::default(), true).unwrap(),
+        });
+        // The old target reaches the worker immediately after the browser key,
+        // before the observer's next animation-frame geometry report.
+        live.send(Command::Ime {
+            device: 0,
+            target,
+            action: ImeAction::Commit { text: "!".into() },
+        });
+        assert!(
+            fixture.wait_for(Duration::from_secs(5), |_| {
+                events(&fixture, "attack")
+                    .iter()
+                    .any(|event| event["w"] == "360" && event["key"] == key)
+            }),
+            "{key} handler did not execute"
+        );
+        let next = live.wait("fresh target after script", Duration::from_secs(5), |s| {
+            s.devices[0]
+                .text_input
+                .is_some_and(|state| state.target != target)
+        });
+        target = next.devices[0].text_input.unwrap().target;
+        assert!(
+            events(&fixture, "input")
+                .iter()
+                .filter(|event| event["w"] == "360")
+                .all(|event| !event["value"].contains('!')),
+            "old IME target inserted text after {key}"
+        );
+    }
+    // Genuine CDP commits remain repeatable without intervening key-up events.
+    for _ in 0..2 {
+        live.send(Command::Ime {
+            device: 0,
+            target,
+            action: ImeAction::Commit { text: "✓".into() },
+        });
+    }
+    assert!(fixture.wait_for(Duration::from_secs(5), |_| {
+        events(&fixture, "input")
+            .iter()
+            .any(|event| event["w"] == "360" && event["value"].matches('✓').count() == 2)
+    }));
+    click(&live, 0, 40.0, 210.0);
+    let tall = live
+        .wait("tall input caret", Duration::from_secs(5), |s| {
+            s.devices[0]
+                .text_input
+                .is_some_and(|state| state.target != target && state.caret.y > 160.0)
+        })
+        .devices[0]
+        .text_input
+        .unwrap();
+    assert!(
+        (188.0..215.0).contains(&tall.caret.y),
+        "tall input caret: {tall:?}"
+    );
+    live.close();
 }
 
 fn count(fixture: &Fixture, path: &str) -> usize {
@@ -1791,7 +2229,13 @@ fn live_link_sync_requires_a_trusted_link_activation() {
     live.wait(
         "forged page only navigates source",
         Duration::from_secs(10),
-        |s| s.devices[0].url == fixture.url("/next") && s.devices[1].url == fixture.url("/forged"),
+        |s| {
+            // Device 0 already had /next in the preceding case. Its old
+            // status is not evidence that this new navigation has happened.
+            count(&fixture, "/next") >= 3
+                && s.devices[0].url == fixture.url("/next")
+                && s.devices[1].url == fixture.url("/forged")
+        },
     );
     thread::sleep(Duration::from_millis(500));
     assert_eq!(

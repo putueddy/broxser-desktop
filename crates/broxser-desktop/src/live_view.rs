@@ -3,25 +3,28 @@
 //! browser surface. Pointer and wheel input go to the device under the pointer
 //! and keys to the selected device, in CSS pixels of that device's viewport.
 
+use crate::ime::{ImeBuffer, Origin};
 use crate::lifecycle::{AfterStop, CloseRequest, Lifecycle};
 use crate::url_input::{UrlEvent, UrlInput};
 use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT, WARN};
 use anyhow::{Context as _, Result};
 use broxser_core::{Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, Frame, KeyInput, LiveSession, MAX_PASTE_CHARS,
-    Modifiers, PasteRejected, PointerButton, PointerEvent, PointerKind, RuntimeState, Status,
-    SyncSettings, is_paste_key, paste_text, to_viewport,
+    BrowserOptions, Cancellation, Command, Frame, ImeAction, KeyInput, LiveSession,
+    MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent, PointerKind,
+    RuntimeState, Status, SyncSettings, is_paste_key, paste_text, to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, Bounds, Context, Corners, Entity, FocusHandle, KeyDownEvent, KeyUpEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage,
-    ScrollWheelEvent, SharedString, Subscription, Window, canvas, div, prelude::*, px, rgb,
+    AnyElement, Bounds, Context, Corners, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString, Subscription,
+    UTF16Selection, Window, canvas, div, prelude::*, px, rgb,
 };
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -38,8 +41,10 @@ pub(crate) struct LiveView {
     devices: Vec<DeviceView>,
     selected: Option<usize>,
     pressed: PressedKeys,
+    ignored_ime_keys: HashSet<String>,
     /// Keys sent to pages, retained so a release never lands on another device.
     held_keys: HashMap<String, (usize, KeyInput)>,
+    ime: ImeBuffer,
     url: Entity<UrlInput>,
     /// Display pixels per CSS pixel.
     scale: f32,
@@ -50,6 +55,7 @@ pub(crate) struct LiveView {
     notice: Option<String>,
     _url_events: Subscription,
     _focus_out: Subscription,
+    _window_activation: Subscription,
     _key_presses: Subscription,
 }
 
@@ -73,6 +79,12 @@ struct PressedKey {
 }
 
 impl PressedKeys {
+    fn forget(&mut self, identity: &str) {
+        self.keys.retain(|pressed| pressed.identity != identity);
+        if self.latest.as_deref() == Some(identity) {
+            self.latest = None;
+        }
+    }
     /// Records a key-down. It repeats the key only if that key had the latest
     /// key-down; otherwise it is a new press, even under a name still down
     /// whose release went unseen.
@@ -122,9 +134,24 @@ struct DeviceView {
     /// Frame bounds from the last paint, used to map pointer positions.
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     hidden: bool,
+    /// A queued engine snapshot must not restore the caret preceding a click.
+    invalidated_ime_target: Option<u64>,
     /// Held buttons as a CDP bitmask, and the last mapped pointer position.
     buttons: u8,
     last_point: Option<(f64, f64)>,
+}
+
+impl DeviceView {
+    fn ime_target(&self, status: &broxser_engine::DeviceStatus) -> Option<u64> {
+        let target = status.text_input?.target;
+        (!self.hidden && self.invalidated_ime_target != Some(target)).then_some(target)
+    }
+
+    fn invalidate_ime_target(&mut self, status: &mut broxser_engine::DeviceStatus) {
+        if let Some(caret) = status.text_input.take() {
+            self.invalidated_ime_target = Some(caret.target);
+        }
+    }
 }
 
 impl LiveView {
@@ -140,8 +167,17 @@ impl LiveView {
         });
         let focus = cx.focus_handle();
         focus.focus(window);
-        let focus_out = cx.on_focus_out(&focus, window, |view, _, _, _| {
+        let focus_out = cx.on_focus_out(&focus, window, |view, _, window, _| {
             view.release_keys();
+            view.invalidate_ime();
+            window.invalidate_character_coordinates();
+        });
+        let window_activation = cx.observe_window_activation(window, |view, window, _| {
+            if !window.is_window_active() {
+                view.release_keys();
+                view.invalidate_ime();
+                window.invalidate_character_coordinates();
+            }
         });
         // Before shortcuts and elements, so every press pairs with its release.
         let pressing = cx.entity().downgrade();
@@ -166,7 +202,9 @@ impl LiveView {
             status: Status::default(),
             selected: Some(0),
             pressed: PressedKeys::default(),
+            ignored_ime_keys: HashSet::new(),
             held_keys: HashMap::new(),
+            ime: ImeBuffer::default(),
             url,
             scale: 0.5,
             sync: SyncSettings::default(),
@@ -175,6 +213,7 @@ impl LiveView {
             notice: None,
             _url_events: url_events,
             _focus_out: focus_out,
+            _window_activation: window_activation,
             _key_presses: key_presses,
         };
         view.start(window, cx);
@@ -262,6 +301,17 @@ impl LiveView {
             .filter_map(|index| Some((index, session.take_frame(index)?)))
             .collect();
         if status != self.status {
+            let former_caret = self
+                .selected
+                .and_then(|index| self.status.devices.get(index))
+                .and_then(|device| device.text_input);
+            let next_caret = self
+                .selected
+                .and_then(|index| status.devices.get(index))
+                .and_then(|device| device.text_input);
+            if self.ime_origin_with_status(&status, window) != self.ime_origin(window) {
+                self.invalidate_ime();
+            }
             if let Some(url) = self
                 .selected
                 .and_then(|index| status.devices.get(index))
@@ -272,6 +322,9 @@ impl LiveView {
                     .update(cx, |input, cx| input.show(&url, window, cx));
             }
             self.status = status;
+            if former_caret != next_caret {
+                window.invalidate_character_coordinates();
+            }
             cx.notify();
         }
         for (index, frame) in frames {
@@ -344,6 +397,7 @@ impl LiveView {
         };
         match validate_url(&url) {
             Ok(()) => {
+                self.invalidate_ime();
                 self.notice = None;
                 self.focus.focus(window);
                 self.send(Command::NavigateAll { url });
@@ -360,6 +414,7 @@ impl LiveView {
             return;
         }
         if self.selected != Some(index) {
+            self.invalidate_ime();
             if !self.release_keys() {
                 return;
             }
@@ -386,6 +441,9 @@ impl LiveView {
 
     fn toggle_hidden(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let visible = self.devices[index].hidden;
+        if !visible && self.selected == Some(index) {
+            self.invalidate_ime();
+        }
         if !visible && (!self.release_keys_for(index) || !self.release_buttons(index)) {
             return;
         }
@@ -492,6 +550,7 @@ impl LiveView {
 
     fn reload_selected(&mut self, cx: &mut Context<Self>) {
         if let Some(device) = self.selected.filter(|&index| !self.devices[index].hidden) {
+            self.invalidate_ime();
             self.send(Command::Reload { device });
             cx.notify();
         }
@@ -499,6 +558,7 @@ impl LiveView {
 
     fn zoom_by(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
         self.scale = (self.scale + delta).clamp(0.25, 1.0);
+        window.invalidate_character_coordinates();
         self.send_frame_limits(window);
         cx.notify();
     }
@@ -528,12 +588,14 @@ impl LiveView {
         if !self.lifecycle.begin_restart() {
             return;
         }
+        self.invalidate_ime();
         // Keys still down stay pressed: their repeats reach no new page.
         self.held_keys.clear();
         for device in &mut self.devices {
             device.buttons = 0;
             device.last_point = None;
             device.bounds.set(None);
+            device.invalidated_ime_target = None;
         }
         let text = self.url.read(cx).text().to_owned();
         if validate_url(&text).is_ok() {
@@ -587,6 +649,7 @@ impl LiveView {
     /// window once the browser and profile are gone: GPUI ends the process as
     /// soon as the last window closes.
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.invalidate_ime();
         let request = self.lifecycle.begin_close(self.session.is_some());
         if request == CloseRequest::Now {
             return true;
@@ -599,6 +662,53 @@ impl LiveView {
             self.stop_then_continue(session, window, cx);
         }
         false
+    }
+
+    fn ime_origin_with_status(&self, status: &Status, window: &Window) -> Option<Origin> {
+        if !window.is_window_active() || !self.focus.is_focused(window) || !self.lifecycle.is_live()
+        {
+            return None;
+        }
+        let device = self.selected?;
+        if self.devices.get(device)?.hidden
+            || !matches!(&status.runtime, RuntimeState::Running { .. })
+        {
+            return None;
+        }
+        let target = self.devices[device].ime_target(status.devices.get(device)?)?;
+        Some(Origin {
+            device,
+            target,
+            generation: self.lifecycle.generation(),
+        })
+    }
+
+    fn ime_origin(&self, window: &Window) -> Option<Origin> {
+        self.ime_origin_with_status(&self.status, window)
+    }
+
+    fn dispatch_ime(&self, origin: Origin, action: ImeAction) {
+        if self.lifecycle.generation() == origin.generation
+            && let Some(session) = &self.session
+        {
+            let _ = session.send(Command::Ime {
+                device: origin.device,
+                target: origin.target,
+                action,
+            });
+        }
+    }
+
+    fn invalidate_ime(&mut self) {
+        if let Some((origin, action)) = self.ime.invalidate() {
+            self.dispatch_ime(origin, action);
+        }
+    }
+
+    fn commit_ime(&mut self, text: &str, window: &Window) {
+        if let Some((origin, action)) = self.ime.commit(self.ime_origin(window), text) {
+            self.dispatch_ime(origin, action);
+        }
     }
 
     fn map(&self, index: usize, position: Point<Pixels>) -> Option<(f64, f64)> {
@@ -641,6 +751,14 @@ impl LiveView {
             _ => 0,
         };
         if kind == PointerKind::Down {
+            if matches!(button, Some(MouseButton::Left | MouseButton::Right)) {
+                self.invalidate_ime();
+                if let Some(status) = self.status.devices.get_mut(index) {
+                    // This click can move editable focus before the next engine
+                    // snapshot. Never latch its old target for a new composition.
+                    self.devices[index].invalidate_ime_target(status);
+                }
+            }
             self.select(index, window, cx);
             if self.selected != Some(index) {
                 return;
@@ -732,10 +850,31 @@ impl LiveView {
     }
 
     /// A key-down in the device canvas.
-    fn key_down(&mut self, keystroke: &Keystroke, is_held: bool, cx: &mut Context<Self>) {
+    fn key_down(
+        &mut self,
+        keystroke: &Keystroke,
+        is_held: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((key, identity)) = key_input(keystroke, true) else {
             return;
         };
+        if self.ime.has_mark()
+            && !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform
+        {
+            self.pressed.forget(&identity);
+            self.ignored_ime_keys.insert(identity);
+            // GPUI/XKB can report the composed character as a key-down after
+            // invoking preedit. It belongs to the composition, not raw CDP keys.
+            if let Some(text) = keystroke.key_char.as_deref() {
+                self.commit_ime(text, window);
+            }
+            return;
+        }
+        self.ignored_ime_keys.remove(&identity);
         let repeat = is_held || self.pressed.repeating(&identity);
         if is_paste_key(&key) {
             if !repeat {
@@ -766,6 +905,9 @@ impl LiveView {
         let Some((_, identity)) = key_input(keystroke, false) else {
             return;
         };
+        if self.ignored_ime_keys.remove(&identity) {
+            return;
+        }
         let Some(pressed) = self.pressed.release(&identity) else {
             return;
         };
@@ -814,10 +956,19 @@ impl LiveView {
         let height = device.height as f32 * self.scale;
         let bounds = Rc::clone(&view.bounds);
         let image = view.image.clone();
+        let selected = self.selected == Some(index);
+        let focus = self.focus.clone();
+        let entity = cx.entity();
         let surface = canvas(
             |_, _, _| (),
-            move |area, (), window, _| {
+            move |area, (), window, cx| {
+                if bounds.get() != Some(area) {
+                    window.invalidate_character_coordinates();
+                }
                 bounds.set(Some(area));
+                if selected {
+                    window.handle_input(&focus, ElementInputHandler::new(area, entity.clone()), cx);
+                }
                 if let Some(image) = image {
                     let _ = window.paint_image(area, Corners::default(), image, 0, false);
                 }
@@ -1266,8 +1417,13 @@ impl Render for LiveView {
                                     .id("canvas")
                                     .track_focus(&self.focus)
                                     .on_key_down(cx.listener(
-                                        |view, event: &KeyDownEvent, _, cx| {
-                                            view.key_down(&event.keystroke, event.is_held, cx);
+                                        |view, event: &KeyDownEvent, window, cx| {
+                                            view.key_down(
+                                                &event.keystroke,
+                                                event.is_held,
+                                                window,
+                                                cx,
+                                            );
                                             cx.stop_propagation();
                                         },
                                     ))
@@ -1288,6 +1444,143 @@ impl Render for LiveView {
                     ),
             )
     }
+}
+
+impl EntityInputHandler for LiveView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, actual) = self.ime.text_for_range(range)?;
+        *adjusted_range = Some(actual);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.ime.selected_range(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ime.marked_range()
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        if let Some((origin, action)) = self.ime.unmark(self.ime_origin(window)) {
+            self.dispatch_ime(origin, action);
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if !self.ime.accepts_replacement_range(range.as_ref()) {
+            return;
+        }
+        if text.is_empty() {
+            if let Some((origin, action)) = self.ime.terminal_delete() {
+                self.dispatch_ime(origin, action);
+            }
+        } else {
+            self.commit_ime(text, window);
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selection: Option<Range<usize>>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if !self.ime.accepts_replacement_range(range.as_ref()) {
+            return;
+        }
+        if let Some((origin, action)) = self.ime.preedit(self.ime_origin(window), text, selection) {
+            self.dispatch_ime(origin, action);
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let origin = self.ime_origin(window)?;
+        let caret = self.status.devices.get(origin.device)?.text_input?.caret;
+        let device = &self.workspace.devices[origin.device];
+        map_caret(
+            caret,
+            element_bounds,
+            f64::from(device.width),
+            f64::from(device.height),
+        )
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.ime.selected_range().end)
+    }
+}
+
+/// CSS viewport caret to painted GPUI pixels. The compositor receives only a
+/// rectangle inside the visible device frame, even for stale or odd page data.
+fn map_caret(
+    caret: broxser_engine::CaretRect,
+    bounds: Bounds<Pixels>,
+    css_width: f64,
+    css_height: f64,
+) -> Option<Bounds<Pixels>> {
+    if !(caret.x.is_finite()
+        && caret.y.is_finite()
+        && caret.width.is_finite()
+        && caret.height.is_finite())
+        || css_width <= 0.0
+        || css_height <= 0.0
+    {
+        return None;
+    }
+    let x0 = caret.x.clamp(0.0, css_width);
+    let y0 = caret.y.clamp(0.0, css_height);
+    let x1 = (caret.x + caret.width.max(0.0)).clamp(x0, css_width);
+    let y1 = (caret.y + caret.height.max(0.0)).clamp(y0, css_height);
+    let sx = bounds.size.width.to_f64() / css_width;
+    let sy = bounds.size.height.to_f64() / css_height;
+    Some(Bounds::from_corners(
+        gpui::point(
+            px(bounds.origin.x.to_f64() as f32 + (x0 * sx) as f32),
+            px(bounds.origin.y.to_f64() as f32 + (y0 * sy) as f32),
+        ),
+        gpui::point(
+            px(bounds.origin.x.to_f64() as f32 + (x1 * sx) as f32),
+            px(bounds.origin.y.to_f64() as f32 + (y1 * sy) as f32),
+        ),
+    ))
 }
 
 fn modifiers_of(modifiers: &gpui::Modifiers) -> Modifiers {
@@ -1386,8 +1679,13 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PressedKeys, key_down_target, key_input, selected_after_visibility_change};
-    use gpui::Keystroke;
+    use super::{
+        DeviceView, PressedKeys, key_down_target, key_input, map_caret,
+        selected_after_visibility_change,
+    };
+    use crate::ime::{ImeBuffer, Origin};
+    use broxser_engine::{CaretRect, DeviceStatus, ImeAction, TextInputState};
+    use gpui::{Bounds, Keystroke, point, px, size};
     use std::collections::HashMap;
 
     /// A keystroke as GPUI reports it on X11: key name and typed character.
@@ -1401,6 +1699,97 @@ mod tests {
 
     fn identity(name: &str) -> String {
         key_input(&stroke(name, Some(name)), true).unwrap().1
+    }
+
+    #[test]
+    fn a_queued_old_snapshot_cannot_rearm_ime_after_pointer_down() {
+        let snapshot = |target| DeviceStatus {
+            text_input: Some(TextInputState {
+                target,
+                caret: CaretRect {
+                    x: 10.,
+                    y: 20.,
+                    width: 1.,
+                    height: 14.,
+                },
+            }),
+            ..DeviceStatus::default()
+        };
+        let mut device = DeviceView::default();
+        let mut status = snapshot(4);
+        device.invalidate_ime_target(&mut status);
+        let origin = |device: &DeviceView, status: &DeviceStatus| {
+            device.ime_target(status).map(|target| Origin {
+                device: 0,
+                target,
+                generation: 1,
+            })
+        };
+        let mut composition = ImeBuffer::default();
+        // A wake-up already queued before the pointer command restores the old
+        // shared status. It must not latch a composition to that retired target.
+        status = snapshot(4);
+        assert_eq!(
+            composition.preedit(origin(&device, &status), "n", None),
+            None
+        );
+        // The worker processes the pointer and publishes its new target. The
+        // full native preedit recovers without losing the word's initial keys.
+        status = snapshot(7);
+        let current = origin(&device, &status).unwrap();
+        assert!(composition.preedit(Some(current), "ni hao", None).is_some());
+        assert_eq!(
+            composition.commit(Some(current), "你好"),
+            Some((
+                current,
+                ImeAction::Commit {
+                    text: "你好".into()
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn caret_maps_css_to_painted_frame_and_clips_outside_viewport() {
+        let frame = Bounds {
+            origin: point(px(100.), px(50.)),
+            size: size(px(200.), px(400.)),
+        };
+        let caret = CaretRect {
+            x: 25.,
+            y: 50.,
+            width: 2.,
+            height: 10.,
+        };
+        let mapped = map_caret(caret, frame, 100., 200.).unwrap();
+        assert_eq!(mapped.origin, point(px(150.), px(150.)));
+        assert_eq!(mapped.size, size(px(4.), px(20.)));
+        let clipped = map_caret(
+            CaretRect {
+                x: 150.,
+                y: -20.,
+                width: 3.,
+                height: 25.,
+            },
+            frame,
+            100.,
+            200.,
+        )
+        .unwrap();
+        assert_eq!(clipped.origin, point(px(300.), px(50.)));
+        assert_eq!(clipped.size, size(px(0.), px(10.)));
+        assert!(
+            map_caret(
+                CaretRect {
+                    x: f64::NAN,
+                    ..caret
+                },
+                frame,
+                100.,
+                200.
+            )
+            .is_none()
+        );
     }
 
     fn press(pressed: &mut PressedKeys, key: &str, key_char: Option<&str>) -> String {
