@@ -1,5 +1,6 @@
 use super::*;
 use crate::browser::{self, ProcessIdentity};
+use crate::device::DENIED_PERMISSIONS;
 use crate::test_support::{FakeBrowser, Fixture, Reply, fake_browser, profile_root, test_browser};
 use broxser_core::{Device, Session};
 use std::collections::HashMap;
@@ -2116,6 +2117,23 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
 }
 
 #[test]
+fn permission_prompts_are_denied_in_every_session_context() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    let expected: Vec<Value> = ["CTX1", "CTX2"]
+        .iter()
+        .flat_map(|context| {
+            DENIED_PERMISSIONS.iter().map(move |name| {
+                json!({"permission": {"name": name}, "setting": "denied", "browserContextId": context})
+            })
+        })
+        .collect();
+    assert_eq!(peer.browser_requests("Browser.setPermission"), expected);
+    drop(live);
+}
+
+#[test]
 fn downloads_and_file_choosers_are_refused_and_reported_for_their_device() {
     let root = profile_root();
     let peer = FakePeer::start(root.path(), |_, _| false);
@@ -2610,6 +2628,15 @@ frame.src = 'http://localhost:' + location.port + '/frame-download';
 
 const FRAME_DOWNLOAD_PAGE: &str = r#"<!doctype html><body style="margin:0" onload="fetch('/event?kind=frame')"><a href="/download?name=frame.pdf" style="display:block;width:300px;height:120px;background:#c63">frame download</a></body>"#;
 
+/// Asks for the notification permission without a gesture as soon as it
+/// loads, and reports the answer, its delay and what `permissions.query` says.
+const PERMISSION_PAGE: &str = r#"<!doctype html><script>
+const ping = (name, value, ms) => fetch('/event?' + new URLSearchParams({kind: 'permission', name, value, ms: String(Math.round(ms))}));
+const t0 = performance.now();
+Notification.requestPermission().then(v => ping('notifications', v, performance.now() - t0), e => ping('notifications', 'error:' + e.name, performance.now() - t0));
+navigator.permissions.query({name: 'notifications'}).then(s => ping('query', s.state, 0), e => ping('query', 'error:' + e.name, 0));
+</script>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -2756,6 +2783,7 @@ fn fixture() -> Fixture {
             "/popup-page" => POPUP_PAGE.into(),
             "/downloads" => DOWNLOAD_PAGE.into(),
             "/frame-download" => FRAME_DOWNLOAD_PAGE.into(),
+            "/permissions" => PERMISSION_PAGE.into(),
             "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
@@ -6570,5 +6598,36 @@ fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recover
     assert_eq!(count(&fixture, "/busy-iframe-first"), 1);
     assert_eq!(count(&fixture, "/busy-iframe-second"), 1);
     assert_eq!(count(&fixture, "/download?healthy"), 1);
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_permission_requests_are_denied_at_once() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/permissions")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/permissions")
+    });
+    // Three devices, two reports each.
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| events(f, "permission").len()
+            >= 6),
+        "{:?}",
+        events(&fixture, "permission")
+    );
+    for report in events(&fixture, "permission") {
+        match report["name"].as_str() {
+            // The page is answered, not left waiting for a prompt nobody
+            // can see, and the answer is the one `query` reports.
+            "notifications" => {
+                assert_eq!(report["value"], "denied", "{report:?}");
+                let ms: u64 = report["ms"].parse().unwrap();
+                assert!(ms < 500, "answered after {ms} ms");
+            }
+            "query" => assert_eq!(report["value"], "denied", "{report:?}"),
+            other => panic!("unexpected report {other}"),
+        }
+    }
     live.close();
 }

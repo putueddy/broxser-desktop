@@ -236,11 +236,50 @@ Review evidence is retained locally in the ignored `artifacts/pr16-review/`
 directory; correction logs and screenshots are in `artifacts/pr16-fixes/`.
 The native checks use Xvfb and Mesa Lavapipe with the browser sandbox enabled.
 
+### Permissions ([ADR 0017](adr/0017-permission-prompts-denied.md))
+
+A fourth scratch Node script, not committed, requested every permission-gated
+API from one page target after a click and again without a gesture, timing each
+answer, and read `navigator.permissions.query()` for eighteen names; then the
+same with `Browser.setPermission` `denied` for the context.
+
+| Request | Headless default | Denied per context |
+| --- | --- | --- |
+| `Notification.requestPermission()` | Resolves `denied` after 1.2–1.8 s, with or without a gesture; `query` says `prompt` | `denied` in 5–17 ms; `query` says `denied` |
+| `IdleDetector.requestPermission()` | `denied` after 2.6–3.8 s (gesture); `NotAllowedError` at once without one; `query` says `prompt` | `denied` in 16 ms |
+| `getUserMedia` (no devices here) | `NotFoundError` in 50–90 ms; `query` says `prompt` for camera and microphone | The same here; `query` says `denied` |
+| `getDisplayMedia` | Never resolves (8 s) | Never resolves, even with `display-capture` denied |
+| Geolocation, MIDI, clipboard read, pointer lock, window management, push subscription, local fonts | Denied or thrown at once | Same |
+| Clipboard write, wake lock, fullscreen, persistent storage | Answered at once | Same, unless those permissions are denied too: then copy buttons and wake locks fail and `queryLocalFonts()` resolves |
+
+`Browser.setPermission` takes web descriptor names (`notifications`,
+`idle-detection`, `camera`, …); the `PermissionType` names of
+`Browser.grantPermissions` are rejected as invalid descriptors. CDP sends no
+event for a permission request.
+
+A live Helium test at `43cb397`, with a page that asks for the notification
+permission on load without a gesture:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Three devices load the page | `query` reported `prompt` on all three; two were answered `denied` after 1551 and 1812 ms and one was not answered within 10 s | All three answered `denied` within 500 ms (the test's bound; the probe measured under 20 ms) and `query` reports `denied` |
+
+| Check | Result |
+| --- | --- |
+| `permission_prompts_are_denied_in_every_session_context` (fake CDP) | Passed |
+| `live_permission_requests_are_denied_at_once` (Helium) | Failed before the change as above; passed after |
+| `bash scripts/check.sh` with permissions | Passed: 1 CLI, 8 core, 69 engine and 25 desktop tests; 39 live tests ignored by default; fmt and strict Clippy clean |
+| Live Helium suite with permissions (`--ignored`, 4 threads) | 39 of 39 passed in 75.0 s |
+
+No desktop change, so no window check was run for this capability.
+
 ### Limits
 
-- Permissions, touch input and hover media, drag and drop and accessibility keep
-  today's behavior; each is a separate decision. The audit above is their
-  evidence.
+- Touch input and hover media, drag and drop and accessibility keep today's
+  behavior; each is a separate decision. The audit above is their evidence.
+- `getDisplayMedia()` never resolves in the headless browser, denied or not.
+  Camera and microphone are denied on the probe's evidence about prompt-type
+  permissions; no device here could exercise them.
 - A refused download's document request still reaches the server; export and
   attachment flows produce no file in Broxser, and upload flows see a cancelled
   chooser. The suggested file name is the browser's, sanitized as a path, shown

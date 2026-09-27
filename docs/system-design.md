@@ -221,6 +221,10 @@ Dismiss laporan download berlaku untuk runtime saat ini dan direset saat
 restart. Panel dibatasi 360 piksel UI dengan tombol di kiri agar tetap
 terjangkau ketika lebar device melampaui window.
 
+Permission yang permintaannya akan menunggu prompt (notifikasi, deteksi idle,
+kamera, mikrofon) ditolak per context saat context dibuat, sehingga halaman
+dijawab `denied` seketika dan `permissions.query` melaporkannya (ADR 0017).
+
 ## 6. API and data contracts
 
 | Kontrak | Makna |

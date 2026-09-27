@@ -10,7 +10,9 @@ use crate::browser::{BrowserOptions, BrowserProcess};
 use crate::cdp::{
     Cancellation, Cancelled, Cdp, Event, error_message, parse_response, required_str,
 };
-use crate::device::{Commands, ExtensionObservations, extension_in_context, setup_target};
+use crate::device::{
+    Commands, ExtensionObservations, deny_permission_prompts, extension_in_context, setup_target,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use broxser_core::{MAX_DEVICES, SyncAction, SyncEvent, SyncRouter, Workspace, validate_url};
@@ -1141,6 +1143,7 @@ impl<'a> Controller<'a> {
                 json!({"behavior": "deny", "browserContextId": context, "eventsEnabled": true}),
                 None,
             )?;
+            deny_permission_prompts(self, &context)?;
             contexts.insert(session.id.as_str(), context);
         }
         for device in &workspace.devices {
