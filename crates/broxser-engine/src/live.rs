@@ -42,6 +42,10 @@ pub const MAX_DIALOG_CHARS: usize = 2048;
 /// Subframes remembered per device, so that downloads they start are
 /// attributed to it (ADR 0016).
 const MAX_TRACKED_FRAMES: usize = 256;
+/// Bounds active and retired iframe sessions, including stalled cleanup. Each
+/// keeps at most one awaited setup or resume command.
+const MAX_IFRAME_SESSIONS: usize = 128;
+const INCOMPLETE_IFRAME_ACTIVITY: &str = "Iframe activity could not be fully observed. Navigate or reload explicitly to start a fresh document.";
 /// Device status while it has an open dialog and Broxser was asked to navigate it.
 pub(crate) const DIALOG_OPEN: &str =
     "The page is waiting for an answer to its dialog; navigation was not sent.";
@@ -762,6 +766,9 @@ struct Controller<'a> {
     next_ime_target: u64,
     next_dialog: u64,
     next_popup: u64,
+    iframe_sessions: HashMap<String, IframeSession>,
+    iframe_pending: HashMap<u64, IframeCommand>,
+    iframe_cleanup: HashMap<String, IframeCleanup>,
 }
 
 struct LinkIntent {
@@ -790,6 +797,7 @@ fn same_link_activation(expected_id: u64, expected_url: &str, id: u64, url: &str
 }
 
 struct LiveDevice {
+    context: String,
     target_id: String,
     session: String,
     css: (f64, f64),
@@ -841,7 +849,56 @@ struct LiveDevice {
     popup: Option<(u64, String)>,
     /// Subframes of the current document, including frames that another
     /// renderer process now runs, so their downloads are attributed here.
-    frames: HashSet<String>,
+    frames: HashMap<String, OwnedFrame>,
+    frame_revision: u64,
+    iframe_activity_incomplete: bool,
+}
+
+struct OwnedFrame {
+    parent: String,
+    loader: Option<String>,
+}
+
+struct IframeSession {
+    device: usize,
+    frame: String,
+    parent_session: String,
+    waiting: bool,
+    deadline: Instant,
+}
+
+/// A retired session is never observed again. A busy renderer may leave its
+/// resume unanswered; retain only this bounded cleanup record until it answers
+/// or the browser reports destruction. Detach ancestors only after children.
+struct IframeCleanup {
+    device: usize,
+    frame: String,
+    parent_session: String,
+    resume: Option<u64>,
+    detaching: bool,
+}
+
+#[derive(Clone, Copy)]
+enum IframeSetup {
+    Enable,
+    Intercept,
+    AutoAttach,
+    FrameTree,
+    Resume,
+}
+
+struct IframeCommand {
+    session: String,
+    stage: IframeSetup,
+    deadline: Instant,
+    revision: u64,
+}
+
+/// Auto-attach is local to an owned page/iframe, and excludes pages (popups),
+/// workers and every other target type. It must be applied recursively.
+fn iframe_auto_attach() -> Value {
+    json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
+        "filter": [{"type": "iframe", "exclude": false}, {"exclude": true}]})
 }
 
 #[derive(Clone, Copy)]
@@ -1018,6 +1075,9 @@ impl<'a> Controller<'a> {
             next_ime_target: 0,
             next_dialog: 0,
             next_popup: 0,
+            iframe_sessions: HashMap::new(),
+            iframe_pending: HashMap::new(),
+            iframe_cleanup: HashMap::new(),
         })
     }
 
@@ -1040,6 +1100,17 @@ impl<'a> Controller<'a> {
                 self.drain()?;
             }
             self.expire(Instant::now())?;
+            for (index, device) in self.devices.iter().enumerate() {
+                if device.iframe_activity_incomplete
+                    && lock(&self.shared.status).devices[index].error.is_none()
+                {
+                    self.shared.device(index, |status| {
+                        if status.error.is_none() {
+                            status.error = Some(INCOMPLETE_IFRAME_ACTIVITY.into());
+                        }
+                    });
+                }
+            }
             if let Some(error) = self.cdp.take_detached_error() {
                 self.shared
                     .update(|status| status.protocol_error = Some(error));
@@ -1102,6 +1173,7 @@ impl<'a> Controller<'a> {
                     .min(DEFAULT_FRAME_EDGE)
             };
             self.devices.push(LiveDevice {
+                context,
                 target_id,
                 session,
                 css: (f64::from(device.width), f64::from(device.height)),
@@ -1134,8 +1206,15 @@ impl<'a> Controller<'a> {
                 dialog: None,
                 window_open: None,
                 popup: None,
-                frames: HashSet::new(),
+                frames: HashMap::new(),
+                frame_revision: 0,
+                iframe_activity_incomplete: false,
             });
+            self.command(
+                "Target.setAutoAttach",
+                iframe_auto_attach(),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
             self.command(
                 "Runtime.enable",
                 json!({}),
@@ -1354,9 +1433,14 @@ impl<'a> Controller<'a> {
             deadline: Instant::now() + self.limits.load,
         });
         let unresponsive = self.devices[index].unresponsive;
+        let incomplete = self.devices[index].iframe_activity_incomplete;
         self.shared.device(index, |device| {
             device.loading = true;
-            device.error = unresponsive.then(|| NOT_RESPONDING.to_owned());
+            device.error = if incomplete {
+                Some(INCOMPLETE_IFRAME_ACTIVITY.into())
+            } else {
+                unresponsive.then(|| NOT_RESPONDING.to_owned())
+            };
         });
         Ok(true)
     }
@@ -1597,6 +1681,16 @@ impl<'a> Controller<'a> {
     /// unanswered for the command limit is reported as not responding. None of
     /// them is sent again.
     fn expire(&mut self, now: Instant) -> Result<()> {
+        let expired: Vec<String> = self
+            .iframe_pending
+            .values()
+            .filter(|pending| now >= pending.deadline)
+            .map(|pending| pending.session.clone())
+            .collect();
+        for session in expired {
+            self.fail_iframe_setup(&session)?;
+        }
+        self.drain_iframe_cleanup()?;
         if let Some((sent, method)) = self.cdp.oldest_detached()
             && now >= sent + self.limits.command
         {
@@ -2131,6 +2225,8 @@ impl<'a> Controller<'a> {
         while let Some(event) = self.cdp.pop_event() {
             self.observe(event)?;
         }
+        self.drain_iframe_setup()?;
+        self.drain_iframe_cleanup()?;
         let ready: Vec<u64> = self.pending.keys().copied().collect();
         for id in ready {
             let Some(response) = self.cdp.take_response(id) else {
@@ -2224,6 +2320,583 @@ impl<'a> Controller<'a> {
         Ok(())
     }
 
+    fn session_owner(&self, session: Option<&str>) -> Option<(usize, bool)> {
+        let session = session?;
+        self.devices
+            .iter()
+            .position(|device| device.session == session)
+            .map(|index| (index, false))
+            .or_else(|| {
+                self.iframe_sessions
+                    .get(session)
+                    .map(|iframe| (iframe.device, true))
+            })
+    }
+
+    fn owns_frame(&self, index: usize, frame: &str) -> bool {
+        self.devices[index].target_id == frame || self.devices[index].frames.contains_key(frame)
+    }
+
+    fn frame_in_session(&self, index: usize, frame: &str, session: &str) -> bool {
+        let root = self
+            .iframe_sessions
+            .get(session)
+            .map(|iframe| iframe.frame.as_str())
+            .unwrap_or(self.devices[index].target_id.as_str());
+        let mut next = frame;
+        for _ in 0..=MAX_TRACKED_FRAMES {
+            if next == root {
+                return true;
+            }
+            let Some(parent) = self.devices[index].frames.get(next) else {
+                return false;
+            };
+            next = &parent.parent;
+        }
+        false
+    }
+
+    fn remember_frame(&mut self, index: usize, frame: &str, parent: &str) -> Result<()> {
+        if frame.is_empty() || frame.len() > 128 || parent.len() > 128 || frame == parent {
+            bail!("invalid CDP iframe identity");
+        }
+        if !self.owns_frame(index, parent) {
+            return Ok(());
+        }
+        if self
+            .devices
+            .iter()
+            .enumerate()
+            .any(|(other, _)| other != index && self.owns_frame(other, frame))
+        {
+            bail!("CDP iframe belongs to another device");
+        }
+        if frame == self.devices[index].target_id {
+            bail!("CDP subframe has the device identity");
+        }
+        let mut ancestor = parent;
+        for _ in 0..=MAX_TRACKED_FRAMES {
+            if ancestor == frame {
+                bail!("CDP frame parent cycle");
+            }
+            let Some(owner) = self.devices[index].frames.get(ancestor) else {
+                break;
+            };
+            ancestor = &owner.parent;
+        }
+        if let Some(owner) = self.devices[index].frames.get_mut(frame)
+            && owner.parent != parent
+        {
+            owner.parent = parent.to_owned();
+            self.devices[index].frame_revision += 1;
+        }
+        if !self.devices[index].frames.contains_key(frame) {
+            if self.devices[index].frames.len() >= MAX_TRACKED_FRAMES {
+                self.mark_iframe_activity_incomplete(index);
+                return Ok(());
+            }
+            self.devices[index].frames.insert(
+                frame.to_owned(),
+                OwnedFrame {
+                    parent: parent.to_owned(),
+                    loader: None,
+                },
+            );
+            self.devices[index].frame_revision += 1;
+        }
+        Ok(())
+    }
+
+    /// Forget an entire document, or a removed frame and its descendants.
+    /// Retire child sessions before accepting any more events from them.
+    fn remove_frame_subtree(&mut self, index: usize, root: Option<&str>) -> Result<()> {
+        let mut removed: HashSet<String> = match root {
+            Some(root) => [root.to_owned()].into(),
+            None => self.devices[index].frames.keys().cloned().collect(),
+        };
+        loop {
+            let before = removed.len();
+            for (frame, owner) in &self.devices[index].frames {
+                if removed.contains(&owner.parent) {
+                    removed.insert(frame.clone());
+                }
+            }
+            if before == removed.len() {
+                break;
+            }
+        }
+        self.devices[index]
+            .frames
+            .retain(|frame, _| !removed.contains(frame));
+        self.devices[index].frame_revision += 1;
+        let sessions: Vec<String> = self
+            .iframe_sessions
+            .iter()
+            .filter(|(_, iframe)| iframe.device == index && removed.contains(&iframe.frame))
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in sessions {
+            self.retire_iframe(&session)?;
+        }
+        Ok(())
+    }
+
+    fn clear_frame_children(&mut self, index: usize, frame: &str) -> Result<()> {
+        let children: Vec<String> = self.devices[index]
+            .frames
+            .iter()
+            .filter(|(_, owner)| owner.parent == frame)
+            .map(|(child, _)| child.clone())
+            .collect();
+        for child in children {
+            self.remove_frame_subtree(index, Some(&child))?;
+        }
+        // Also invalidates a frame-tree snapshot even when there were no children.
+        self.devices[index].frame_revision += 1;
+        Ok(())
+    }
+
+    fn retire_iframe(&mut self, session: &str) -> Result<()> {
+        let mut retired: HashSet<String> = [session.to_owned()].into();
+        loop {
+            let before = retired.len();
+            for (child, iframe) in &self.iframe_sessions {
+                if retired.contains(&iframe.parent_session) {
+                    retired.insert(child.clone());
+                }
+            }
+            if before == retired.len() {
+                break;
+            }
+        }
+        // Transfer an already-sent resume to cleanup; never resend it just
+        // because its response was late. Other setup responses become stale.
+        let mut resumes = HashMap::new();
+        let commands: Vec<u64> = self
+            .iframe_pending
+            .iter()
+            .filter(|(_, pending)| retired.contains(&pending.session))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in commands {
+            let pending = self.iframe_pending.remove(&id).unwrap();
+            if matches!(pending.stage, IframeSetup::Resume) {
+                resumes.insert(pending.session, id);
+            } else {
+                self.cdp.abandon(id);
+            }
+        }
+        for session in retired {
+            if let Some(iframe) = self.iframe_sessions.remove(&session) {
+                let resume = match resumes.remove(&session) {
+                    Some(id) => Some(id),
+                    None if iframe.waiting => Some(self.cdp.send(
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                        Some(&session),
+                    )?),
+                    None => None,
+                };
+                self.iframe_cleanup.insert(
+                    session,
+                    IframeCleanup {
+                        device: iframe.device,
+                        frame: iframe.frame,
+                        parent_session: iframe.parent_session,
+                        resume,
+                        detaching: false,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_iframe_activity_incomplete(&mut self, index: usize) {
+        self.devices[index].iframe_activity_incomplete = true;
+        self.shared.device(index, |device| {
+            device.error = Some(INCOMPLETE_IFRAME_ACTIVITY.into())
+        });
+    }
+
+    fn fail_iframe_setup(&mut self, session: &str) -> Result<()> {
+        if let Some(iframe) = self.iframe_sessions.get(session) {
+            let index = iframe.device;
+            self.mark_iframe_activity_incomplete(index);
+        }
+        self.retire_iframe(session)
+    }
+
+    fn drain_iframe_cleanup(&mut self) -> Result<()> {
+        let sessions: Vec<String> = self.iframe_cleanup.keys().cloned().collect();
+        for session in sessions {
+            let Some(id) = self.iframe_cleanup[&session].resume else {
+                continue;
+            };
+            if let Some(response) = self.cdp.take_response(id)
+                && error_message(&response).is_none()
+            {
+                self.iframe_cleanup.get_mut(&session).unwrap().resume = None;
+            }
+            // A failed resume does not prove the renderer is released. Keep
+            // this bounded record until target destruction, without retrying
+            // resume or detaching a potentially held renderer.
+        }
+        loop {
+            let ready = self
+                .iframe_cleanup
+                .iter()
+                .find(|(session, cleanup)| {
+                    !cleanup.detaching
+                        && cleanup.resume.is_none()
+                        && !self
+                            .iframe_cleanup
+                            .values()
+                            .any(|child| child.parent_session == **session)
+                })
+                .map(|(session, _)| session.clone());
+            let Some(session) = ready else {
+                break;
+            };
+            let cleanup = self.iframe_cleanup.get_mut(&session).unwrap();
+            cleanup.detaching = true;
+            self.cdp.send_ignored(
+                "Target.detachFromTarget",
+                json!({"sessionId": session}),
+                Some(&cleanup.parent_session),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn forget_destroyed_iframe_cleanup(&mut self, session: Option<&str>, frame: Option<&str>) {
+        let mut gone: HashSet<String> = self
+            .iframe_cleanup
+            .iter()
+            .filter(|(id, cleanup)| match session {
+                Some(session) => session == id.as_str(),
+                None => frame == Some(cleanup.frame.as_str()),
+            })
+            .map(|(session, _)| session.clone())
+            .collect();
+        loop {
+            let before = gone.len();
+            for (session, cleanup) in &self.iframe_cleanup {
+                if gone.contains(&cleanup.parent_session) {
+                    gone.insert(session.clone());
+                }
+            }
+            if before == gone.len() {
+                break;
+            }
+        }
+        for session in gone {
+            if let Some(cleanup) = self.iframe_cleanup.remove(&session)
+                && let Some(id) = cleanup.resume
+            {
+                self.cdp.abandon(id);
+            }
+        }
+    }
+
+    fn attach_iframe(&mut self, event: &Event) -> Result<()> {
+        let Some(parent_session) = event.session.as_deref() else {
+            return Ok(());
+        };
+        let owner = self.session_owner(Some(parent_session));
+        let Some(index) = owner.map(|(index, _)| index).or_else(|| {
+            self.iframe_cleanup
+                .get(parent_session)
+                .map(|cleanup| cleanup.device)
+        }) else {
+            return Ok(());
+        };
+        let release_only = owner.is_none();
+        let Some(info) = event.params.get("targetInfo") else {
+            return Ok(());
+        };
+        let Some(session) = event.params.get("sessionId").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(frame) = info.get("targetId").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if info.get("type").and_then(Value::as_str) != Some("iframe")
+            || info
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .is_some_and(|context| context != self.devices[index].context)
+        {
+            return Ok(());
+        }
+        if self.iframe_sessions.contains_key(session) || self.iframe_cleanup.contains_key(session) {
+            return Ok(());
+        }
+        if session.is_empty()
+            || session.len() > 128
+            || frame.is_empty()
+            || frame.len() > 128
+            || self.iframe_sessions.len() + self.iframe_cleanup.len() >= MAX_IFRAME_SESSIONS
+        {
+            bail!("CDP iframe session limit exceeded or invalid session identity");
+        }
+        let parent_session = event.session.as_ref().unwrap().clone();
+        if release_only {
+            let resume =
+                self.cdp
+                    .send("Runtime.runIfWaitingForDebugger", json!({}), Some(session))?;
+            self.iframe_cleanup.insert(
+                session.to_owned(),
+                IframeCleanup {
+                    device: index,
+                    frame: frame.to_owned(),
+                    parent_session,
+                    resume: Some(resume),
+                    detaching: false,
+                },
+            );
+            return Ok(());
+        }
+        let parent = self
+            .iframe_sessions
+            .get(&parent_session)
+            .map(|iframe| iframe.frame.clone())
+            .unwrap_or(self.devices[index].target_id.clone());
+        if !self.owns_frame(index, frame) {
+            let dom_parent = info
+                .get("parentFrameId")
+                .and_then(Value::as_str)
+                .filter(|parent| self.owns_frame(index, parent))
+                .unwrap_or(&parent);
+            self.remember_frame(index, frame, dom_parent)?;
+        }
+        // A new session can replace the renderer for an existing frame. Retire
+        // its old debugger sessions, but keep the frame identity across swaps.
+        let previous: Vec<String> = self
+            .iframe_sessions
+            .iter()
+            .filter(|(_, iframe)| iframe.frame == frame)
+            .map(|(session, _)| session.clone())
+            .collect();
+        for old in previous {
+            self.retire_iframe(&old)?;
+        }
+        self.iframe_sessions.insert(
+            session.to_owned(),
+            IframeSession {
+                device: index,
+                frame: frame.to_owned(),
+                parent_session,
+                waiting: event
+                    .params
+                    .get("waitingForDebugger")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                deadline: Instant::now() + self.limits.command,
+            },
+        );
+        self.send_iframe_setup(session, IframeSetup::Enable)
+    }
+
+    fn send_iframe_setup(&mut self, session: &str, stage: IframeSetup) -> Result<()> {
+        let (method, params) = match stage {
+            IframeSetup::Enable => ("Page.enable", json!({})),
+            IframeSetup::Intercept => (
+                "Page.setInterceptFileChooserDialog",
+                json!({"enabled": true, "cancel": true}),
+            ),
+            IframeSetup::AutoAttach => ("Target.setAutoAttach", iframe_auto_attach()),
+            IframeSetup::FrameTree => ("Page.getFrameTree", json!({})),
+            IframeSetup::Resume => ("Runtime.runIfWaitingForDebugger", json!({})),
+        };
+        let index = self.iframe_sessions[session].device;
+        let id = self.cdp.send(method, params, Some(session))?;
+        self.iframe_pending.insert(
+            id,
+            IframeCommand {
+                session: session.to_owned(),
+                stage,
+                deadline: self.iframe_sessions[session].deadline,
+                revision: self.devices[index].frame_revision,
+            },
+        );
+        Ok(())
+    }
+
+    fn drain_iframe_setup(&mut self) -> Result<()> {
+        let ready: Vec<u64> = self.iframe_pending.keys().copied().collect();
+        for id in ready {
+            let Some(response) = self.cdp.take_response(id) else {
+                continue;
+            };
+            let pending = self.iframe_pending.remove(&id).unwrap();
+            let Some(iframe) = self.iframe_sessions.get(&pending.session) else {
+                continue;
+            };
+            let (index, frame) = (iframe.device, iframe.frame.clone());
+            if error_message(&response).is_some() {
+                self.fail_iframe_setup(&pending.session)?;
+                continue;
+            }
+            let next = match pending.stage {
+                IframeSetup::Enable => IframeSetup::Intercept,
+                IframeSetup::Intercept => IframeSetup::AutoAttach,
+                IframeSetup::AutoAttach => IframeSetup::FrameTree,
+                IframeSetup::FrameTree => {
+                    // A remove/navigation event after the request makes its old
+                    // tree obsolete; it must never resurrect old ownership.
+                    let stale = self.devices[index].frame_revision != pending.revision;
+                    if !stale
+                        && let Some(tree) = response.pointer("/result/frameTree")
+                        && tree.pointer("/frame/id").and_then(Value::as_str) == Some(&frame)
+                    {
+                        self.remember_frame_tree(index, tree)?;
+                    }
+                    if stale {
+                        // Repeat only this read-only inventory after a concurrent
+                        // lifecycle change, within the original setup deadline.
+                        IframeSetup::FrameTree
+                    } else {
+                        IframeSetup::Resume
+                    }
+                }
+                IframeSetup::Resume => {
+                    self.iframe_sessions
+                        .get_mut(&pending.session)
+                        .unwrap()
+                        .waiting = false;
+                    continue;
+                }
+            };
+            self.send_iframe_setup(&pending.session, next)?;
+        }
+        Ok(())
+    }
+
+    fn remember_frame_tree(&mut self, index: usize, tree: &Value) -> Result<()> {
+        let mut trees = vec![tree];
+        let mut seen = 0;
+        while let Some(tree) = trees.pop() {
+            seen += 1;
+            if seen > MAX_TRACKED_FRAMES + 1 {
+                self.mark_iframe_activity_incomplete(index);
+                return Ok(());
+            }
+            if let Some(frame) = tree.pointer("/frame/id").and_then(Value::as_str)
+                && let Some(loader) = tree.pointer("/frame/loaderId").and_then(Value::as_str)
+            {
+                if loader.len() > 128 {
+                    bail!("invalid CDP frame loader identity");
+                }
+                if let Some(owner) = self.devices[index].frames.get_mut(frame) {
+                    owner.loader = Some(loader.to_owned());
+                }
+            }
+            if let Some(parent) = tree.pointer("/frame/id").and_then(Value::as_str)
+                && let Some(children) = tree.get("childFrames").and_then(Value::as_array)
+            {
+                if trees.len() + children.len() > MAX_TRACKED_FRAMES + 1 {
+                    self.mark_iframe_activity_incomplete(index);
+                    return Ok(());
+                }
+                for child in children {
+                    if let Some(frame) = child.pointer("/frame/id").and_then(Value::as_str) {
+                        self.remember_frame(index, frame, parent)?;
+                        trees.push(child);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn chooser_session(&self, index: usize, frame: &str) -> &str {
+        let mut next = frame;
+        for _ in 0..=MAX_TRACKED_FRAMES {
+            if let Some((session, _)) = self
+                .iframe_sessions
+                .iter()
+                .find(|(_, iframe)| iframe.device == index && iframe.frame == next)
+            {
+                return session;
+            }
+            let Some(owner) = self.devices[index].frames.get(next) else {
+                break;
+            };
+            next = &owner.parent;
+        }
+        &self.devices[index].session
+    }
+
+    fn observe_frame_lifecycle(&mut self, index: usize, event: &Event) -> Result<bool> {
+        let text = |field: &str| event.params.get(field).and_then(Value::as_str);
+        let session = event.session.as_deref().unwrap();
+        match event.method.as_str() {
+            "Page.frameAttached" => {
+                if let (Some(frame), Some(parent)) = (text("frameId"), text("parentFrameId"))
+                    && self.frame_in_session(index, parent, session)
+                {
+                    self.remember_frame(index, frame, parent)?;
+                }
+            }
+            "Page.frameDetached" => {
+                if text("reason") == Some("remove")
+                    && let Some(frame) = text("frameId")
+                    && self.frame_in_session(index, frame, session)
+                {
+                    self.remove_frame_subtree(index, Some(frame))?;
+                }
+                // "swap" retains the ownership of this frame.
+            }
+            "Page.frameNavigated" => {
+                let Some(frame) = event.params.get("frame") else {
+                    return Ok(true);
+                };
+                let Some(id) = frame.get("id").and_then(Value::as_str) else {
+                    return Ok(true);
+                };
+                if id == self.devices[index].target_id {
+                    return Ok(false);
+                }
+                if let Some(parent) = frame.get("parentId").and_then(Value::as_str)
+                    && self.frame_in_session(index, parent, session)
+                {
+                    self.remember_frame(index, id, parent)?;
+                }
+                if self.frame_in_session(index, id, session)
+                    && let Some(loader) = frame.get("loaderId").and_then(Value::as_str)
+                {
+                    if loader.len() > 128 {
+                        bail!("invalid CDP frame loader identity");
+                    }
+                    let changed = self.devices[index]
+                        .frames
+                        .get(id)
+                        .and_then(|frame| frame.loader.as_deref())
+                        .is_some_and(|old| old != loader);
+                    if changed {
+                        self.clear_frame_children(index, id)?;
+                    }
+                    if let Some(frame) = self.devices[index].frames.get_mut(id) {
+                        frame.loader = Some(loader.to_owned());
+                    }
+                }
+            }
+            "Page.fileChooserOpened" => {
+                if let Some(frame) = text("frameId")
+                    && self.frame_in_session(index, frame, session)
+                    && self.chooser_session(index, frame) == session
+                {
+                    self.shared.device(index, |device| {
+                        device.file_choosers = device.file_choosers.saturating_add(1);
+                    });
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     fn observe(&mut self, event: Event) -> Result<()> {
         let params = &event.params;
         let text = |field: &str| params.get(field).and_then(Value::as_str);
@@ -2268,15 +2941,40 @@ impl<'a> Controller<'a> {
                 }
                 return Ok(());
             }
-            "Target.targetCrashed" | "Target.detachedFromTarget" => {
-                if let Some(index) = self
-                    .devices
+            "Target.attachedToTarget" => {
+                self.attach_iframe(&event)?;
+                return Ok(());
+            }
+            "Target.targetCrashed" | "Target.targetDestroyed" | "Target.detachedFromTarget" => {
+                let sessions: Vec<String> = self
+                    .iframe_sessions
                     .iter()
-                    .position(|device| Some(device.target_id.as_str()) == text("targetId"))
-                {
+                    .filter(|(session, iframe)| match text("sessionId") {
+                        Some(detached) => detached == session.as_str(),
+                        None => text("targetId") == Some(iframe.frame.as_str()),
+                    })
+                    .map(|(session, _)| session.clone())
+                    .collect();
+                for session in sessions {
+                    if let Some(iframe) = self.iframe_sessions.get(&session) {
+                        let (index, frame) = (iframe.device, iframe.frame.clone());
+                        if event.method != "Target.detachedFromTarget" {
+                            self.remove_frame_subtree(index, Some(&frame))?;
+                        } else {
+                            self.clear_frame_children(index, &frame)?;
+                        }
+                    }
+                    self.retire_iframe(&session)?;
+                }
+                self.forget_destroyed_iframe_cleanup(text("sessionId"), text("targetId"));
+                if let Some(index) = self.devices.iter().position(|device| {
+                    Some(device.target_id.as_str()) == text("targetId")
+                        || Some(device.session.as_str()) == text("sessionId")
+                }) {
                     let crashed = event.method == "Target.targetCrashed";
                     // The renderer or the session that owed these answers is
                     // gone; the error below describes the device instead.
+                    self.remove_frame_subtree(index, None)?;
                     self.forget_input(index);
                     self.forget_navigation(index);
                     self.invalidate_ime(index);
@@ -2300,7 +2998,7 @@ impl<'a> Controller<'a> {
             "Browser.downloadWillBegin" => {
                 if let Some(frame) = text("frameId")
                     && let Some(index) = self.devices.iter().position(|device| {
-                        device.target_id == frame || device.frames.contains(frame)
+                        device.target_id == frame || device.frames.contains_key(frame)
                     })
                 {
                     let download = DownloadState {
@@ -2316,13 +3014,14 @@ impl<'a> Controller<'a> {
             }
             _ => {}
         }
-        let Some(index) = self
-            .devices
-            .iter()
-            .position(|device| event.session.as_deref() == Some(device.session.as_str()))
-        else {
+        let Some((index, iframe)) = self.session_owner(event.session.as_deref()) else {
             return Ok(());
         };
+        if self.observe_frame_lifecycle(index, &event)? || iframe {
+            // Iframe sessions never feed top-level navigation, input, sync,
+            // dialogs or screencast state.
+            return Ok(());
+        }
         match event.method.as_str() {
             "Runtime.executionContextCreated" => {
                 if let Some(context) = params.get("context")
@@ -2620,7 +3319,8 @@ impl<'a> Controller<'a> {
                 self.forget_input(index);
                 self.invalidate_ime(index);
                 self.devices[index].dialog = None;
-                self.devices[index].frames.clear();
+                self.remove_frame_subtree(index, None)?;
+                self.devices[index].iframe_activity_incomplete = false;
                 let matches_reload =
                     self.devices[index]
                         .navigation
@@ -2736,28 +3436,6 @@ impl<'a> Controller<'a> {
             }
             "Page.windowOpen" => {
                 self.devices[index].window_open = text("url").map(str::to_owned);
-            }
-            "Page.frameAttached" => {
-                let frames = &mut self.devices[index].frames;
-                if let Some(frame) = text("frameId")
-                    && frame.len() <= 128
-                    && frames.len() < MAX_TRACKED_FRAMES
-                {
-                    frames.insert(frame.to_owned());
-                }
-            }
-            // A frame that another renderer process takes over ("swap") stays
-            // part of this page; its downloads still name it.
-            "Page.frameDetached" if text("reason") == Some("remove") => {
-                if let Some(frame) = text("frameId") {
-                    self.devices[index].frames.remove(frame);
-                }
-            }
-            // Interception cancels the chooser for the page (ADR 0016).
-            "Page.fileChooserOpened" => {
-                self.shared.device(index, |device| {
-                    device.file_choosers = device.file_choosers.saturating_add(1);
-                });
             }
             _ => {}
         }

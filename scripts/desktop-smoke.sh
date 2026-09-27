@@ -186,9 +186,21 @@ restart_run() {
     xdotool mousemove --window "$window" 1300 839 click --repeat 2 --delay 0 1 key --delay 0 ctrl+q
   else
     xdotool mousemove --window "$window" 1300 839 click --repeat 2 --delay 0 1
-    sleep 3
-    loaded=$(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /live.html || true)
-    [[ $loaded -gt 0 ]] || { echo "$label: the restarted runtime loaded nothing" >&2; return 1; }
+    # Startup can outlast a fixed sleep under load. Require the new runtime's
+    # fixture request, within the same bound as the initial startup above.
+    for _ in $(seq 300); do
+      loaded=$(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /live.html || true)
+      [[ $loaded -gt 0 ]] && break
+      kill -0 "$app" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ $loaded -eq 0 ]]; then
+      echo "$label: the restarted runtime loaded nothing within 30 s" >&2
+      xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+      timeout 15 tail -s 0.05 --pid="$app" -f /dev/null || kill -TERM "$app" 2>/dev/null || true
+      wait "$app" || true
+      return 1
+    fi
     xdotool mousemove --window "$window" 600 400 key ctrl+q
   fi
   timeout 15 tail -s 0.05 --pid="$app" -f /dev/null || { echo "$label: did not exit" >&2; return 1; }
@@ -332,7 +344,8 @@ typing_run() {
 # Fails once TIMEOUT passes without a match. With a ninth argument "absent" it
 # instead succeeds, printing nothing, once fewer than 20 pixels match; with
 # "filled" it counts only pixels whose neighbor two rows below also matches, so
-# one-pixel borders of the same color do not count. "absent,filled" combines both.
+# horizontal one-pixel borders do not count. Vertical borders still count, so
+# keep them outside the region. "absent,filled" combines both.
 find_color() {
   python3 - "$@" <<'PY'
 import ctypes, sys, time
@@ -604,10 +617,139 @@ download_run() {
   done
   # No file may appear anywhere the browser could write.
   local saved
-  saved=$(find "$TMPDIR" "$HOME/Downloads" -name 'notes.txt*' 2>/dev/null | wc -l)
+  local download_roots=("$TMPDIR")
+  [[ -d $HOME/Downloads ]] && download_roots+=("$HOME/Downloads")
+  saved=$(find "${download_roots[@]}" -name 'notes.txt*' | wc -l)
   [[ $saved -eq 0 ]] || failure=${failure:-"$saved file(s) named notes.txt saved"}
   echo "$label: ${failure:-refused and reported, nothing saved}; exit $code;" \
     "$left_processes browser processes and $left_profiles profiles left"
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
+# A 1440 CSS-pixel desktop at 100% is wider than this 1360-pixel window.
+# Dismiss must remain reachable after scrolling down the host canvas. After
+# dismissing, kill only this app's browser and explicitly restart: the first
+# new download must have its own visible report, as must another download
+# after dismissing that one. This covers both report layout and runtime-local
+# dismissal counts (ADR 0016), which the small phone smoke cannot exercise.
+download_desktop_restart_run() {
+  local label=$1
+  local app window= failure= button browser stage before clicks x y code=0
+  local left_processes left_profiles
+  python3 - "$work/download-desktop.json" <<'PY'
+import json, sys
+with open("examples/workspace.json") as source:
+    workspace = json.load(source)
+workspace["devices"] = [device for device in workspace["devices"] if device["id"] == "desktop"]
+workspace["devices"][0].update(width=1440, height=900)
+with open(sys.argv[1], "w") as destination:
+    json.dump(workspace, destination)
+PY
+  "$binary" --workspace "$work/download-desktop.json" --url "http://127.0.0.1:$port/download.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    # Xvfb has no window manager; focus before resize to get the first frame.
+    for _ in $(seq 100); do
+      xdotool windowfocus "$window" 2>/dev/null && break
+      sleep 0.05
+    done
+    xdotool windowsize "$window" 1360 861 || true
+    xdotool mousemove --window "$window" 600 400 || true
+    if ! button=$(find_color "$window" 1300 10 40 38 252c29 6 30 filled); then
+      failure="the zoom-in control did not appear"
+    else
+      read -r x y _ <<< "$button"
+      # Four steps of 12.5% take the initial 50% display scale to 100%.
+      xdotool mousemove --window "$window" "$x" "$y" click --repeat 4 --delay 250 1
+    fi
+    for stage in initial after-restart fresh; do
+      [[ -n $failure ]] && break
+      # The gutter belongs to the host canvas, so wheel events scroll the
+      # card rather than the page. Scroll to the frame before each gesture.
+      xdotool mousemove --window "$window" 242 400 click --repeat 30 --delay 20 4
+      if ! button=$(find_color "$window" 267 180 1080 600 3b82f6 40 30); then
+        failure="$stage: the desktop frame did not show the page"
+        break
+      fi
+      before=$(grep -c -- '/event?download=clicked' "$work/requests" || true)
+      read -r x y _ <<< "$button"
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      for _ in $(seq 100); do
+        clicks=$(grep -c -- '/event?download=clicked' "$work/requests" || true)
+        [[ $clicks -gt $before ]] && break
+        sleep 0.1
+      done
+      if [[ $clicks -le $before ]]; then
+        failure="$stage: the page did not report the download gesture within 10 s"
+        break
+      fi
+      xdotool mousemove --window "$window" 242 400 click --repeat 30 --delay 20 5
+      # Interior only: filled filtering also matches vertical card borders.
+      # The desktop's right border is beyond the window at 100%; x267 also
+      # excludes its left border. The status bar starts below this region.
+      if ! button=$(find_color "$window" 267 60 1080 750 7ce29b 6 10 filled); then
+        failure="$stage: Dismiss was not visible in the desktop card at 100%"
+        break
+      fi
+      read -r x y _ <<< "$button"
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      if ! find_color "$window" 267 60 1080 750 7ce29b 6 5 absent,filled; then
+        failure="$stage: the report stayed after Dismiss"
+        break
+      fi
+      echo "$label: $stage report visible and dismissed at 100%"
+      if [[ $stage == initial ]]; then
+        browser=$(pgrep -P "$app" -f -- "--user-data-dir=$TMPDIR/broxser-cdp-" || true)
+        if [[ $(wc -w <<< "$browser") -ne 1 ]]; then
+          failure="expected one app-owned browser: $browser"
+          break
+        fi
+        kill -KILL "$browser"
+        for _ in $(seq 200); do
+          [[ -z $(find "$TMPDIR" -maxdepth 1 -name 'broxser-cdp-*' -print -quit) ]] && break
+          sleep 0.05
+        done
+        if ! button=$(find_color "$window" 1100 818 245 36 7ce29b 6 10 filled); then
+          failure="Restart runtime did not appear after the browser stopped"
+          break
+        fi
+        before=$(wc -l < "$work/requests")
+        read -r x y _ <<< "$button"
+        xdotool mousemove --window "$window" "$x" "$y" click 1
+        for _ in $(seq 200); do
+          [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- '/download.html' || true) -gt 0 ]] && break
+          sleep 0.1
+        done
+        if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- '/download.html' || true) -eq 0 ]]; then
+          failure="the restarted browser did not load the fixture within 20 s"
+          break
+        fi
+      fi
+    done
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool windowfocus "$window" mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-three independent reports dismissed, including the first after restart}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
@@ -622,4 +764,5 @@ typing_run "typing while pages animate" animation.html
 dialog_run "dialog answered on the card"
 popup_run "popup closed and opened on the card"
 download_run "download refused on the card"
+download_desktop_restart_run "desktop download dismissal after restart"
 echo "desktop smoke passed"

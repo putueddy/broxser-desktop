@@ -61,16 +61,43 @@ runtime at `6fefab7` found:
   until removal, across renderer swaps, and cleared with each new document, so
   a cross-site frame's download is the device's too. A frame Broxser does not
   know reports nothing.
+- Device sessions auto-attach to iframe renderer targets only, and configure
+  each attached iframe to do the same for its own descendants. The browser-level
+  target and page targets are not auto-attached, so this does not change popup
+  handling. New iframe renderers wait during asynchronous setup: enable Page
+  events, install chooser cancellation, enable recursive attachment, read the
+  existing frame tree, then resume. Ownership follows the DOM parent tree,
+  including same-process ancestors between renderer targets; removed subtrees
+  and replaced documents retire their sessions and pending setup results.
+  Child-session events update frame ownership and chooser counts only; they do
+  not enter the device's main-frame input, IME, dialog or navigation-sync paths.
+- The whole iframe setup uses one command deadline. A setup error or timeout
+  marks that device's current document as having incomplete iframe activity
+  reports; other devices keep running. A fresh main document clears that state;
+  the report offers an explicit navigation or reload, with no automatic retry.
+  Retired debugger-held sessions wait asynchronously for their resume response
+  before detachment, so a temporarily busy renderer can recover without being
+  left paused. Late replies cannot restore retired frame ownership.
+- Frame ownership remains bounded to 256 subframes per device; reaching that
+  limit reports incomplete activity for that device instead of stopping peers.
+  Active and retiring iframe sessions share a runtime limit of 128. Exhausting
+  that global safety budget stops the runtime with an explicit error and browser
+  cleanup, rather than accumulating untracked debugger-held renderers.
 - Broxser's own navigation (Go, Reload, a synced link) to an address that is a
   download ends without a navigation error; the download report tells what
   happened, and the device stays on its page. A capture run reports the
   address as a download in its navigation error.
 - Every device intercepts file choosers with `cancel`: the page gets the
   `cancel` event as before and no file, and the device counts the chooser. No
-  file of the user's is read.
+  file of the user's is read. The same interception is installed on attached
+  iframe renderer sessions and their reports are attributed to the owning device.
 - The card's activity line says "N download(s) refused" and "N file chooser(s)
   cancelled"; a refused download also shows "Refused a download the page
   started" with the file name and address and a Dismiss that only hides it.
+  Dismissal belongs to the current runtime and is cleared when it is replaced,
+  since the download count starts over. The panel is at most 360 UI pixels wide
+  with Dismiss at the left edge, keeping it reachable on wide devices in the
+  vertically scrolling canvas.
 
 ## Consequences
 
@@ -93,3 +120,19 @@ a `download` attribute link, a cross-site frame's link, a file input, Go to a
 download, and no file in the profile or `~/Downloads`). Desktop: the smoke run
 "download refused on the card" in a real X11 window. Results are in
 `docs/validation.md` (P1.6).
+
+The review fixes add fake-CDP coverage for recursive sessions, DOM ancestry,
+renderer swaps, stale inventories and replies, retirement order, setup errors
+and deadlines, and per-device frame limits. The Helium tests
+`live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device` and
+`live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recovers`
+exercise nested renderer targets, separate-device controls, busy-renderer
+recovery, cancellation and no replay. The desktop smoke
+`download_desktop_restart_run` checks Dismiss at 100% on a 1440 px device in a
+1360 px window, including the first report after runtime restart.
+
+The recursive attachment follows the CDP
+[`Target.setAutoAttach` contract](https://github.com/ChromeDevTools/devtools-protocol/blob/master/pdl/domains/Target.pdl): attachment applies to directly related targets,
+and newly paused targets are resumed with `Runtime.runIfWaitingForDebugger`.
+The iframe filter and lifecycle behavior are qualified against the pinned Helium
+runtime, rather than inferred from protocol availability alone.

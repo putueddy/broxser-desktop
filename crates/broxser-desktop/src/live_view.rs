@@ -33,10 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// UI pixels per wheel line when the platform reports lines instead of pixels.
 const WHEEL_LINE: f32 = 40.0;
-/// Widest dialog panel, in UI pixels. It starts at the frame's left edge and
+/// Widest dialog or download panel, in UI pixels. It starts at the frame's left edge and
 /// the canvas does not scroll sideways, so the panel of a wide device stays
 /// readable in a half-width window.
-const DIALOG_WIDTH: f32 = 360.0;
+const PANEL_WIDTH: f32 = 360.0;
 
 pub(crate) struct LiveView {
     workspace: Workspace,
@@ -914,6 +914,8 @@ impl LiveView {
             device.last_point = None;
             device.bounds.set(None);
             device.invalidated_ime_target = None;
+            // Download counts start over with each runtime.
+            device.dismissed_download = None;
         }
         let text = self.url.read(cx).text().to_owned();
         if validate_url(&text).is_ok() {
@@ -1356,7 +1358,7 @@ impl LiveView {
             .when_some(
                 open_dialog(&self.status, self.session.is_some(), index).cloned(),
                 |this, dialog| {
-                    let panel = width.clamp(180., DIALOG_WIDTH);
+                    let panel = width.clamp(180., PANEL_WIDTH);
                     this.child(self.dialog_panel(index, &dialog, panel, cx))
                 },
             )
@@ -1456,7 +1458,7 @@ impl LiveView {
                         index,
                         &download,
                         status.downloads,
-                        width.max(180.),
+                        width.clamp(180., PANEL_WIDTH),
                         cx,
                     ))
                 },
@@ -1516,7 +1518,7 @@ impl LiveView {
                     .child(url),
             )
             .child(
-                div().flex().justify_end().child(
+                div().flex().child(
                     div()
                         .id(("download-dismiss", index))
                         .cursor_pointer()

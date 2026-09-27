@@ -5753,3 +5753,822 @@ fn download_names(root: &Path) -> Vec<String> {
     found.sort();
     found
 }
+
+fn iframe_event(session: &str, method: &str, params: Value) -> Value {
+    json!({"method": method, "sessionId": session, "params": params})
+}
+
+fn iframe_attached(parent: &str, session: &str, frame: &str) -> Value {
+    iframe_event(
+        parent,
+        "Target.attachedToTarget",
+        json!({
+            "sessionId": session, "waitingForDebugger": true,
+            "targetInfo": {"targetId": frame, "type": "iframe", "browserContextId": "CTX1"}
+        }),
+    )
+}
+
+fn frame_download(frame: &str) -> Value {
+    json!({"method": "Browser.downloadWillBegin", "params": {
+        "frameId": frame, "guid": frame, "url": format!("http://localhost/{frame}"),
+        "suggestedFilename": "nested.pdf"
+    }})
+}
+
+#[test]
+fn iframe_sessions_recursively_cancel_choosers_and_own_nested_downloads() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    assert!(peer.browser_requests("Target.setAutoAttach").is_empty());
+    for session in ["S0", "S1", "S2"] {
+        assert_eq!(
+            peer.last_params("Target.setAutoAttach", session),
+            iframe_auto_attach()
+        );
+    }
+    peer.event(iframe_attached("S1", "I1", "F1"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I1", 1);
+    peer.event(iframe_attached("I1", "I2", "F2"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I2", 1);
+    for session in ["I1", "I2"] {
+        assert_eq!(
+            peer.last_params("Page.setInterceptFileChooserDialog", session),
+            json!({"enabled": true, "cancel": true})
+        );
+        assert_eq!(
+            peer.last_params("Target.setAutoAttach", session),
+            iframe_auto_attach()
+        );
+        assert_eq!(peer.count("Page.enable", session), 1);
+        assert_eq!(peer.count("DOM.setFileInputFiles", session), 0);
+    }
+    peer.event(iframe_event(
+        "I2",
+        "Page.frameAttached",
+        json!({
+            "frameId": "F3", "parentFrameId": "F2"
+        }),
+    ));
+    for (session, frame) in [("I1", "F1"), ("I2", "F2"), ("I2", "F3")] {
+        peer.event(iframe_event(
+            session,
+            "Page.fileChooserOpened",
+            json!({"frameId": frame}),
+        ));
+    }
+    // Top-session mirrors and events of other devices do not double-count.
+    peer.event(iframe_event(
+        "S1",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F2"}),
+    ));
+    peer.event(iframe_event(
+        "S0",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F2"}),
+    ));
+    for frame in ["F1", "F2", "F3"] {
+        peer.event(frame_download(frame));
+    }
+    // Child-session events must not modify top-level navigation/input/sync state.
+    peer.event(iframe_event(
+        "I2",
+        "Page.frameNavigated",
+        json!({
+            "frame": {"id": "F2", "loaderId": "L1", "url": "http://localhost/nested"}
+        }),
+    ));
+    peer.event(iframe_event(
+        "I2",
+        "Page.javascriptDialogOpening",
+        json!({"type": "alert"}),
+    ));
+    let status = wait_for(&live, "nested activity", Duration::from_secs(3), |s| {
+        s.devices[1].file_choosers == 3 && s.devices[1].downloads == 3
+    });
+    assert_eq!(status.devices[0].file_choosers, 0);
+    assert_eq!(status.devices[2].file_choosers, 0);
+    assert_eq!(status.devices[0].downloads, 0);
+    assert_eq!(status.devices[2].downloads, 0);
+    assert!(status.devices[1].dialog.is_none());
+    assert_eq!(status.devices[1].url, "");
+    // Removing an ancestor invalidates all child identities and sessions.
+    peer.event(iframe_event(
+        "S1",
+        "Page.frameDetached",
+        json!({"frameId": "F1", "reason": "remove"}),
+    ));
+    for frame in ["F1", "F2", "F3"] {
+        peer.event(frame_download(frame));
+    }
+    peer.event(iframe_event(
+        "I2",
+        "Page.frameAttached",
+        json!({"frameId": "STALE", "parentFrameId": "F2"}),
+    ));
+    peer.event(iframe_event(
+        "I2",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F2"}),
+    ));
+    peer.event(frame_download("STALE"));
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(live.status().devices[1].downloads, 3);
+    assert_eq!(live.status().devices[1].file_choosers, 3);
+    assert_eq!(peer.count("Runtime.runIfWaitingForDebugger", "I2"), 1);
+    drop(live);
+}
+
+#[test]
+fn iframe_frame_tree_snapshots_cannot_restore_removed_documents() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.getFrameTree" && session.is_some_and(|s| s.starts_with('I'))
+    });
+    let live = fake_live(root.path(), Limits::default());
+    let reply_tree = |peer: &FakePeer, session: &str, frame: &str, child: &str| {
+        peer.event(
+            json!({"id": peer.last_request_id("Page.getFrameTree", session), "result": {
+                "frameTree": {"frame": {"id": frame}, "childFrames": [{"frame": {"id": child}}]}
+            }}),
+        );
+    };
+    peer.event(iframe_attached("S0", "I1", "F1"));
+    wait_for_requests(&peer, "Page.getFrameTree", "I1", 1);
+    reply_tree(&peer, "I1", "F1", "EXISTING");
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I1", 1);
+    peer.event(frame_download("EXISTING"));
+    wait_for(
+        &live,
+        "existing child ownership",
+        Duration::from_secs(2),
+        |s| s.devices[0].downloads == 1,
+    );
+    peer.event(iframe_attached("I1", "I2", "F2"));
+    wait_for_requests(&peer, "Page.getFrameTree", "I2", 1);
+    // An iframe new document clears descendants without retiring its own session.
+    for loader in ["L1", "L2"] {
+        peer.event(iframe_event(
+            "I1",
+            "Page.frameNavigated",
+            json!({"frame": {
+                "id": "F1", "loaderId": loader, "url": "http://localhost/new"
+            }}),
+        ));
+    }
+    reply_tree(&peer, "I2", "F2", "STALE");
+    peer.event(iframe_event(
+        "I2",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F2"}),
+    ));
+    for frame in ["F2", "STALE", "EXISTING"] {
+        peer.event(frame_download(frame));
+    }
+    peer.event(frame_download("F1"));
+    wait_for(
+        &live,
+        "replacement ownership",
+        Duration::from_secs(2),
+        |s| s.devices[0].downloads == 2,
+    );
+    assert_eq!(live.status().devices[0].file_choosers, 0);
+    // Main document replacement retires the remaining iframe session.
+    peer.event(iframe_event(
+        "S0",
+        "Page.frameNavigated",
+        json!({"frame": {
+            "id": "T0", "loaderId": "MAIN2", "url": "http://localhost/new-main"
+        }}),
+    ));
+    peer.event(iframe_event(
+        "I1",
+        "Page.frameAttached",
+        json!({"frameId": "LATE", "parentFrameId": "F1"}),
+    ));
+    for frame in ["F1", "LATE"] {
+        peer.event(frame_download(frame));
+    }
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(live.status().devices[0].downloads, 2);
+    peer.release();
+    drop(live);
+}
+
+#[test]
+fn iframe_detach_and_swaps_retire_setup_without_replaying_input() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.enable" && session == Some("I-old")
+    });
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(iframe_attached("S0", "I-old", "F1"));
+    wait_for_requests(&peer, "Page.enable", "I-old", 1);
+    peer.event(iframe_event(
+        "S0",
+        "Target.detachedFromTarget",
+        json!({"sessionId": "I-old"}),
+    ));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I-old", 1);
+    peer.event(iframe_event(
+        "S0",
+        "Page.frameDetached",
+        json!({"frameId": "F1", "reason": "swap"}),
+    ));
+    peer.event(iframe_attached("S0", "I-new", "F1"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I-new", 1);
+    peer.release();
+    peer.event(iframe_event(
+        "I-old",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F1"}),
+    ));
+    peer.event(iframe_event(
+        "I-new",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F1"}),
+    ));
+    peer.event(frame_download("F1"));
+    wait_for(&live, "swapped renderer", Duration::from_secs(2), |s| {
+        s.devices[0].downloads == 1 && s.devices[0].file_choosers == 1
+    });
+    assert_eq!(peer.count("Page.setInterceptFileChooserDialog", "I-old"), 0);
+    assert_eq!(peer.count("Runtime.runIfWaitingForDebugger", "I-old"), 1);
+    assert_eq!(peer.count("Input.dispatchMouseEvent", "I-new"), 0);
+    peer.event(json!({"method": "Target.targetCrashed", "params": {"targetId": "F1"}}));
+    peer.event(frame_download("F1"));
+    peer.event(iframe_event(
+        "I-new",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F1"}),
+    ));
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(live.status().devices[0].downloads, 1);
+    assert_eq!(live.status().devices[0].file_choosers, 1);
+    drop(live);
+}
+
+#[test]
+fn iframe_setup_deadline_does_not_block_other_devices_or_leave_held_renderers() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        matches!(method, "Page.enable" | "Runtime.runIfWaitingForDebugger")
+            && session == Some("I-stuck")
+    });
+    let live = fake_live(
+        root.path(),
+        Limits {
+            command: Duration::from_millis(300),
+            ..Limits::default()
+        },
+    );
+    peer.event(iframe_attached("S0", "I-stuck", "F1"));
+    wait_for_requests(&peer, "Page.enable", "I-stuck", 1);
+    send_keys(&live, 2, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S2", 2);
+    let status = wait_for(&live, "iframe setup timeout", Duration::from_secs(3), |s| {
+        s.devices[0].error.as_deref() == Some(INCOMPLETE_IFRAME_ACTIVITY)
+    });
+    assert!(running(&status));
+    assert_eq!(status.devices[2].error, None);
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I-stuck", 1);
+    assert_eq!(
+        peer.count("Target.detachFromTarget", "S0"),
+        0,
+        "never detach while resume is held"
+    );
+    send_keys(&live, 2, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S2", 4);
+    // Late page events from the retired session are ignored. Release answers
+    // cleanup, then permits exactly one detach, never another setup attempt.
+    peer.event(iframe_event(
+        "I-stuck",
+        "Page.fileChooserOpened",
+        json!({"frameId": "F1"}),
+    ));
+    peer.release();
+    wait_for_requests(&peer, "Target.detachFromTarget", "S0", 1);
+    assert_eq!(peer.count("Page.enable", "I-stuck"), 1);
+    assert_eq!(peer.count("Runtime.runIfWaitingForDebugger", "I-stuck"), 1);
+    assert_eq!(live.status().devices[0].file_choosers, 0);
+    assert!(live.send(Command::Reload { device: 0 }));
+    wait_for_requests(&peer, "Page.reload", "S0", 1);
+    assert_eq!(
+        live.status().devices[0].error.as_deref(),
+        Some(INCOMPLETE_IFRAME_ACTIVITY)
+    );
+    peer.event(iframe_event(
+        "S0",
+        "Page.frameNavigated",
+        json!({"frame": {
+            "id": "T0", "loaderId": "FRESH", "url": "http://localhost/fresh"
+        }}),
+    ));
+    wait_for(
+        &live,
+        "fresh document clears degradation",
+        Duration::from_secs(2),
+        |s| s.devices[0].error.is_none(),
+    );
+    drop(live);
+    assert_eq!(fs_entries(root.path()), ["fake-cdp-port"]);
+}
+
+#[test]
+fn iframe_attachment_preserves_dom_ancestry_and_ignores_replaced_session_detach() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    for (frame, parent) in [("SAME", "T0"), ("CROSS", "SAME")] {
+        peer.event(iframe_event(
+            "S0",
+            "Page.frameAttached",
+            json!({"frameId": frame, "parentFrameId": parent}),
+        ));
+    }
+    peer.event(iframe_attached("S0", "I-old", "CROSS"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I-old", 1);
+    peer.event(iframe_attached("S0", "I-new", "CROSS"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I-new", 1);
+    // An old session detach may arrive after the new session attached; targetId
+    // alone must not invalidate the current session for that frame.
+    peer.event(iframe_event(
+        "S0",
+        "Target.detachedFromTarget",
+        json!({"sessionId": "I-old", "targetId": "CROSS"}),
+    ));
+    peer.event(iframe_event(
+        "I-new",
+        "Page.fileChooserOpened",
+        json!({"frameId": "CROSS"}),
+    ));
+    wait_for(
+        &live,
+        "current session survives old detach",
+        Duration::from_secs(2),
+        |s| s.devices[0].file_choosers == 1,
+    );
+    peer.event(iframe_event(
+        "S0",
+        "Page.frameDetached",
+        json!({"frameId": "SAME", "reason": "remove"}),
+    ));
+    peer.event(iframe_event(
+        "I-new",
+        "Page.frameAttached",
+        json!({"frameId": "LATE", "parentFrameId": "CROSS"}),
+    ));
+    for frame in ["CROSS", "LATE"] {
+        peer.event(frame_download(frame));
+    }
+    peer.event(iframe_event(
+        "I-new",
+        "Page.fileChooserOpened",
+        json!({"frameId": "CROSS"}),
+    ));
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(live.status().devices[0].downloads, 0);
+    assert_eq!(live.status().devices[0].file_choosers, 1);
+    drop(live);
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device() {
+    // 127.0.0.1 -> localhost -> 127.0.0.1 forces two renderer boundaries,
+    // including a nested OOPIF that the top page session cannot observe.
+    let fixture = Fixture::start(|request, _| {
+        let html = |body: String| Reply::Html {
+            body,
+            delay: Duration::ZERO,
+            cookie: None,
+        };
+        if request.path.starts_with("/download?") {
+            return Reply::File {
+                filename: Some("frame.pdf".into()),
+            };
+        }
+        if request.path.starts_with("/event?") {
+            return Reply::Empty {
+                status: 204,
+                location: None,
+            };
+        }
+        let style = "<style>body{margin:0}input,a,button{position:absolute;left:0;width:300px;height:40px}iframe{position:absolute;left:0;border:0;width:400px;height:250px}</style>";
+        let chooser = |name: &str| {
+            format!(
+                "<input id=file type=file style='top:0'><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}&files='+file.files.length));</script>"
+            )
+        };
+        let ready = |name: &str| format!("<script>fetch('/event?ready={name}')</script>");
+        match request.path.as_str() {
+            "/nested-main" => html(format!(
+                "{style}<iframe id=outer style='top:0'></iframe><a style='top:520px' href='/download?top'>top download</a><script>outer.src=location.origin.replace('127.0.0.1','localhost')+'/nested-outer';</script>"
+            )),
+            "/nested-outer" => html(format!(
+                "{style}{}<iframe id=inner style='top:60px'></iframe><a style='top:180px' href='/download?outer'>outer download</a><script>inner.src=location.origin.replace('localhost','127.0.0.1')+'/nested-inner';</script>{}",
+                chooser("outer"),
+                ready("outer")
+            )),
+            "/nested-inner" => html(format!(
+                "{style}{}<a style='top:60px' href='/download?inner'>inner download</a>{}",
+                chooser("inner"),
+                ready("inner")
+            )),
+            "/top-control" => html(format!(
+                "{style}{}<a style='top:60px' href='/download?control'>control download</a>{}",
+                chooser("top"),
+                ready("top")
+            )),
+            _ => html("<p>done</p>".into()),
+        }
+    });
+    let mut workspace = workspace(fixture.url("/nested-main"));
+    for device in &mut workspace.devices {
+        device.width = 800;
+        device.height = 700;
+    }
+    let live = Live::start(workspace);
+    live.wait("nested pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/nested-main")
+    });
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| count(f, "/event?ready=inner")
+            == 3)
+    );
+    // Each chooser fires one cancel event; neither frame ever receives files.
+    for (device, y, source) in [(0, 20.0, "outer"), (1, 80.0, "inner")] {
+        click(&live, device, 100.0, y);
+        live.wait(source, Duration::from_secs(10), |s| {
+            s.devices[device].file_choosers == 1
+        });
+        assert!(fixture.wait_for(Duration::from_secs(5), |f| count(
+            f,
+            &format!("/event?cancel={source}")
+        ) == 1));
+    }
+    for (device, y, source) in [(0, 200.0, "outer"), (1, 140.0, "inner"), (2, 540.0, "top")] {
+        click(&live, device, 100.0, y);
+        let status = live.wait(source, Duration::from_secs(10), |s| {
+            s.devices[device].downloads == 1
+        });
+        assert_eq!(
+            status.devices[device].download.as_ref().unwrap().filename,
+            "frame.pdf"
+        );
+        assert!(
+            status.devices[device]
+                .download
+                .as_ref()
+                .unwrap()
+                .url
+                .ends_with(&format!("/download?{source}"))
+        );
+        assert_eq!(count(&fixture, &format!("/download?{source}")), 1);
+    }
+    let status = live.session().status();
+    assert_eq!(
+        status
+            .devices
+            .iter()
+            .map(|d| d.file_choosers)
+            .collect::<Vec<_>>(),
+        [1, 1, 0]
+    );
+    assert_eq!(
+        status
+            .devices
+            .iter()
+            .map(|d| d.downloads)
+            .collect::<Vec<_>>(),
+        [1, 1, 1]
+    );
+    assert!(
+        status
+            .devices
+            .iter()
+            .all(|d| d.error.is_none() && d.url == fixture.url("/nested-main"))
+    );
+    // A new document retires both recursive iframe sessions. Only explicit
+    // new controls add reports, and none of the old actions is replayed.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/top-control"),
+    });
+    live.wait("top controls", Duration::from_secs(15), |s| {
+        loaded(s, &fixture, "/top-control")
+    });
+    click(&live, 2, 100.0, 20.0);
+    live.wait("top chooser control", Duration::from_secs(5), |s| {
+        s.devices[2].file_choosers == 1
+    });
+    click(&live, 2, 100.0, 80.0);
+    live.wait("top download control", Duration::from_secs(5), |s| {
+        s.devices[2].downloads == 2
+    });
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(count(&fixture, "/event?cancel=top"), 1);
+    assert_eq!(count(&fixture, "/download?control"), 1);
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|r| r.path.starts_with("/event?change="))
+    );
+    assert_eq!(download_names(live.root.path()), Vec::<String>::new());
+    let status = live.session().status();
+    assert_eq!(
+        status
+            .devices
+            .iter()
+            .map(|d| d.downloads)
+            .collect::<Vec<_>>(),
+        [1, 1, 2]
+    );
+    assert_eq!(status.protocol_error, None);
+    live.close();
+}
+
+#[test]
+fn iframe_stale_inventory_is_refreshed_without_resurrecting_removed_frames() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.getFrameTree" && session == Some("I1")
+    });
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(iframe_attached("S0", "I1", "F1"));
+    wait_for_requests(&peer, "Page.getFrameTree", "I1", 1);
+    let old_id = peer.last_request_id("Page.getFrameTree", "I1");
+    peer.event(iframe_event(
+        "I1",
+        "Page.frameAttached",
+        json!({"frameId": "REMOVED", "parentFrameId": "F1"}),
+    ));
+    peer.event(iframe_event(
+        "I1",
+        "Page.frameDetached",
+        json!({"frameId": "REMOVED", "reason": "remove"}),
+    ));
+    peer.event(json!({"id": old_id, "result": {"frameTree": {
+        "frame": {"id": "F1"}, "childFrames": [{"frame": {"id": "REMOVED"}}]
+    }}}));
+    wait_for_requests(&peer, "Page.getFrameTree", "I1", 2);
+    assert_eq!(peer.count("Runtime.runIfWaitingForDebugger", "I1"), 0);
+    peer.event(
+        json!({"id": peer.last_request_id("Page.getFrameTree", "I1"), "result": {"frameTree": {
+            "frame": {"id": "F1"}, "childFrames": [{"frame": {"id": "EXISTING"}}]
+        }}}),
+    );
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I1", 1);
+    for frame in ["REMOVED", "EXISTING"] {
+        peer.event(frame_download(frame));
+    }
+    wait_for(&live, "fresh inventory", Duration::from_secs(2), |s| {
+        s.devices[0].downloads == 1
+    });
+    assert!(
+        live.status().devices[0]
+            .download
+            .as_ref()
+            .unwrap()
+            .url
+            .ends_with("/EXISTING")
+    );
+    peer.release();
+    drop(live);
+}
+
+#[test]
+fn iframe_frame_capacity_degrades_only_its_device_and_remains_bounded() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    for frame in 0..MAX_TRACKED_FRAMES + 2 {
+        peer.event(iframe_event(
+            "S0",
+            "Page.frameAttached",
+            json!({"frameId": format!("F{frame}"), "parentFrameId": "T0"}),
+        ));
+    }
+    let status = wait_for(&live, "frame capacity", Duration::from_secs(3), |s| {
+        s.devices[0].error.as_deref() == Some(INCOMPLETE_IFRAME_ACTIVITY)
+    });
+    assert!(running(&status));
+    assert_eq!(status.devices[2].error, None);
+    send_keys(&live, 2, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S2", 2);
+    peer.event(frame_download("F0"));
+    peer.event(frame_download(&format!("F{MAX_TRACKED_FRAMES}")));
+    wait_for(
+        &live,
+        "retained frame ownership",
+        Duration::from_secs(2),
+        |s| s.devices[0].downloads == 1,
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(live.status().devices[0].downloads, 1);
+    drop(live);
+}
+
+#[test]
+fn iframe_retirement_transfers_pending_resume_and_releases_late_children_first() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Runtime.runIfWaitingForDebugger" && session.is_some_and(|s| s.starts_with('I'))
+    });
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(iframe_attached("S0", "I1", "F1"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I1", 1);
+    peer.event(iframe_event(
+        "S0",
+        "Page.frameDetached",
+        json!({"frameId": "F1", "reason": "remove"}),
+    ));
+    // A debugger-held child attachment may already be queued from the parent
+    // whose setup just retired. It gets release-only cleanup, no observation.
+    peer.event(iframe_attached("I1", "I2", "F2"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I2", 1);
+    assert_eq!(peer.count("Page.enable", "I2"), 0);
+    assert_eq!(peer.count("Target.detachFromTarget", "S0"), 0);
+    assert_eq!(peer.count("Target.detachFromTarget", "I1"), 0);
+    let answer_resume = |session: &str| {
+        peer.event(json!({"id": peer.last_request_id("Runtime.runIfWaitingForDebugger", session), "result": {}}))
+    };
+    answer_resume("I1");
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        peer.count("Target.detachFromTarget", "S0"),
+        0,
+        "held child keeps parent attached"
+    );
+    answer_resume("I2");
+    wait_for_requests(&peer, "Target.detachFromTarget", "I1", 1);
+    assert_eq!(peer.count("Target.detachFromTarget", "S0"), 0);
+    peer.event(iframe_event(
+        "I1",
+        "Target.detachedFromTarget",
+        json!({"sessionId": "I2"}),
+    ));
+    wait_for_requests(&peer, "Target.detachFromTarget", "S0", 1);
+    for session in ["I1", "I2"] {
+        assert_eq!(peer.count("Runtime.runIfWaitingForDebugger", session), 1);
+        peer.event(iframe_event(
+            session,
+            "Page.fileChooserOpened",
+            json!({"frameId": "F2"}),
+        ));
+    }
+    assert_eq!(live.status().devices[0].file_choosers, 0);
+    peer.release();
+    drop(live);
+}
+
+#[test]
+fn iframe_setup_errors_degrade_only_the_owning_document() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.enable" && session == Some("I-failed")
+    });
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(iframe_attached("S0", "I-failed", "F1"));
+    wait_for_requests(&peer, "Page.enable", "I-failed", 1);
+    peer.event(json!({"id": peer.last_request_id("Page.enable", "I-failed"), "error": {"code": -32000, "message": "renderer unavailable"}}));
+    let status = wait_for(
+        &live,
+        "iframe setup rejection",
+        Duration::from_secs(2),
+        |s| s.devices[0].error.as_deref() == Some(INCOMPLETE_IFRAME_ACTIVITY),
+    );
+    assert!(running(&status));
+    assert_eq!(status.devices[2].error, None);
+    wait_for_requests(&peer, "Target.detachFromTarget", "S0", 1);
+    assert_eq!(peer.count("Runtime.runIfWaitingForDebugger", "I-failed"), 1);
+    assert_eq!(
+        peer.count("Page.setInterceptFileChooserDialog", "I-failed"),
+        0
+    );
+    peer.release();
+    drop(live);
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recovers() {
+    let fixture = Fixture::start(|request, _| {
+        if request.path.starts_with("/download?") {
+            return Reply::File {
+                filename: Some("frame.pdf".into()),
+            };
+        }
+        if request.path.starts_with("/event?") {
+            return Reply::Empty {
+                status: 204,
+                location: None,
+            };
+        }
+        let controls = |name: &str| {
+            format!(
+                "<input id=file type=file style='top:0'><a href='/download?{name}' style='top:60px'>download</a><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}'));</script>"
+            )
+        };
+        let style = "<style>body{margin:0}input,a{position:absolute;left:0;width:300px;height:40px}iframe{position:absolute;left:0;border:0;width:400px;height:200px}</style>";
+        let body = match request.path.as_str() {
+            "/busy-iframe-main" => format!(
+                "{style}{}<script>if(innerWidth===800){{document.body.innerHTML='';const origin=location.origin.replace('127.0.0.1','localhost');const first=document.createElement('iframe');first.src=origin+'/busy-iframe-first';document.body.append(first);setTimeout(()=>{{const second=document.createElement('iframe');second.style.top='250px';second.src=origin+'/busy-iframe-second';document.body.append(second);}},1200);}}</script>",
+                controls("healthy")
+            ),
+            "/busy-iframe-first" => format!(
+                "{style}{}<script>fetch('/event?ready=first');setTimeout(()=>{{const end=performance.now()+4000;while(performance.now()<end){{}}fetch('/event?unblocked');}},300);</script>",
+                controls("first")
+            ),
+            "/busy-iframe-second" => format!(
+                "{style}{}<script>fetch('/event?ready=second')</script>",
+                controls("second")
+            ),
+            _ => "<p>fresh</p>".into(),
+        };
+        Reply::Html {
+            body,
+            delay: Duration::ZERO,
+            cookie: None,
+        }
+    });
+    let mut workspace = workspace(fixture.url("/busy-iframe-main"));
+    for (device, width) in workspace.devices.iter_mut().zip([800, 700, 600]) {
+        device.width = width;
+        device.height = 700;
+    }
+    let live = Live::start_with(
+        workspace,
+        Limits {
+            command: Duration::from_secs(1),
+            ..Limits::default()
+        },
+    );
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| count(f, "/event?ready=first")
+            == 1)
+    );
+    let status = live.wait("one busy iframe setup", Duration::from_secs(10), |s| {
+        s.devices[0].error.as_deref() == Some(INCOMPLETE_IFRAME_ACTIVITY)
+    });
+    assert!(running(&status));
+    assert_eq!(status.devices[2].error, None);
+    // The separate-session healthy device still receives input and reports it.
+    click(&live, 2, 100.0, 20.0);
+    live.wait("healthy chooser", Duration::from_secs(5), |s| {
+        s.devices[2].file_choosers == 1
+    });
+    click(&live, 2, 100.0, 80.0);
+    live.wait("healthy download", Duration::from_secs(5), |s| {
+        s.devices[2].downloads == 1
+    });
+    // After the busy renderer returns, the held second iframe must finish
+    // loading. A detach before acknowledged resume would leave it hung.
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| count(f, "/event?unblocked")
+            == 1
+            && count(f, "/event?ready=second") == 1)
+    );
+    click(&live, 0, 100.0, 20.0);
+    live.wait(
+        "configured iframe after recovery",
+        Duration::from_secs(5),
+        |s| s.devices[0].file_choosers == 1,
+    );
+    click(&live, 0, 100.0, 270.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |f| count(f, "/event?cancel=second")
+            == 1)
+    );
+    let status = live.session().status();
+    assert!(running(&status));
+    assert_eq!(
+        status.devices[0].file_choosers, 1,
+        "retired session must not report late activity"
+    );
+    assert_eq!(
+        status.devices[0].error.as_deref(),
+        Some(INCOMPLETE_IFRAME_ACTIVITY)
+    );
+    assert_eq!(status.devices[2].error, None);
+    assert_eq!(count(&fixture, "/event?cancel=first"), 1);
+    assert_eq!(count(&fixture, "/event?cancel=healthy"), 1);
+    assert!(
+        !fixture
+            .requests()
+            .iter()
+            .any(|r| r.path.starts_with("/event?change="))
+    );
+    live.send(Command::NavigateAll {
+        url: fixture.url("/fresh-iframe-document"),
+    });
+    live.wait("explicit fresh document", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/fresh-iframe-document") && s.devices[0].error.is_none()
+    });
+    assert_eq!(count(&fixture, "/busy-iframe-first"), 1);
+    assert_eq!(count(&fixture, "/busy-iframe-second"), 1);
+    assert_eq!(count(&fixture, "/download?healthy"), 1);
+    live.close();
+}
