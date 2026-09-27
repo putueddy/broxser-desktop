@@ -51,6 +51,10 @@ notification permission on three devices. Findings:
   and `microphone` (`Browser.setPermission`, `denied`, all origins) right
   after the context is created, in live and capture runs. A page that asks
   gets `denied` at once and `permissions.query` says so.
+- Camera denial includes both the ordinary `{"name":"camera"}` descriptor and
+  `{"name":"camera","panTiltZoom":true}`. Chromium treats camera movement
+  controls as a separate permission, so both descriptors must be denied for
+  their query states to consistently reflect Broxser's camera policy.
 - Camera and microphone are denied on the same ground (a prompt-type
   permission whose request would wait) although no device here could exercise
   them; a machine with a webcam is expected to see `NotAllowedError` at once
@@ -70,10 +74,16 @@ notification permission on three devices. Findings:
 
 ## Validation
 
-Fake CDP: `permission_prompts_are_denied_in_every_session_context` (the four
-denials per context, in order). Helium:
+Fake CDP: `permission_prompts_are_denied_in_every_session_context` (the five
+descriptor denials per context, including ordinary camera and PTZ, in order). Helium:
 `live_permission_requests_are_denied_at_once` (a page asks without a gesture on
 load: every device is answered `denied` within 500 ms and `query` reports
 `denied`; before the change two devices waited 1.5–1.8 s and one was not
 answered within 10 s, all reporting `prompt`). Results are in
 `docs/validation.md` (P1.6).
+
+`live_camera_permission_queries_deny_ptz_across_origins` checks ordinary camera
+and PTZ queries on three devices in two session contexts, first on `127.0.0.1`
+and then on `localhost`. Both camera descriptors must report `denied`, while
+clipboard-write and screen-wake-lock remain `granted`. This query-only regression
+uses no physical or simulated camera and fails on the original PTZ policy gap.

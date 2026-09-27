@@ -111,8 +111,9 @@ dan dilaporkan di kartu device dengan nama file dan alamatnya; pemilih file
 dibatalkan dan dihitung, halaman tidak pernah menerima file (ADR 0016). Jika
 renderer iframe tidak merespons saat disiapkan, device menampilkan bahwa laporan
 aktivitas iframe tidak lengkap; device lain tetap berjalan. Permission
-notifikasi, deteksi idle, kamera dan mikrofon ditolak per context sehingga halaman
-dijawab `denied` seketika, bukan menunggu prompt yang tidak pernah muncul
+notifikasi, deteksi idle, kamera (termasuk pan/tilt/zoom atau PTZ) dan mikrofon
+ditolak per context sehingga halaman dijawab `denied` seketika, bukan menunggu
+prompt yang tidak pernah muncul
 (ADR 0017). Input touch belum didukung dan berperilaku seperti default browser
 headless; status auditnya ada di `docs/validation.md`.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).

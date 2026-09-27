@@ -222,8 +222,8 @@ restart. Panel dibatasi 360 piksel UI dengan tombol di kiri agar tetap
 terjangkau ketika lebar device melampaui window.
 
 Permission yang permintaannya akan menunggu prompt (notifikasi, deteksi idle,
-kamera, mikrofon) ditolak per context saat context dibuat, sehingga halaman
-dijawab `denied` seketika dan `permissions.query` melaporkannya (ADR 0017).
+kamera termasuk PTZ, mikrofon) ditolak per context saat context dibuat, sehingga
+halaman dijawab `denied` seketika dan `permissions.query` melaporkannya (ADR 0017).
 
 ## 6. API and data contracts
 

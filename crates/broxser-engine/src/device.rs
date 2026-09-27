@@ -50,7 +50,8 @@ pub(crate) trait Commands {
 pub(crate) const DENIED_PERMISSIONS: [&str; 4] =
     ["notifications", "idle-detection", "camera", "microphone"];
 
-/// Denies [`DENIED_PERMISSIONS`] for every origin in `context`.
+/// Denies [`DENIED_PERMISSIONS`] and the camera PTZ descriptor for every origin
+/// in `context`.
 pub(crate) fn deny_permission_prompts(commands: &mut impl Commands, context: &str) -> Result<()> {
     for name in DENIED_PERMISSIONS {
         commands.command(
@@ -59,6 +60,18 @@ pub(crate) fn deny_permission_prompts(commands: &mut impl Commands, context: &st
             None,
         )?;
     }
+    // Helium treats PTZ as a separate permission: denying base camera access
+    // still leaves `permissions.query({name: "camera", panTiltZoom: true})`
+    // reporting `prompt` unless this descriptor is denied explicitly.
+    commands.command(
+        "Browser.setPermission",
+        json!({
+            "permission": {"name": "camera", "panTiltZoom": true},
+            "setting": "denied",
+            "browserContextId": context,
+        }),
+        None,
+    )?;
     Ok(())
 }
 

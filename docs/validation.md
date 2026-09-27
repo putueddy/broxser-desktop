@@ -273,6 +273,48 @@ permission on load without a gesture:
 
 No desktop change, so no window check was run for this capability.
 
+### PR #17 camera PTZ correction, 27 September 2026 (local Linux)
+
+Review of `b62bc05` found that denying `{"name":"camera"}` left
+`permissions.query({name: "camera", panTiltZoom: true})` at `prompt`. Chromium
+uses a separate permission for camera movement controls. The pinned Helium
+probe reproduced that state on both `127.0.0.1` and `localhost`, while ordinary
+camera queries reported `denied` and media requests using simulated devices
+rejected with `NotAllowedError`. Explicitly denying the PTZ descriptor changed
+its query to `denied`; unrelated permission queries and a separate control
+context were unchanged.
+
+The shared setup helper now sends a fifth `Browser.setPermission` denial for
+`{"name":"camera","panTiltZoom":true}` in each session context. Both live and
+capture use that helper before creating device targets. The four existing
+denials remain in place.
+
+The fake-CDP regression independently lists all five expected descriptors for
+each context. The new live test
+`live_camera_permission_queries_deny_ptz_across_origins` collects 24 query
+reports across three device widths, two session contexts and two origins.
+Ordinary camera and PTZ must both be `denied`; clipboard-write and
+screen-wake-lock must remain `granted`. It requests no media device access.
+
+Before the patch, the focused permission run passed the existing notification
+timing test and failed the two regression checks: the fifth descriptor was
+missing and PTZ remained `prompt` in all six device/origin combinations. After
+the patch, all three focused tests passed (0.89 s). Baseline and passing logs are
+retained locally in the ignored `artifacts/pr17-fixes/` directory; the original
+review probes are in `artifacts/pr17-review/`.
+
+| Final check | Result |
+| --- | --- |
+| `CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 94 engine + 36 desktop tests (139 total) |
+| Full live Helium suite (`--ignored --test-threads=2 --nocapture`) | Passed: 43 of 43, 146.73 s, including the PTZ regression and existing notification timing test |
+| `git diff --check` | Passed |
+
+Validation used Helium 0.18.1.1 (`Chrome/154.0.8037.57`), sandbox enabled and
+application-owned private profiles. No GUI code changed, so no additional
+window check was required. The PTZ regression queries permission state without
+accessing camera hardware. Existing vendored GPUI and `proc-macro-error2`
+future-compatibility warnings remain non-failing.
+
 ### Limits
 
 - Touch input and hover media, drag and drop and accessibility keep today's
