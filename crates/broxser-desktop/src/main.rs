@@ -28,7 +28,10 @@ const WARN: u32 = 0xf2b872;
 /// Destructive actions, such as removing a device from the draft.
 const DANGER: u32 = 0xe07a7a;
 
-actions!(broxser, [Quit, Refresh, FocusUrl, TogglePanel]);
+actions!(
+    broxser,
+    [Quit, Refresh, FocusUrl, TogglePanel, ToggleConsole]
+);
 
 #[derive(Parser)]
 #[command(
@@ -146,6 +149,9 @@ fn main() -> Result<()> {
                 // Helium's own Ctrl+Shift+W closes a window; it never reaches
                 // a page (ADR 0010), so the panel can take it.
                 KeyBinding::new("ctrl-shift-w", TogglePanel, None),
+                // Helium's own Ctrl+Shift+J opens DevTools; the engine never
+                // forwards it (ADR 0010), so the console panel can take it.
+                KeyBinding::new("ctrl-shift-j", ToggleConsole, None),
             ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {

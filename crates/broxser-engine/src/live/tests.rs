@@ -7174,3 +7174,373 @@ fn live_certificate_trust_is_the_browsers_own_not_the_users() {
     // The profile, and the database with it, are gone after the session.
     live.close();
 }
+
+/// Level, kind, text, location, subframe and repeats of each console entry.
+fn console_rows(
+    live: &LiveSession,
+    device: usize,
+) -> Vec<(ConsoleLevel, ConsoleKind, String, String, bool, u32)> {
+    live.console(device)
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.level,
+                entry.kind,
+                entry.text,
+                entry.location,
+                entry.subframe,
+                entry.repeats,
+            )
+        })
+        .collect()
+}
+
+/// ADR 0023: console calls, uncaught errors and browser log entries reach
+/// the console of the device whose page or frame produced them, bounded and
+/// on one line, with repeats counted; Broxser's own worlds never do; Clear
+/// empties one device; old entries leave while the counts stay.
+#[test]
+fn device_consoles_are_bounded_attributed_and_cleared() {
+    use ConsoleKind::{Console, Exception, Navigation, Network};
+    use ConsoleLevel::{Error, Info, Warning};
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    for session in ["S0", "S1", "S2"] {
+        assert_eq!(peer.count("Runtime.enable", session), 1, "{session}");
+        assert_eq!(peer.count("Log.enable", session), 1, "{session}");
+    }
+    // The phone's page world, a same-process frame's world and Broxser's
+    // link observer world.
+    let context = |id: i64, frame: &str, default: bool, kind: &str, name: &str| {
+        phone(
+            "Runtime.executionContextCreated",
+            json!({"context": {"id": id, "name": name,
+                "auxData": {"frameId": frame, "isDefault": default, "type": kind}}}),
+        )
+    };
+    peer.event(context(5, "T0", true, "default", ""));
+    peer.event(context(6, "FX", true, "default", ""));
+    peer.event(context(7, "T0", false, "isolated", LINK_WORLD));
+    let call = |session: &str, context: i64, kind: &str, text: &str| {
+        json!({"method": "Runtime.consoleAPICalled", "sessionId": session, "params": {
+            "type": kind, "executionContextId": context,
+            "args": [{"type": "string", "value": text}]}})
+    };
+    peer.event(call("S0", 5, "error", "main\nerror"));
+    peer.event(call("S0", 5, "error", "main\nerror"));
+    peer.event(call("S0", 6, "warning", "frame warning"));
+    peer.event(call("S0", 7, "error", "from Broxser's own world"));
+    peer.event(phone(
+        "Runtime.exceptionThrown",
+        json!({"exceptionDetails": {"text": "Uncaught", "executionContextId": 5,
+            "url": "http://127.0.0.1:4173/app.js?token=T", "lineNumber": 1, "columnNumber": 2,
+            "exception": {"type": "object", "subtype": "error", "description": "Error: boom\n    at x"}}}),
+    ));
+    peer.event(phone(
+        "Log.entryAdded",
+        json!({"entry": {"source": "network", "level": "error",
+            "text": "Failed to load resource: the server responded with a status of 404 (Not Found)",
+            "url": "http://127.0.0.1:4173/missing.png?session=S"}}),
+    ));
+    peer.event(call("S0", 5, "log", &"x".repeat(5000)));
+    peer.event(commit(
+        "L9",
+        "http://127.0.0.1:4173/next?code=secret",
+        json!({"urlFragment": "#part"}),
+    ));
+    // The tablet's out-of-process iframe reports console output from its
+    // first script: Runtime and Log are enabled before it may run.
+    peer.event(iframe_attached("S1", "I1", "F1"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I1", 1);
+    let setup: Vec<String> = peer
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, session, _, _)| session.as_deref() == Some("I1"))
+        .map(|(method, ..)| method.clone())
+        .collect();
+    assert_eq!(
+        setup,
+        [
+            "Page.enable",
+            "Page.setInterceptFileChooserDialog",
+            "Target.setAutoAttach",
+            "Page.getFrameTree",
+            "Runtime.enable",
+            "Log.enable",
+            "Runtime.runIfWaitingForDebugger"
+        ]
+    );
+    peer.event(call("I1", 1, "log", "iframe log"));
+    // A session nobody owns reaches no console.
+    peer.event(call("S9", 1, "error", "unknown session"));
+    wait_until_read(&peer);
+
+    let status = live.status();
+    assert_eq!(
+        (
+            status.devices[0].console_errors,
+            status.devices[0].console_warnings
+        ),
+        (4, 1)
+    );
+    let rows = console_rows(&live, 0);
+    assert_eq!(rows.len(), 6, "{rows:#?}");
+    assert_eq!(
+        rows[..4],
+        [
+            (Error, Console, "main error".into(), String::new(), false, 2),
+            (
+                Warning,
+                Console,
+                "frame warning".into(),
+                String::new(),
+                true,
+                1
+            ),
+            (
+                Error,
+                Exception,
+                "Uncaught Error: boom".into(),
+                "http://127.0.0.1:4173/app.js:2:3".into(),
+                false,
+                1
+            ),
+            (
+                Error,
+                Network,
+                "Failed to load resource: the server responded with a status of 404 (Not Found)"
+                    .into(),
+                "http://127.0.0.1:4173/missing.png".into(),
+                false,
+                1
+            ),
+        ]
+    );
+    assert_eq!(rows[4].2.chars().count(), MAX_CONSOLE_TEXT + 1);
+    assert!(rows[4].2.ends_with("x…"));
+    assert_eq!(
+        rows[5],
+        (
+            Info,
+            Navigation,
+            "Navigated".into(),
+            "http://127.0.0.1:4173/next".into(),
+            false,
+            1
+        )
+    );
+    assert_eq!(
+        console_rows(&live, 1),
+        [(Info, Console, "iframe log".into(), String::new(), true, 1)]
+    );
+    assert_eq!(
+        (
+            status.devices[1].console_errors,
+            status.devices[1].console_warnings
+        ),
+        (0, 0)
+    );
+    assert!(console_rows(&live, 2).is_empty());
+
+    // Clear empties the phone only; the tablet keeps its entry.
+    let revision = status.devices[0].console_revision;
+    assert!(live.send(Command::ClearConsole { device: 0 }));
+    let status = wait_for(&live, "the cleared phone", Duration::from_secs(2), |s| {
+        s.devices[0].console_revision != revision
+    });
+    assert_eq!(
+        (
+            status.devices[0].console_errors,
+            status.devices[0].console_warnings
+        ),
+        (0, 0)
+    );
+    assert!(console_rows(&live, 0).is_empty());
+    assert_eq!(console_rows(&live, 1).len(), 1);
+
+    // The desktop keeps the newest entries; its count keeps every error.
+    for n in 0..MAX_CONSOLE_ENTRIES + 50 {
+        peer.event(call("S2", 1, "error", &format!("error {n}")));
+    }
+    wait_until_read(&peer);
+    let rows = console_rows(&live, 2);
+    assert_eq!(rows.len(), MAX_CONSOLE_ENTRIES);
+    assert_eq!(rows[0].2, "error 50");
+    assert_eq!(
+        live.status().devices[2].console_errors,
+        MAX_CONSOLE_ENTRIES as u32 + 50
+    );
+    drop(live);
+}
+
+const CONSOLE_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"></head><body>
+<img src="/missing.png" alt="">
+<script>
+console.error('boom on', innerWidth);
+console.warn('careful on %s', innerWidth);
+console.log('plain', {w: innerWidth});
+setTimeout(() => { throw new Error('uncaught on ' + innerWidth); }, 0);
+Promise.reject(new Error('rejected on ' + innerWidth));
+document.body.insertAdjacentHTML('beforeend', '<iframe src="http://localhost:' + location.port + '/console-frame?w=' + innerWidth + '"></iframe>');
+</script></body></html>"#;
+
+const CONSOLE_FRAME_PAGE: &str = r#"<!doctype html><script>
+const w = new URLSearchParams(location.search).get('w');
+console.error('frame error on ' + w);
+setTimeout(() => { throw new Error('frame uncaught on ' + w); }, 0);
+</script>"#;
+
+/// ADR 0023 with Helium: each device's console holds its own page's console
+/// calls, uncaught errors and rejections, the failed image request and its
+/// cross-site iframe's output, marked as a subframe; nothing from another
+/// device. Before the change none of this reached Broxser at all.
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_console_keeps_each_devices_errors() {
+    let server = Fixture::start(|request, _| {
+        let body = match request.path.split('?').next().unwrap_or("/") {
+            "/console" => CONSOLE_PAGE,
+            "/console-frame" => CONSOLE_FRAME_PAGE,
+            _ => {
+                return Reply::Empty {
+                    status: 404,
+                    location: None,
+                };
+            }
+        };
+        Reply::Html {
+            body: body.into(),
+            delay: Duration::ZERO,
+            cookie: None,
+        }
+    });
+    let image = server.url("/missing.png");
+    let live = Live::start(workspace(server.url("/console")));
+    let widths = [360, 600, 1000];
+    let wanted = |width: u32| {
+        [
+            format!("boom on {width}"),
+            format!("Uncaught Error: uncaught on {width}"),
+            format!("Uncaught (in promise) Error: rejected on {width}"),
+            format!("frame error on {width}"),
+            format!("Uncaught Error: frame uncaught on {width}"),
+        ]
+    };
+    let has_all = |status: &Status| {
+        status
+            .devices
+            .iter()
+            .zip(widths)
+            .enumerate()
+            .all(|(index, (device, width))| {
+                let entries = live.session().console(index);
+                device.console_errors >= 6
+                    && entries.iter().any(|entry| entry.location == image)
+                    && wanted(width)
+                        .iter()
+                        .all(|text| entries.iter().any(|entry| &entry.text == text))
+            })
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let status = live.session().status();
+        if has_all(&status) {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for every device's console: {:#?}",
+            (0..widths.len())
+                .map(|index| live.session().console(index))
+                .collect::<Vec<_>>()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    for (index, width) in widths.into_iter().enumerate() {
+        let entries = live.session().console(index);
+        let find = |text: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.text == text)
+                .unwrap_or_else(|| panic!("{text} missing in {entries:#?}"))
+        };
+        assert_eq!(entries[0].kind, ConsoleKind::Navigation, "{entries:#?}");
+        assert_eq!(entries[0].location, server.url("/console"));
+        let boom = find(&format!("boom on {width}"));
+        assert_eq!(
+            (boom.level, boom.kind, boom.subframe),
+            (ConsoleLevel::Error, ConsoleKind::Console, false)
+        );
+        assert!(
+            boom.location.starts_with(&server.url("/console:")),
+            "{boom:?}"
+        );
+        let careful = find(&format!("careful on {width}"));
+        assert_eq!(careful.level, ConsoleLevel::Warning);
+        assert_eq!(
+            find(&format!("plain {{w: {width}}}")).level,
+            ConsoleLevel::Info
+        );
+        assert_eq!(
+            find(&format!("Uncaught Error: uncaught on {width}")).kind,
+            ConsoleKind::Exception
+        );
+        let failed = entries
+            .iter()
+            .find(|entry| entry.location == image)
+            .unwrap();
+        assert_eq!(
+            (failed.level, failed.kind),
+            (ConsoleLevel::Error, ConsoleKind::Network)
+        );
+        assert!(failed.text.contains("404"), "{failed:?}");
+        for text in [
+            format!("frame error on {width}"),
+            format!("Uncaught Error: frame uncaught on {width}"),
+        ] {
+            let entry = find(&text);
+            assert!(entry.subframe, "{entry:?}");
+            // The frame's address loses its query.
+            assert!(
+                entry.location.starts_with(&format!(
+                    "http://localhost:{}/console-frame:",
+                    server.url("").rsplit(':').next().unwrap()
+                )),
+                "{entry:?}"
+            );
+        }
+        // Nothing from the other devices.
+        for other in widths.into_iter().filter(|other| *other != width) {
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.text.contains(&format!(" {other}"))),
+                "{width} shows {other}: {entries:#?}"
+            );
+        }
+        assert_eq!(status.devices[index].console_warnings, 1);
+    }
+    let revision = status.devices[0].console_revision;
+    live.send(Command::ClearConsole { device: 0 });
+    live.wait("the cleared phone", Duration::from_secs(5), |status| {
+        status.devices[0].console_revision != revision
+    });
+    // Only the favicon's 404, which the browser can request later, may
+    // arrive after Clear.
+    let left = live.session().console(0);
+    assert!(
+        left.iter()
+            .all(|entry| entry.location == server.url("/favicon.ico")),
+        "{left:#?}"
+    );
+    let status = live.session().status();
+    assert_eq!(
+        status.devices[0].console_errors,
+        left.iter().map(|entry| entry.repeats).sum::<u32>()
+    );
+    assert!(status.devices[1].console_errors >= 6);
+    live.close();
+}

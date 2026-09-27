@@ -3,6 +3,94 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P2.3 device console, 27 September 2026 (cloud container)
+
+Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by `broxsertest`
+with the sandbox enabled, Xvfb 1600 × 1000, debug builds. Decisions are in
+[ADR 0023](adr/0023-device-console-in-memory.md). This is the first part of
+P2.3; bug-report export is not implemented.
+
+### Before the change
+
+- Code: every device session ran `Runtime.enable` (for the link and IME
+  observers), so the browser already sent each console call and uncaught
+  exception to the live worker, whose event loop matched neither and dropped
+  them. No session enabled `Log`, and iframe sessions (ADR 0016) enabled
+  neither. The browser's stdout and stderr are `/dev/null`. Nothing reached
+  the UI, a log or a file.
+- A scratch CDP probe (Node, a Broxser-like context, page target and
+  recursive iframe auto-attach) on a fixture that logs every console type,
+  throws, rejects, loads a missing image and script, fetches a 500 and a
+  refused port, starts a worker and embeds a same-origin and a cross-site
+  iframe received 20 `Runtime.consoleAPICalled` and 4 `Runtime.exceptionThrown`
+  events: `warning` and `error` types, `startGroup`/`endGroup`, `count`
+  labels, argument previews (`Object` with 2 properties, `Array(2)`, a `body`
+  node) and the calling line; a 100 000-character string as one 100 345-byte
+  event; same-origin frame messages on the page session in another execution
+  context; cross-site iframe messages only on the iframe's session once
+  `Runtime` was enabled there; nothing from the worker. The five failed
+  requests (image, script, 500, `ERR_UNSAFE_PORT`, favicon) arrived only as
+  `Log.entryAdded` (source `network`, level `error`), replayed when `Log` was
+  enabled late; `Runtime.disable` and `enable` replayed all 22 messages.
+- Flood: a page logging 100 000 messages took 2.5 s in its loop with
+  `Runtime` enabled (1.3 s without) and sent 41.7 MB of events. In a scratch
+  live test of three devices (debug build) whose phone page did the same, the
+  desktop device's frames went from 60 per second to 5, 1, 1, 1 and 17 over
+  the next seconds, with gaps up to 1.1 s, then back to 60; the runtime kept
+  running. Keeping entries does not change that cost, which the events cause.
+
+### After the change
+
+- Each device's console holds its page's console calls (formatted on one
+  line), uncaught errors and rejections, failed requests and other browser
+  messages, from the page and its cross-site iframes (marked "frame"), plus a
+  navigation entry per document; newest 200 entries, 1000 characters each,
+  repeats counted, error and warning counts in the device status.
+- In the fixture run each device showed its own `boom on 360` (600, 1000),
+  `careful on …` as a warning, `plain {w: …}`, `Uncaught Error: uncaught on …`,
+  `Uncaught (in promise) Error: rejected on …`, the image's 404 at
+  `…/missing.png`, and the cross-site frame's `frame error on …` and
+  `Uncaught Error: frame uncaught on …` located at
+  `http://localhost:<port>/console-frame:<line>:<column>` without the query;
+  never another device's width.
+- The desktop card of each device on the smoke fixture shows "1 error ·
+  1 warning · Console"; clicking it opens the Console panel for that device
+  with the warning, the error (both at `console.html:<line>:<column>`) and the
+  navigation, newest first; Clear empties that device only; `Ctrl+Shift+J`
+  and the toolbar toggle open and close it. An earlier fixture that signalled
+  with a missing address and had no icon link showed "3 errors" there: the
+  404s of the signal and of the favicon, which can arrive after Clear, so the
+  fixture now declares an inline icon and signals with an existing file.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| Engine unit tests | `console_calls_become_bounded_one_line_entries`, `exceptions_and_log_entries_name_what_failed_and_where`, `locations_keep_only_scheme_host_and_path`, `repeats_collapse_and_old_entries_leave_while_counts_stay` passed |
+| Fake CDP `device_consoles_are_bounded_attributed_and_cleared` | Passed: `Runtime.enable` and `Log.enable` on every device session; an iframe session's setup sends `Runtime.enable` and `Log.enable` before `Runtime.runIfWaitingForDebugger`; repeats collapse (×2), a same-process frame's warning is a subframe entry, Broxser's link world adds nothing, an unknown session reaches no device, 5000 characters become 1000 plus "…", the navigation entry drops query and fragment, Clear empties the phone only, 250 errors keep 200 entries and count 250 |
+| Helium `live_console_keeps_each_devices_errors` | Passed 6 of 6 alone after two test fixes: the fixture first answered the "missing" image with 200, so no 404 was reported, and a favicon 404 can arrive after Clear, so the test now allows only that entry afterwards |
+| `bash scripts/check.sh` | Passed in 29 s: fmt, `cargo test --locked` (1 CLI, 10 core, 103 engine, 37 desktop), strict Clippy for the workspace and the desktop crate |
+| Live Helium suite (`--ignored`, 4 threads, `broxsertest`, sandbox on) | 46 of 46 passed in 77 s, the owner's iframe regressions included with the two new iframe setup steps |
+| New smoke run "console panel counts and clears one device", alone and in the full run | Passed: the phone card's filled count appeared, a click on it opened the panel (its Clear found at the panel's top right), Clear removed the phone's count and kept the tablet's, `Ctrl+Shift+J` closed the panel and the phone frame returned |
+| Full `scripts/desktop-smoke.sh` (Xvfb 1600 × 1000, debug build) | 14 of 14 scenarios passed in 1 m 29 s; no browser process, profile or window left |
+| Real window, screenshots | With the final fixture: the cards with their counts, the panel with the phone's three entries (warning, error, navigation), the panel after Clear ("No errors or warnings", "No console messages.", the tablet's count still shown) and the canvas after `Ctrl+Shift+J` were captured with `xwd` and inspected |
+| Rerun after the cherry-pick onto `main` (`5972c48`, PR #23 merged with the owner's review corrections and the stale-input follow-up; `live_view.rs`, `scripts/desktop-smoke.sh`, System Design and this file merged with both sides kept) | `check.sh` passed in 62 s: 1 CLI, 12 core, 147 engine and 42 desktop tests, 52 live tests ignored by default. Live Helium suite 52 of 52 in 85.4 s. The first full smoke failed in "input right after Apply removed a device": right after `Ctrl+Shift+W` it looked for Remove before the panel was drawn and found a card's error count, which has the danger color and lay in the Remove column, so Save was clicked instead of Apply and the desktop did not restart. That run now waits for the panel's Add column first: it passed 3 of 3 alone, a build without the `pointer` guard still panicked in it (2 of 2), and the full smoke passed 16 of 16 in 1 m 43 s with no browser process, profile or window left |
+
+### Limits
+
+- Dedicated, shared and service workers are not attached; their messages and
+  errors are not shown.
+- Text is what the page logged and may contain secrets the page printed;
+  only locations lose query strings and user information.
+- A console flood still delays other devices' frames while its events arrive
+  (measured above); there is no rate limit in the browser to use.
+- `Runtime.exceptionRevoked` (a rejection handled later) does not remove the
+  earlier entry, and `console.clear()` is ignored by design.
+- The Console panel renders every kept entry each frame while open; with 200
+  long entries this was not measured for frame time.
+- No export yet: screenshots, device details and console text for a bug
+  report, with redaction and retention, are the next part of P2.3.
+
 ## PR #23 follow-up: input right after Apply, 28 September 2026 (cloud container)
 
 Helium 0.18.1.1 run by `broxsertest` with its sandbox enabled, debug desktop,

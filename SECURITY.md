@@ -106,6 +106,14 @@ workspace file paths and the window size, nothing of a run: no page address (an
 address can carry a token), cookie, credential or profile path. It is validated
 before use and an invalid file is ignored, not repaired silently (ADR 0022).
 
+Page console messages, uncaught errors and failed request reports are kept per
+device in memory only, for the Console panel (ADR 0023): at most 200 entries of at
+most 1000 characters each, control characters removed, and resource locations
+without user information, query or fragment. They are page text: shown, never
+written to Broxser's output, a log or disk, never sent anywhere and never acted on.
+Clear, Restart and closing Broxser drop them. The text is whatever the page logged,
+so a page that prints a token shows it in the panel.
+
 Screenshots may contain private data. CLI exports remain in the specified output
 directory until the developer deletes them. Desktop previews use an owned temporary
 directory. No analytics or application upload endpoint is configured. Website

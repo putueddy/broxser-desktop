@@ -361,7 +361,7 @@ Autentikasi X11 mempertahankan `XAUTHORITY` asli dan `SSLKEYLOGFILE` dibuang pad
 launch; environment native lainnya tetap diwarisi, jadi batas NSS/profil ini
 tidak menjamin isolasi seluruh akses filesystem.
 
-**Status P2.2a (27 September 2026, PR menunggu review):** keputusan ada di
+**Status P2.2a (27–28 September 2026, merged melalui PR #23):** keputusan ada di
 [ADR 0022](docs/adr/0022-workspace-panel-presets-and-application-state.md).
 Sebelumnya workspace hanya bisa diedit di file dan start berikutnya melupakan
 file dan ukuran window. Kini panel Workspace (`Ctrl+Shift+W`) mengedit draft:
@@ -400,6 +400,28 @@ semua jalur cleanup, durabilitas terukur, kompatibilitas runtime lengkap terhada
 penulis profil terakhir, resource dan migrasi. Profil tidak kompatibel tidak
 boleh menahan update keamanan browser. Default tetap ephemeral; merge dokumen
 audit ini bukan penerimaan desain atau pengiriman persistent login.
+
+**Status P2.3 (27 September 2026, bagian pertama; PR menunggu review):** keputusan ada
+di [ADR 0023](docs/adr/0023-device-console-in-memory.md) dan pengukuran di
+`docs/validation.md` (P2.3). Sebelumnya setiap session device sudah
+menjalankan `Runtime.enable`, sehingga browser mengirim setiap panggilan
+console dan exception ke worker live, yang membuangnya; request yang gagal
+tidak dilaporkan sama sekali (tanpa `Log.enable`) dan iframe lintas situs
+tidak mengaktifkan keduanya. Probe Helium membuktikan bahwa pesan iframe
+lintas situs hanya tiba di session iframe-nya, worker tidak ter-attach, string
+100 000 karakter tiba utuh, dan halaman yang mencetak 100 000 pesan mengirim
+41,7 MB event sehingga frame device lain turun dari 60 ke 1–5 per detik selama
+sekitar 4 detik (biaya yang sudah ada). Kini setiap device punya console di
+memori: 200 entri terbaru (panggilan console satu baris, error dan rejection
+yang tidak tertangani, request gagal, pesan browser lain, entri navigasi),
+teks maksimal 1000 karakter tanpa karakter kontrol, lokasi tanpa query,
+fragment dan user info, repeat dihitung, jumlah error/warning di status
+device; iframe lintas situs mengaktifkan `Runtime` dan `Log` sebelum boleh
+berjalan. Kartu device menampilkan jumlahnya; panel Console (`Ctrl+Shift+J`)
+menampilkan console device terpilih dengan Clear. Tidak ada yang ditulis ke
+log atau disk; Restart dan menutup Broxser menghapusnya. Belum ada: pesan
+worker, export laporan bug (screenshot, detail device, console) dengan
+redaksi dan retensi, yang menjadi bagian berikutnya.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -495,6 +517,7 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian
   (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
   session: audit dan ADR 0021 proposed, merged melalui PR #22; P2.2a panel workspace,
-  preset dan file state: ADR 0022, PR menunggu review).
+  preset dan file state: ADR 0022, merged melalui PR #23; P2.3a console per device:
+  ADR 0023, PR menunggu review).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

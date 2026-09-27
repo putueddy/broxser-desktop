@@ -11,7 +11,8 @@ native, bukan browser tertanam: copy ke clipboard sistem, paste selain teks dan
 aksesibilitas belum didukung; dialog JavaScript dijawab pengguna di kartu, jendela
 yang dibuka halaman ditutup dan dilaporkan, download ditolak dan dilaporkan, dan
 permission yang akan menunggu prompt ditolak (ADR 0014–0017); frame device DPR>1
-tiba pada resolusi CSS. Belum ada persistent login, DevTools panel atau console aggregator.
+tiba pada resolusi CSS. Console, error dan request gagal setiap device terlihat di
+panel Console (ADR 0023). Belum ada persistent login, DevTools panel atau export laporan bug.
 IME memakai input handler native untuk preedit, commit dan posisi kandidat pada
 kontrol teks main frame; batas dan kualifikasinya ada di [ADR 0011](docs/adr/0011-native-ime-on-device-canvas.md).
 Ini belum pengganti Sizzy. Mode capture statis tetap tersedia lewat `--static`.
@@ -67,7 +68,7 @@ deterministik untuk capture statis.
 | --- | --- |
 | `Ctrl+L`, ketik, `Enter` / **Go** | Navigasi semua device satu kali; tanpa skema diawali `http://` |
 | Klik device | Memilih device; pointer dan wheel ke device di bawah kursor |
-| Keyboard | Ke device terpilih yang terlihat; `Ctrl+Q/R/L` dan `F5` tetap pintasan Broxser. Tombol yang oleh Helium dijadikan perintah browser (menutup tab/window seperti `Ctrl+W` atau `Alt+F4`, tab baru, DevTools, reload, `Alt+←`) tidak diteruskan ke halaman |
+| Keyboard | Ke device terpilih yang terlihat; `Ctrl+Q/R/L`, `Ctrl+Shift+W/J` dan `F5` tetap pintasan Broxser. Tombol yang oleh Helium dijadikan perintah browser (menutup tab/window seperti `Ctrl+W` atau `Alt+F4`, tab baru, DevTools, reload, `Alt+←`) tidak diteruskan ke halaman |
 | `Ctrl+V` / `Shift+Insert` / `Ctrl+Shift+V` | Menyisipkan teks clipboard sistem (maks. 65.536 karakter) ke device terpilih yang terlihat, sekali per tekan; halaman tidak menerima event `paste` dan tidak pernah membaca clipboard browser yang dipakai bersama semua session. Klik tengah tidak diteruskan |
 | IME native | Preedit dan commit ke input, textarea atau contenteditable main frame; kandidat mengikuti caret pada frame yang ditampilkan. Commit tidak memerlukan key-up. Password, iframe dan editor berbasis canvas belum dicakup |
 | **Reload** / `Ctrl+R` / `F5` | Reload device terpilih saja |
@@ -76,6 +77,7 @@ deterministik untuk capture statis.
 | `+` / `−` | Skala tampilan; frame diminta sebesar ukuran tampilan |
 | **Restart runtime** | Muncul setelah browser berhenti dan selama tidak ada restart atau close berjalan; memulai satu runtime, memulihkan konfigurasi, tidak memutar ulang aksi |
 | **Workspace** / `Ctrl+Shift+W` | Panel draft workspace: **Add** menambah device dari preset kelas viewport generik ke session device terpilih, **Remove** menghapus device (bukan yang terakhir), **Apply (restart)** menjalankan ulang runtime dengan draft, **Save** menulis draft dan URL ke file workspace yang dimuat (demo tidak punya file), **Discard** membuang draft. Runtime yang berjalan tidak berubah sebelum Apply (ADR 0022) |
+| **Console** / `Ctrl+Shift+J` / jumlah error di kartu | Console device terpilih, terbaru di atas: panggilan console halaman, error dan rejection yang tidak tertangani, request gagal dan pesan browser lain, termasuk iframe lintas situs (ditandai *frame*); 200 entri terbaru, lokasi tanpa query. Hanya di memori: **Clear** mengosongkan device itu, Restart dan menutup Broxser menghapus semuanya. Pesan worker belum tampil (ADR 0023) |
 | `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus; saat restart berjalan, tidak memulai browser baru |
 
 Go, Reload, sync atau membuka workspace yang tidak mendapat respons dalam 30 detik

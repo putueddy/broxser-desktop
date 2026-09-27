@@ -10,7 +10,9 @@
 # run types while every page animates; use a release build
 # (BROXSER_DESKTOP_BIN=target/release/broxser-desktop) for it to cover the GPUI
 # atlas race of ADR 0012. Every run must leave no browser process or profile
-# behind, and the window must be gone.
+# behind, and the window must be gone. The console run clicks a device's error
+# count, clears that device's console in the panel and closes the panel with
+# Ctrl+Shift+J (ADR 0023).
 # Needs an X11 display (a desktop session or Xvfb), xdotool, python3,
 # BROXSER_HELIUM_BIN and a built desktop binary. It does not check rendering
 # quality, Wayland, IME, accessibility or a physical GPU.
@@ -1051,7 +1053,11 @@ PY
   else
     size_window "$window"
     xdotool mousemove --window "$window" 600 400 key ctrl+shift+w
-    if ! found=$(panel_button e07a7a 480 90); then
+    # Until the panel is drawn, a card's error count lies where its Remove
+    # column will be and has the same danger color; wait for the Add column.
+    if ! panel_button 7ce29b 500 70 >/dev/null; then
+      failure="the panel did not open with Add buttons"
+    elif ! found=$(panel_button e07a7a 480 90); then
       failure="the panel showed no Remove button"
     else
       read -r _ _ _ y0 x1 _ < <(echo "$found")
@@ -1112,6 +1118,78 @@ PY
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Every device's page logs an error and a warning (ADR 0023). The phone's card
+# shows a filled count; clicking it opens the Console panel for the phone,
+# where Clear empties the phone's console only; Ctrl+Shift+J closes the panel.
+# Regions at 50%: the phone card spans x 254-474 without the panel and moves
+# 340 px right with it; the panel's Clear sits at its top right (x 480-570),
+# where nothing else is filled in the accent color.
+console_run() {
+  local label=$1
+  local before app window= failure= found x0 y0 x y code=0 left_processes left_profiles
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/console.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    size_window "$window"
+    xdotool mousemove --window "$window" 900 400 || true
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'console.html?logged' || true) -ge 3 ]] && break
+      sleep 0.1
+    done
+    if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'console.html?logged' || true) -lt 3 ]]; then
+      failure="the pages did not log within 30 s"
+    elif ! found=$(find_color "$window" 250 60 230 760 e07a7a 8 15 filled); then
+      failure="the phone card showed no console count"
+    else
+      read -r _ _ x0 y0 _ _ <<< "$found"
+      xdotool mousemove --window "$window" $((x0 + 10)) $((y0 + 5)) click 1
+      if ! found=$(find_color "$window" 480 60 90 80 7ce29b 8 10 filled); then
+        failure="the count did not open the Console panel"
+      else
+        read -r x y _ <<< "$found"
+        xdotool mousemove --window "$window" "$x" "$y" click 1
+        if ! find_color "$window" 590 60 230 760 e07a7a 8 10 absent,filled >/dev/null; then
+          failure="Clear left the phone's count"
+        elif ! find_color "$window" 840 60 400 760 e07a7a 8 5 filled >/dev/null; then
+          failure="Clear removed the tablet's count too"
+        else
+          xdotool mousemove --window "$window" 900 400 key ctrl+shift+j
+          if ! find_color "$window" 480 60 90 80 7ce29b 8 10 absent,filled >/dev/null; then
+            failure="Ctrl+Shift+J did not close the panel"
+          elif ! find_color "$window" 250 60 230 760 3b82f6 40 10 >/dev/null; then
+            failure="the phone frame did not return after the panel closed"
+          fi
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 900 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-counted, opened, cleared for one device and closed}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -1127,4 +1205,5 @@ download_desktop_restart_run "desktop download dismissal after restart"
 touch_run "touch cancellation through the canvas"
 workspace_run "workspace panel edits a draft and saves it"
 apply_input_run "input right after Apply removed a device"
+console_run "console panel counts and clears one device"
 echo "desktop smoke passed"

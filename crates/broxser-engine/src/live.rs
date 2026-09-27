@@ -92,6 +92,9 @@ const LINK_OBSERVER: &str = r#"(() => {
 })();"#;
 mod ime;
 use ime::{IME_BINDING, IME_OBSERVER, IME_WORLD, parse_caret_report, valid_ime_action};
+mod console;
+use console::ConsoleLog;
+pub use console::{ConsoleEntry, ConsoleKind, ConsoleLevel, MAX_CONSOLE_ENTRIES, MAX_CONSOLE_TEXT};
 const JPEG_QUALITY: u32 = 80;
 /// Largest frame edge requested before the UI reports its display size.
 const DEFAULT_FRAME_EDGE: u32 = 2048;
@@ -134,6 +137,11 @@ impl LiveSession {
                 devices: vec![DeviceStatus::default(); workspace.devices.len()],
                 ..Status::default()
             }),
+            console: Mutex::new(
+                (0..workspace.devices.len())
+                    .map(|_| ConsoleLog::default())
+                    .collect(),
+            ),
             notify: Box::new(notify),
         });
         let cancel = options.cancel.clone();
@@ -163,6 +171,15 @@ impl LiveSession {
 
     pub fn status(&self) -> Status {
         lock(&self.shared.status).clone()
+    }
+
+    /// The console entries of `device`, oldest first (ADR 0023). Read it when
+    /// [`DeviceStatus::console_revision`] changes, not on every status.
+    pub fn console(&self, device: usize) -> Vec<ConsoleEntry> {
+        lock(&self.shared.console)
+            .get(device)
+            .map(ConsoleLog::entries)
+            .unwrap_or_default()
     }
 
     /// True once the worker has stopped the browser and removed its profile.
@@ -241,6 +258,13 @@ pub struct DeviceStatus {
     /// A JavaScript dialog the page is waiting on. The page, its frames and
     /// its input stay blocked until the user answers it (ADR 0014).
     pub dialog: Option<DialogState>,
+    /// Console errors and warnings since the runtime started or the user
+    /// cleared the console, including repeats and entries no longer kept.
+    pub console_errors: u32,
+    pub console_warnings: u32,
+    /// Changes whenever the console of this device changes; read it with
+    /// [`LiveSession::console`].
+    pub console_revision: u64,
 }
 
 /// A window the page opened and Broxser closed as soon as the browser
@@ -402,6 +426,10 @@ pub enum Command {
         height: u32,
     },
     SetSync(SyncSettings),
+    /// Empties the device's console and resets its counts (ADR 0023).
+    ClearConsole {
+        device: usize,
+    },
     /// Crashes a renderer so tests can check crash reporting and recovery.
     #[cfg(test)]
     CrashForTest {
@@ -685,6 +713,9 @@ pub fn to_viewport(
 struct Shared {
     frames: Mutex<Vec<Option<Frame>>>,
     status: Mutex<Status>,
+    /// Per device; kept apart from the status so that status snapshots stay
+    /// small (ADR 0023).
+    console: Mutex<Vec<ConsoleLog>>,
     notify: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -699,6 +730,22 @@ impl Shared {
             if let Some(device) = status.devices.get_mut(index) {
                 change(device);
             }
+        });
+    }
+
+    /// Changes the console of `device` and publishes its counts.
+    fn console(&self, index: usize, change: impl FnOnce(&mut ConsoleLog)) {
+        let counts = {
+            let mut logs = lock(&self.console);
+            let Some(log) = logs.get_mut(index) else {
+                return;
+            };
+            change(log);
+            (log.errors, log.warnings)
+        };
+        self.device(index, |device| {
+            (device.console_errors, device.console_warnings) = counts;
+            device.console_revision = device.console_revision.wrapping_add(1);
         });
     }
 }
@@ -833,6 +880,9 @@ struct LiveDevice {
     generation: u64,
     link_context: Option<i64>,
     ime_context: Option<i64>,
+    /// The page's own main-frame context. Console entries from other
+    /// contexts of the page session come from its same-process frames.
+    main_context: Option<i64>,
     ime_anchor: Option<u64>,
     ime_blocked_anchor: Option<u64>,
     ime_target: Option<u64>,
@@ -912,6 +962,10 @@ enum IframeSetup {
     Intercept,
     AutoAttach,
     FrameTree,
+    /// Console calls and errors of the iframe reach the device's console,
+    /// from its first script on (ADR 0023).
+    Runtime,
+    Log,
     Resume,
 }
 
@@ -1223,6 +1277,7 @@ impl<'a> Controller<'a> {
                 generation: 0,
                 link_context: None,
                 ime_context: None,
+                main_context: None,
                 ime_anchor: None,
                 ime_blocked_anchor: None,
                 ime_target: None,
@@ -1257,6 +1312,13 @@ impl<'a> Controller<'a> {
             )?;
             self.command(
                 "Runtime.enable",
+                json!({}),
+                Some(&self.devices.last().unwrap().session.clone()),
+            )?;
+            // Failed requests and other browser messages reach the device's
+            // console only through the Log domain (ADR 0023).
+            self.command(
+                "Log.enable",
                 json!({}),
                 Some(&self.devices.last().unwrap().session.clone()),
             )?;
@@ -1431,6 +1493,9 @@ impl<'a> Controller<'a> {
                 }
             }
             Command::SetSync(settings) => self.set_sync(settings)?,
+            Command::ClearConsole { device } if device < count => {
+                self.shared.console(device, ConsoleLog::clear);
+            }
             #[cfg(test)]
             Command::CrashForTest { device } if device < count => {
                 // The crashing renderer may never answer.
@@ -2938,6 +3003,8 @@ impl<'a> Controller<'a> {
             ),
             IframeSetup::AutoAttach => ("Target.setAutoAttach", iframe_auto_attach()),
             IframeSetup::FrameTree => ("Page.getFrameTree", json!({})),
+            IframeSetup::Runtime => ("Runtime.enable", json!({})),
+            IframeSetup::Log => ("Log.enable", json!({})),
             IframeSetup::Resume => ("Runtime.runIfWaitingForDebugger", json!({})),
         };
         let index = self.iframe_sessions[session].device;
@@ -2988,9 +3055,11 @@ impl<'a> Controller<'a> {
                         // lifecycle change, within the original setup deadline.
                         IframeSetup::FrameTree
                     } else {
-                        IframeSetup::Resume
+                        IframeSetup::Runtime
                     }
                 }
+                IframeSetup::Runtime => IframeSetup::Log,
+                IframeSetup::Log => IframeSetup::Resume,
                 IframeSetup::Resume => {
                     self.iframe_sessions
                         .get_mut(&pending.session)
@@ -3128,6 +3197,39 @@ impl<'a> Controller<'a> {
         Ok(true)
     }
 
+    /// Adds a console call, an uncaught error or a browser log entry to the
+    /// device's console (ADR 0023). Broxser's own isolated worlds are not the
+    /// page's, so nothing from them is shown.
+    fn observe_console(&mut self, index: usize, iframe: bool, event: &Event) {
+        let params = &event.params;
+        let context = match event.method.as_str() {
+            "Runtime.consoleAPICalled" => params.get("executionContextId"),
+            "Runtime.exceptionThrown" => params.pointer("/exceptionDetails/executionContextId"),
+            _ => None,
+        }
+        .and_then(Value::as_i64);
+        let device = &self.devices[index];
+        if !iframe
+            && context.is_some()
+            && (context == device.link_context || context == device.ime_context)
+        {
+            return;
+        }
+        let entry = match event.method.as_str() {
+            "Runtime.consoleAPICalled" => console::console_call(params),
+            "Runtime.exceptionThrown" => console::exception(params),
+            _ => console::log_entry(params),
+        };
+        let Some(mut entry) = entry else {
+            return;
+        };
+        entry.subframe = iframe
+            || (context.is_some()
+                && device.main_context.is_some()
+                && context != device.main_context);
+        self.shared.console(index, |log| log.push(entry));
+    }
+
     fn observe(&mut self, event: Event) -> Result<()> {
         let params = &event.params;
         let text = |field: &str| params.get(field).and_then(Value::as_str);
@@ -3248,6 +3350,13 @@ impl<'a> Controller<'a> {
         let Some((index, iframe)) = self.session_owner(event.session.as_deref()) else {
             return Ok(());
         };
+        if matches!(
+            event.method.as_str(),
+            "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" | "Log.entryAdded"
+        ) {
+            self.observe_console(index, iframe, &event);
+            return Ok(());
+        }
         if self.observe_frame_lifecycle(index, &event)? || iframe {
             // Iframe sessions never feed top-level navigation, input, sync,
             // dialogs or screencast state.
@@ -3255,6 +3364,16 @@ impl<'a> Controller<'a> {
         }
         match event.method.as_str() {
             "Runtime.executionContextCreated" => {
+                if let Some(context) = params.get("context")
+                    && context.pointer("/auxData/frameId").and_then(Value::as_str)
+                        == Some(self.devices[index].target_id.as_str())
+                    && context
+                        .pointer("/auxData/isDefault")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    self.devices[index].main_context = context.get("id").and_then(Value::as_i64);
+                }
                 if let Some(context) = params.get("context")
                     && context.pointer("/auxData/frameId").and_then(Value::as_str)
                         == Some(self.devices[index].target_id.as_str())
@@ -3276,6 +3395,11 @@ impl<'a> Controller<'a> {
                 }
             }
             "Runtime.executionContextDestroyed" => {
+                if self.devices[index].main_context
+                    == params.get("executionContextId").and_then(Value::as_i64)
+                {
+                    self.devices[index].main_context = None;
+                }
                 if self.devices[index].ime_context.is_some_and(|id| {
                     params.get("executionContextId").and_then(Value::as_i64) == Some(id)
                 }) {
@@ -3290,6 +3414,7 @@ impl<'a> Controller<'a> {
                 }
             }
             "Runtime.executionContextsCleared" => {
+                self.devices[index].main_context = None;
                 self.devices[index].link_context = None;
                 self.devices[index].link_intent = None;
                 self.devices[index].ime_context = None;
@@ -3596,6 +3721,10 @@ impl<'a> Controller<'a> {
                 // The browser's error page for a navigation Broxser started
                 // shows the failure; its report stays until a document commits.
                 let error_page = frame.get("unreachableUrl").is_some();
+                if !error_page {
+                    let entry = console::navigation(&url);
+                    self.shared.console(index, |log| log.push(entry));
+                }
                 self.shared.device(index, |device| {
                     device.url = url;
                     let failed = device
