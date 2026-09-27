@@ -120,6 +120,17 @@ preview mode statis dan direktori socket `org.chromium.Chromium.*` masih terting
 (yang kedua juga pada close normal), serta kualifikasi skenario kill di Wayland,
 GPU fisik, distro dan kernel perusahaan.
 
+**Tindak lanjut P0 (27 September 2026, PR terpisah):** deadlock cleanup yang
+tercatat di P1.4 (crash handler Helium men-trace renderer yang ikut terbunuh di
+dalam PID namespace sandbox, sehingga handler, renderer dan zombie-nya hidup
+terus sementara profilnya sudah dihapus) muncul sebagai "browser processes still
+running" di suite live dan meninggalkan proses di mesin pengguna tanpa recovery.
+Kini semua jalur cleanup, sesudah menunggu lima detik, membunuh lewat pidfd
+berdasarkan identitas proses yang tercatat dan masih berjalan, proses dengan
+argumen `--user-data-dir=<profil>` persis, dan crash handler dengan
+`--database=<profil>/`, lalu menunggu sekali lagi; proses lain yang hanya menyebut
+profil tetap tidak disinyal. Bukti di `docs/validation.md` (tindak lanjut P0).
+
 ### Backlog sesudah P0
 
 | Urutan | Pekerjaan | Hasil atau gate yang diperlukan |

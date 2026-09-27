@@ -351,6 +351,7 @@ pub(crate) fn fake_browser(kind: FakeBrowser) -> PathBuf {
             FakeBrowser::NeverReady => "never-ready",
             FakeBrowser::LoopbackEndpoint => "loopback-endpoint",
             FakeBrowser::LateHelper => "late-helper",
+            FakeBrowser::StuckHelper => "stuck-helper",
         })
 }
 
@@ -362,6 +363,9 @@ pub(crate) enum FakeBrowser {
     /// Never publishes an endpoint; once it is gone, a process that did not
     /// exist before writes into the profile for about 0.3 seconds.
     LateHelper,
+    /// Never publishes an endpoint and leaves a helper, named like Chromium's
+    /// crash handler after the profile's crash database, that outlives it.
+    StuckHelper,
 }
 
 /// How a fake CDP websocket peer behaves after its (optionally delayed) handshake.

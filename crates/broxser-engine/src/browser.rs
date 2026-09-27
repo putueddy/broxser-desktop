@@ -198,7 +198,7 @@ impl BrowserProcess {
         let _ = self.child.kill();
         self.child.wait().context("wait for browser exit")?;
         let survivors = match &self.profile {
-            Some(profile) => wait_for_release(&processes, profile.path(), EXIT_TIMEOUT),
+            Some(profile) => release_or_stop(&processes, profile.path(), EXIT_TIMEOUT),
             None => wait_for_exit(&processes, EXIT_TIMEOUT),
         };
         #[cfg(test)]
@@ -225,7 +225,7 @@ impl Drop for BrowserProcess {
         processes.extend(referencing(profile.path()));
         let _ = self.child.kill();
         let _ = self.child.wait();
-        wait_for_release(&processes, profile.path(), EXIT_TIMEOUT);
+        release_or_stop(&processes, profile.path(), EXIT_TIMEOUT);
         // Removes the profile, then releases the guardian.
         drop(profile);
     }
@@ -406,6 +406,21 @@ pub(crate) fn launched_with(_profile: &Path) -> Vec<ProcessIdentity> {
     Vec::new()
 }
 
+/// Running crash handlers of a browser on `profile`: Chromium starts them
+/// with `--database=<profile>/Crash Reports`.
+#[cfg(target_os = "linux")]
+pub(crate) fn crash_handlers_of(profile: &Path) -> Vec<ProcessIdentity> {
+    let mut prefix = b"--database=".to_vec();
+    prefix.extend_from_slice(profile.as_os_str().as_encoded_bytes());
+    prefix.push(b'/');
+    procfs::with_argument_prefix(&prefix)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn crash_handlers_of(_profile: &Path) -> Vec<ProcessIdentity> {
+    Vec::new()
+}
+
 /// The browser and its current descendants. Chromium's sandboxed zygotes,
 /// renderers, GPU and utility processes are children or grandchildren of the
 /// browser; its crash handler detaches and is found through the profile path.
@@ -477,6 +492,37 @@ pub(crate) fn wait_for_release(
     }
 }
 
+/// [`wait_for_release`], then, if something of the browser still runs, kills
+/// by process identity each recorded process that runs and each process
+/// launched on `profile` or keeping its crash reports there, and waits once
+/// more. A crash handler that traces a renderer caught by the kill otherwise
+/// keeps itself, that renderer and its sandbox namespace alive indefinitely
+/// (validation, P1.4); a stopped handler releases them. Processes that merely
+/// mention the profile are waited for, never signalled. Returns how many
+/// still run.
+pub(crate) fn release_or_stop(
+    processes: &[ProcessIdentity],
+    profile: &Path,
+    timeout: Duration,
+) -> usize {
+    if wait_for_release(processes, profile, timeout) == 0 {
+        return 0;
+    }
+    let mut stopped: Vec<ProcessIdentity> = processes.iter().copied().filter(is_running).collect();
+    for process in launched_with(profile)
+        .into_iter()
+        .chain(crash_handlers_of(profile))
+    {
+        if !stopped.contains(&process) {
+            stopped.push(process);
+        }
+    }
+    for process in &stopped {
+        let _ = terminate(process);
+    }
+    wait_for_release(&stopped, profile, timeout)
+}
+
 /// Waits until none of `processes` is running. Returns how many still run.
 pub(crate) fn wait_for_exit(processes: &[ProcessIdentity], timeout: Duration) -> usize {
     let deadline = Instant::now() + timeout;
@@ -540,6 +586,11 @@ pub(crate) mod procfs {
         matching(|cmdline| has_argument(cmdline, argument))
     }
 
+    /// Running processes with an argument that starts with `prefix`.
+    pub(crate) fn with_argument_prefix(prefix: &[u8]) -> Vec<ProcessIdentity> {
+        matching(|cmdline| has_argument_prefix(cmdline, prefix))
+    }
+
     fn matching(condition: impl Fn(&[u8]) -> bool) -> Vec<ProcessIdentity> {
         all()
             .into_iter()
@@ -550,6 +601,18 @@ pub(crate) mod procfs {
             })
             .map(|process| process.identity)
             .collect()
+    }
+
+    /// An argument of `cmdline` starts with `prefix`: it is preceded by the
+    /// start, a NUL or, for rewritten titles, a space.
+    pub(super) fn has_argument_prefix(cmdline: &[u8], prefix: &[u8]) -> bool {
+        !prefix.is_empty()
+            && cmdline
+                .windows(prefix.len())
+                .enumerate()
+                .any(|(at, window)| {
+                    window == prefix && (at == 0 || matches!(cmdline[at - 1], 0 | b' '))
+                })
     }
 
     pub(super) fn has_argument(cmdline: &[u8], argument: &[u8]) -> bool {
@@ -718,6 +781,26 @@ mod tests {
             b"x--user-data-dir=/tmp/broxser-cdp-a\0",
         ] {
             assert!(!procfs::has_argument(other, argument), "{other:?}");
+        }
+    }
+
+    /// Crash handlers are found by the profile's crash database argument; a
+    /// process that only mentions the profile is never one of them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_database_argument_matches_only_the_profiles_own() {
+        let prefix = b"--database=/tmp/broxser-cdp-a/";
+        assert!(procfs::has_argument_prefix(
+            b"helium_crashpad_handler\0--monitor-self\0--database=/tmp/broxser-cdp-a/Crash Reports\0",
+            prefix
+        ));
+        for other in [
+            &b"helium_crashpad_handler\0--database=/tmp/broxser-cdp-ab/Crash Reports\0"[..],
+            b"ls\0/tmp/broxser-cdp-a/Crash Reports\0",
+            b"x\0x--database=/tmp/broxser-cdp-a/Crash Reports\0",
+            b"cat\0notes--database=/tmp/broxser-cdp-a/\0",
+        ] {
+            assert!(!procfs::has_argument_prefix(other, prefix), "{other:?}");
         }
     }
 

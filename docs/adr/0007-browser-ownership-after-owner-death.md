@@ -75,6 +75,15 @@ metadata files were readable by other local users; Chromium itself uses 0700.
   carries the profile path in its command line, so each re-scan also finds
   processes the helpers start. Waiting never signals: processes that merely name
   the profile are not killed.
+- **Stop what outlives the wait** (added 2026-09-27). A crash handler that
+  traces a renderer caught by the kill never stops by itself: the renderer, as
+  init of its sandbox PID namespace, waits for its traced threads and the
+  handler waits for it (`docs/validation.md`, P1.4). When something still runs
+  after the five-second wait, every cleanup path SIGKILLs through a pidfd,
+  re-checked against the recorded start time, the processes it recorded that
+  still run, the processes carrying the exact `--user-data-dir=<profile>`
+  argument and the crash handlers carrying `--database=<profile>/…`, then waits
+  once more. Processes that only mention the profile are still never signaled.
 - **Recovery on the next start.** Before creating a profile, the engine checks
   `broxser-cdp-*` entries in the same root. An entry is stale only when it is a
   real directory owned by the user, with a valid version-1 lease, and either
@@ -107,11 +116,15 @@ metadata files were readable by other local users; Chromium itself uses 0700.
 - A process in uninterruptible sleep can outlast the wait; the guardian still
   deletes the profile and exits with a failure status.
 - An unrelated process that keeps naming the profile, such as `tail -f` on a
-  file inside it, makes shutdown and the guardian wait the full five seconds and
-  report an error; they still delete the profile and never signal that process.
+  file inside it, makes shutdown and the guardian wait the full five seconds,
+  twice since the survivors stop above, and report an error; they still delete
+  the profile and never signal that process.
   Recovery leaves such a profile for a later start.
 - The browser's helpers stopping with its main process is measured behavior,
   not a documented upstream guarantee; the live tests re-check it per update.
+  A shutdown that has to stop survivors takes the five-second wait plus the
+  second wait; before, the handler, the renderer and its zombie stayed until
+  someone killed them by hand, after the profile was already removed.
 - Static-mode preview directories (desktop screenshots) are outside this
   mechanism and remain after the desktop is killed. Chromium's process-singleton
   directory `org.chromium.Chromium.*` in the temporary directory remains after

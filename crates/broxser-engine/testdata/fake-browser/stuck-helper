@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake browser for engine tests: never publishes a CDP endpoint and starts a
+# helper that names the profile in its crash database argument, as Chromium's
+# crash handler does, and never exits on its own: a crash handler tracing a
+# renderer that the kill caught can outlive the browser indefinitely.
+case "$1" in --version) echo "Fake 1.0 (Chromium 154.0.0.0)"; exit 0 ;; esac
+for arg in "$@"; do case "$arg" in --user-data-dir=*) dir=${arg#--user-data-dir=} ;; esac; done
+# The trailing no-op keeps this shell, and its arguments, from being replaced
+# by `sleep`.
+sh -c 'sleep 60; :' stuck-helper --monitor-self "--database=$dir/Crash Reports" &
+exec sleep 60

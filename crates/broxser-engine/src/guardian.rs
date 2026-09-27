@@ -277,7 +277,7 @@ fn cleanup(profile: &Path, owner: &ProcessIdentity, reported: Option<ProcessIden
     for browser in &browsers {
         let _ = browser::terminate(browser);
     }
-    let survivors = browser::wait_for_release(&processes, profile, EXIT_TIMEOUT);
+    let survivors = browser::release_or_stop(&processes, profile, EXIT_TIMEOUT);
     let removed = profile::remove_guarded(profile, owner);
     let mut stderr = io::stderr();
     if survivors > 0 {
