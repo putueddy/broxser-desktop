@@ -2002,11 +2002,21 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
         }
         json!({"method": "Target.targetCreated", "params": {"targetInfo": info}})
     };
-    let closed = |peer: &FakePeer| -> Vec<String> {
-        peer.browser_requests("Target.closeTarget")
-            .iter()
-            .map(|params| params["targetId"].as_str().unwrap_or_default().to_owned())
-            .collect()
+    // The report is visible before the peer has read the close request that
+    // went with it, so the check waits for `count` requests first.
+    let closed = |peer: &FakePeer, count: usize| -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let targets: Vec<String> = peer
+                .browser_requests("Target.closeTarget")
+                .iter()
+                .map(|params| params["targetId"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            if targets.len() >= count || Instant::now() >= deadline {
+                return targets;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     };
 
     // The phone opens a window: it is closed and reported with its URL.
@@ -2021,7 +2031,7 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
         .unwrap();
     assert_eq!(popup.url, format!("{origin}/popup"));
     assert!(popup.openable);
-    assert_eq!(closed(&peer), ["P1"]);
+    assert_eq!(closed(&peer, 1), ["P1"]);
     // Only the report of the latest window opens, and only once.
     peer.event(window_open("S0", "javascript:alert(1)"));
     peer.event(created("P2", Some("T0"), "CTX1"));
@@ -2079,7 +2089,7 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
         .popup
         .clone()
         .unwrap();
-    assert_eq!(closed(&peer), ["P1", "P2", "P3", "P5", "P6"]);
+    assert_eq!(closed(&peer, 5), ["P1", "P2", "P3", "P5", "P6"]);
     let status = live.status();
     assert_eq!(status.devices[0].popups, 3);
     assert_eq!(status.devices[1].popups, 1);
