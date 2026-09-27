@@ -338,7 +338,7 @@ mendapat layar seukuran viewport, dan sisanya didokumentasikan: hasil mewakili
 pengguna Helium dengan blocker mati di mesin serupa, bukan pengguna Chrome, dan
 perbandingan piksel canvas tidak stabil antar session.
 
-**Status P2.1 (27 September 2026, PR menunggu review):** audit dan keputusan ada di
+**Status P2.1 (27–28 September 2026, merged melalui PR #21):** audit dan keputusan ada di
 [ADR 0020](docs/adr/0020-certificate-store-and-keyring-inside-the-profile.md) dan
 `docs/validation.md` (P2.1). Trace `broxser capture` membuktikan bahwa verifikasi
 sertifikat HTTPS pertama membuka database NSS pengguna (`~/.pki/nssdb`, atau
@@ -360,6 +360,26 @@ di bawah HOME pengguna tidak terlihat halaman.
 Autentikasi X11 mempertahankan `XAUTHORITY` asli dan `SSLKEYLOGFILE` dibuang pada
 launch; environment native lainnya tetap diwarisi, jadi batas NSS/profil ini
 tidak menjamin isolasi seluruh akses filesystem.
+
+**Status P2.2 (27 September 2026, audit; belum ada implementasi; PR menunggu review):** pengukuran
+ada di `docs/validation.md` (P2.2) dan usulannya di
+[ADR 0021](docs/adr/0021-persistent-sessions-one-profile-per-session.md)
+(proposed, belum diterima). Context CDP tidak punya opsi persisten, jadi
+persistent session berarti satu browser dengan profil on-disk per session.
+Probe Helium membuktikan profil itu menyimpan cookie ber-expiry, localStorage
+dan IndexedDB melewati close bersih maupun SIGKILL; cookie session (termasuk
+cookie login `HttpOnly`) hilang pada setiap restart kecuali `Preferences`
+memuat `session.restore_on_startup = 1`; SIGKILL 12 s setelah login menghilangkan
+semua cookie (flush cookie berjalan per timer dan saat shutdown); context
+off-the-record di browser yang sama tidak melihat apa pun; cookie at rest hanya
+dilindungi mode direktori dan disk karena `--password-store=basic` memakai kunci
+tetap (didekripsi dalam probe); profil yang dibuat Helium 154 tidak dapat
+dipakai Chromium 141. Pekerjaan P2.2 dipecah: (a) UI kelola workspace, device
+dan preset serta restore konfigurasi tanpa kredensial, dapat berjalan lebih dulu;
+(b) persistent session sesuai ADR 0021 menunggu gate produk (mesin mana yang
+boleh menyimpan login), lifecycle (close bersih tanpa kehilangan cookie,
+ikatan versi browser), budget resource, dan migrasi skema workspace. Default
+tetap ephemeral.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -452,6 +472,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   PR #16; permission: ADR 0017, merged melalui PR #17; input touch dan batas hover,
   drag/drop serta aksesibilitas: ADR 0018, merged melalui PR #19; P1.7 fidelitas QA:
   ADR 0019, merged melalui PR #20).
-- [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
+- [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian
+  (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
+  session: audit dan ADR 0021 proposed, PR menunggu review).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

@@ -3,6 +3,51 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P2.2 persistent session audit, 27 September 2026 (cloud container)
+
+Audit only; nothing is implemented, and the proposal is
+[ADR 0021](adr/0021-persistent-sessions-one-profile-per-session.md) (not
+accepted). Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by
+`broxsertest` with the sandbox enabled and Broxser's launch flags (private
+home, `--password-store=basic`), an on-disk profile as `--user-data-dir`, a
+page in the browser's default context, and a scratch Node fixture on a fixed
+port that sets `persistent` (Max-Age one day), `session` (`HttpOnly`) and
+`visible` cookies, localStorage, sessionStorage and an IndexedDB value.
+Chromium 141 (the Playwright build here) played the older browser.
+
+### What the on-disk profile keeps
+
+| Run | Cookies seen after the restart | localStorage / IndexedDB | sessionStorage |
+| --- | --- | --- | --- |
+| Clean close (`Browser.close`), restart | `persistent` only | Kept | Gone |
+| Restart after a SIGKILL of an idle browser (the values had been flushed by the earlier close) | `persistent` only | Kept | Gone |
+| SIGKILL 12 s after the login page set everything, restart | None; `Preferences` `profile.exit_type` was `Crashed` | Kept | Gone |
+| `session.restore_on_startup = 1` seeded before the first run, clean close, restart | `persistent`, `session` (`HttpOnly`) and `visible` | Kept | Gone |
+| The profile opened by Chromium 141, then by Helium again | Chromium answered `Browser.getVersion` and no `Target.getTargets` within 8 s; Helium afterwards saw everything as before | — | — |
+
+Other measurements: an off-the-record context created in the same browser saw
+no cookie, storage or permission of the profile; `Browser.setDownloadBehavior`
+and `Browser.setPermission` sent without `browserContextId` applied to the
+default context (`notifications` `denied` there, `prompt` in the created
+context); the profile held 2.6 MB after one run and 5.0 MB after five; the CDP
+endpoint came up in 150 ms with a warm profile; the previous run's
+`DevToolsActivePort` stays in the directory and must not be read. The
+`Default/Cookies` SQLite file holds every cookie, session cookies included,
+with `v10` values that a short script decrypted with the fixed password of
+`--password-store=basic` (PBKDF2 of `peanuts`, 16 space bytes as the IV), so
+at rest the profile is protected by its mode and the disk only.
+
+### Limits
+
+- Measured with one browser, one page and a local fixture; no application
+  under test, no Helium update between runs.
+- The cookie flush interval was not measured beyond "lost after 12 s, kept
+  after a clean close".
+- Reading `profile.exit_type` right after a close is not reliable (it still
+  read `Crashed` once after a clean close).
+- Not measured: resource cost of several persistent browsers, the workspace
+  UI, and any migration.
+
 ## P2.1 storage and credential boundary, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by the unprivileged
