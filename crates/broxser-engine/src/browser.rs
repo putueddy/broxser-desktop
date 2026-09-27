@@ -11,6 +11,7 @@ use serde_json::json;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -116,6 +117,7 @@ impl BrowserProcess {
         if seed {
             seed_profile(profile.path())?;
         }
+        let home = create_private_home(profile.path())?;
         let mut command = Command::new(&options.executable);
         command
             .args(launch_args(profile.path(), options.headless, user_agent))
@@ -129,6 +131,12 @@ impl BrowserProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        for (name, value) in environment(&home, |name| env::var_os(name)) {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
         // Profile creation includes guardian startup. Cancellation during that
         // work must prevent the browser spawn as well.
         options.cancel.check()?;
@@ -323,6 +331,11 @@ fn launch_args(profile: &Path, headless: bool, user_agent: Option<&str>) -> Vec<
         user_data_dir,
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
+        // A temporary profile needs no key from the user's keyring. Without
+        // this, Chromium asks the desktop's Secret Service or KWallet for the
+        // key that also protects a personal profile's cookies, or creates one
+        // there that outlives the profile (ADR 0020).
+        "--password-store=basic".into(),
         "about:blank".into(),
     ];
     if headless {
@@ -333,6 +346,57 @@ fn launch_args(profile: &Path, headless: bool, user_agent: Option<&str>) -> Vec<
         }
     }
     args
+}
+
+/// The browser's home directory inside the private profile (ADR 0020).
+pub(crate) const PRIVATE_HOME: &str = "home";
+
+/// Creates the browser's private home directory, mode 0700 like the profile.
+fn create_private_home(profile: &Path) -> Result<PathBuf> {
+    let home = profile.join(PRIVATE_HOME);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .context("create the browser's private home directory")?;
+    Ok(home)
+}
+
+/// The browser's environment (ADR 0020): a variable to set, or `None` to remove
+/// it. `HOME` is a directory inside the private profile, so NSS creates the
+/// browser's certificate and key database there and never opens the user's
+/// `~/.pki/nssdb`, whose CAs and client certificates would otherwise be trusted
+/// and offered in Broxser's sessions. `XDG_DATA_HOME` and `XDG_CONFIG_HOME` go
+/// too: Chromium keeps that database under the data directory when one is set.
+/// The user's cache directory stays, so fontconfig reuses its caches of the
+/// system fonts instead of rebuilding them at every browser start.
+fn environment(
+    home: &Path,
+    inherited: impl Fn(&str) -> Option<OsString>,
+) -> [(&'static str, Option<OsString>); 4] {
+    let absolute = |value: &OsString| Path::new(value).is_absolute();
+    let cache = inherited("XDG_CACHE_HOME").filter(absolute).or_else(|| {
+        inherited("HOME")
+            .filter(absolute)
+            .map(|home| Path::new(&home).join(".cache").into_os_string())
+    });
+    [
+        ("HOME", Some(home.as_os_str().to_owned())),
+        ("XDG_DATA_HOME", None),
+        ("XDG_CONFIG_HOME", None),
+        ("XDG_CACHE_HOME", cache),
+    ]
+}
+
+/// Added to a certificate error: a page that a personal browser opens can fail
+/// here, because Broxser's browser trusts its built-in roots and the machine's
+/// `CACertificates` policy, not a user's certificate database (ADR 0020).
+pub(crate) fn certificate_note(error: &str) -> &'static str {
+    if error == "net::ERR_CERT_AUTHORITY_INVALID" {
+        " (Broxser trusts the browser's built-in roots and the CACertificates policy, not a \
+         personal certificate store)"
+    } else {
+        ""
+    }
 }
 
 /// Capture diagnostics retain observed identities even when startup fails
@@ -845,6 +909,7 @@ mod tests {
         assert!(args.contains(&"--user-data-dir=/tmp/broxser-cdp-test".to_owned()));
         assert!(args.contains(&"--user-agent=UA".to_owned()));
         assert!(args.contains(&POINTER_SETTINGS.to_owned()));
+        assert!(args.contains(&"--password-store=basic".to_owned()));
         let headed: Vec<String> = launch_args(profile, false, None)
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
@@ -852,6 +917,7 @@ mod tests {
         assert!(!headed.iter().any(|arg| arg.starts_with("--headless")
             || arg.starts_with("--user-agent")
             || arg.starts_with("--blink-settings")));
+        assert!(headed.contains(&"--password-store=basic".to_owned()));
         assert!(
             !args
                 .iter()
@@ -867,6 +933,107 @@ mod tests {
             preferences["extensions"]["settings"][HELIUM_UBLOCK_ID]["incognito"],
             false
         );
+    }
+
+    #[test]
+    fn environment_keeps_only_the_users_cache_directory() {
+        let home = Path::new("/tmp/broxser-cdp-test/home");
+        let from = |variables: Vec<(&'static str, &'static str)>| {
+            move |name: &str| {
+                variables
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            environment(
+                home,
+                from(vec![
+                    ("HOME", "/home/u"),
+                    ("XDG_DATA_HOME", "/home/u/.local/share"),
+                    ("XDG_CONFIG_HOME", "/home/u/.config"),
+                ])
+            ),
+            [
+                ("HOME", Some("/tmp/broxser-cdp-test/home".into())),
+                ("XDG_DATA_HOME", None),
+                ("XDG_CONFIG_HOME", None),
+                ("XDG_CACHE_HOME", Some("/home/u/.cache".into())),
+            ]
+        );
+        let explicit = environment(
+            home,
+            from(vec![
+                ("HOME", "/home/u"),
+                ("XDG_CACHE_HOME", "/var/cache/u"),
+            ]),
+        );
+        assert_eq!(explicit[3], ("XDG_CACHE_HOME", Some("/var/cache/u".into())));
+        assert_eq!(
+            environment(home, from(vec![("HOME", "relative")]))[3],
+            ("XDG_CACHE_HOME", None)
+        );
+        assert_eq!(environment(home, from(vec![]))[3], ("XDG_CACHE_HOME", None));
+        assert!(certificate_note("net::ERR_CERT_AUTHORITY_INVALID").contains("CACertificates"));
+        assert_eq!(certificate_note("net::ERR_CONNECTION_REFUSED"), "");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_runs_in_a_private_home() {
+        use crate::test_support::{FakeBrowser, fake_browser, profile_root};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let root = profile_root();
+        let browser = BrowserProcess::start(
+            &BrowserOptions {
+                executable: fake_browser(FakeBrowser::NeverReady),
+                headless: true,
+                profile_root: Some(root.path().to_owned()),
+                cancel: Cancellation::new(),
+            },
+            true,
+        )
+        .unwrap();
+        let home = browser.profile.as_ref().unwrap().path().join(PRIVATE_HOME);
+        // The fake browser execs `sleep`; while it does, its environment reads
+        // back empty for a moment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let environ = loop {
+            let environ = fs::read(format!("/proc/{}/environ", browser.child.id())).unwrap();
+            if environ.windows(5).any(|bytes| bytes == b"HOME=") || Instant::now() >= deadline {
+                break environ;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let variable = |name: &str| {
+            environ
+                .split(|byte| *byte == 0)
+                .filter_map(|entry| {
+                    let at = entry.iter().position(|byte| *byte == b'=')?;
+                    Some((&entry[..at], &entry[at + 1..]))
+                })
+                .find(|(key, _)| *key == name.as_bytes())
+                .map(|(_, value)| std::ffi::OsStr::from_bytes(value).to_owned())
+        };
+        assert_eq!(variable("HOME"), Some(home.clone().into_os_string()));
+        assert_eq!(
+            fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(variable("XDG_DATA_HOME"), None);
+        assert_eq!(variable("XDG_CONFIG_HOME"), None);
+        assert_eq!(
+            variable("XDG_CACHE_HOME"),
+            env::var_os("XDG_CACHE_HOME").or_else(|| env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache").into_os_string()))
+        );
+        assert!(
+            variable("BREAKPAD_DUMP_LOCATION")
+                .is_some_and(|location| Path::new(&location).starts_with(root.path()))
+        );
+        browser.shutdown().unwrap();
     }
 
     #[cfg(target_os = "linux")]

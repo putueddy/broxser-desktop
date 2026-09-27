@@ -72,6 +72,10 @@ canvas scale. See `docs/validation.md` for numbers.
   its own gate; ADR 0010 covers
   plain-text paste only. ADR 0011 adds native IME composition and caret placement
   for standard main-frame editable controls, qualified with Fcitx5/Pinyin over XIM.
+- Certificate trust is the browser's own: ADR 0020 gives it a private home and
+  NSS database inside the profile, so a CA trusted only in the user's database
+  and the user's client certificates do not apply in sessions; a corporate CA
+  comes through the `CACertificates` policy.
 
 ## Options for later
 

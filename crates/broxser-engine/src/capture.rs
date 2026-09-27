@@ -322,8 +322,11 @@ impl Capture<'_> {
             .map(str::to_owned);
         if let Some(error) = response.get("errorText").and_then(Value::as_str) {
             self.settle(index, loader.as_deref());
+            let note = crate::browser::certificate_note(error);
             let explanation = if response.get("isDownload").and_then(Value::as_bool) == Some(true) {
                 " (the address is a download, which Broxser does not save)".to_owned()
+            } else if !note.is_empty() {
+                note.to_owned()
             } else {
                 foreign(&self.targets[index], loader.as_deref())
                     .map(|navigation| format!(" (superseded by {})", describe(navigation)))

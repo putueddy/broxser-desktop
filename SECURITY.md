@@ -18,9 +18,15 @@ browser, Broxser sets its own soft core-file limit and `coredump_filter` to zero
 and the browser inherits both. File-based core patterns and apport (for unpackaged
 programs) then write nothing. systemd-coredump ignores the limit and still records
 the crash, but the dump holds only headers and register state, no memory mappings
-with cookies or page content. Chromium still opens the user's shared NSS
-certificate database, which may hold corporate CAs and client certificates;
-whether to isolate it is an open decision.
+with cookies or page content. The browser runs with a private home directory
+inside the profile (ADR 0020): NSS creates the browser's own certificate database
+there, deleted with the profile, and the user's `~/.pki/nssdb`, with its CAs,
+client certificates and keys, is not opened. The desktop keyring is not asked for
+a key (`--password-store=basic`). A corporate CA is installed explicitly through
+Chromium's `CACertificates` policy in `/etc/chromium/policies/managed`, which the
+user's own Helium honours too; a CA trusted only in a personal database, and
+client certificates, do not apply in Broxser. Only the user's cache directory
+(fontconfig caches) is still shared with the browser.
 
 Cleanup runs on normal close, errors and cancellation. Every cleanup path deletes
 the profile only once no running process names it, so a Helium helper that is

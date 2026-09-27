@@ -7007,3 +7007,116 @@ fn live_pages_see_the_browser_a_user_would_run() {
     assert_eq!(phone["touch"], "1");
     live.close();
 }
+
+/// A TLS server whose certificate no root signed, served by the `openssl`
+/// command line tool with a key made for this test only. Stops when dropped.
+struct SelfSignedServer {
+    child: std::process::Child,
+    port: u16,
+    _files: tempfile::TempDir,
+}
+
+impl SelfSignedServer {
+    fn start() -> Self {
+        use std::process::Stdio;
+        let files = tempfile::tempdir().unwrap();
+        let (certificate, key) = (files.path().join("cert.pem"), files.path().join("key.pem"));
+        let made = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            ])
+            .args([
+                "-subj",
+                "/CN=broxser-test",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&certificate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run openssl to make the test certificate");
+        assert!(made.success(), "openssl req failed: {made}");
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = std::process::Command::new("openssl")
+            .args(["s_server", "-www", "-accept", &format!("127.0.0.1:{port}")])
+            .arg("-cert")
+            .arg(&certificate)
+            .arg("-key")
+            .arg(&key)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start openssl s_server");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "openssl s_server did not listen");
+            thread::sleep(Duration::from_millis(20));
+        }
+        Self {
+            child,
+            port,
+            _files: files,
+        }
+    }
+}
+
+impl Drop for SelfSignedServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// ADR 0020: the browser's certificate trust is its own. Before the change the
+/// browser opened the user's `~/.pki/nssdb` on the first HTTPS navigation and
+/// trusted the CAs (and offered the client certificates) found there; now NSS
+/// creates a database inside the private profile, which goes with it.
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_certificate_trust_is_the_browsers_own_not_the_users() {
+    let server = SelfSignedServer::start();
+    let live = Live::start(workspace(format!("https://127.0.0.1:{}/", server.port)));
+    let status = live.wait(
+        "a certificate error on every device",
+        Duration::from_secs(30),
+        |status| status.devices.iter().all(|device| device.error.is_some()),
+    );
+    for device in &status.devices {
+        let error = device.error.as_deref().unwrap();
+        assert!(
+            error.contains("net::ERR_CERT_AUTHORITY_INVALID")
+                && error.contains("CACertificates policy")
+                && error.ends_with("not retried"),
+            "{error}"
+        );
+    }
+    let profile = std::fs::read_dir(live.root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("broxser-cdp-"))
+        })
+        .expect("the private profile");
+    let database = profile
+        .join(browser::PRIVATE_HOME)
+        .join(".local/share/pki/nssdb");
+    assert!(
+        database.join("cert9.db").is_file(),
+        "no NSS database of the browser's own in {}",
+        database.display()
+    );
+    drop(server);
+    // The profile, and the database with it, are gone after the session.
+    live.close();
+}
