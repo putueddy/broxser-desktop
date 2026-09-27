@@ -3,6 +3,59 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P2.2a workspace panel, presets and application state, 27 September 2026 (cloud container)
+
+Same container: Helium 0.18.1.1 run by `broxsertest` with the sandbox enabled,
+Xvfb 1600 × 1000 (Vulkan software), debug build of the desktop. Decisions are in
+[ADR 0022](adr/0022-workspace-panel-presets-and-application-state.md).
+
+### Before the change
+
+- The only way to add or remove a device was to edit the workspace file and
+  start the desktop again; the running workspace could not be changed.
+- Nothing survived a run: the next start needed `--workspace` again and opened
+  a 1360 × 860 window whatever the previous size.
+
+### After the change
+
+- The panel (toolbar "Workspace", `Ctrl+Shift+W`) lists the draft's devices
+  with Remove, the eight presets with Add, a notice line, and Apply (when the
+  draft differs), Discard and Save. Adding "Phone" to the demo, which already
+  has a `phone`, yields `phone-2` named "Phone 2"; a ninth device or one over
+  the pixel budget is refused with the validation message and the draft stays.
+- Apply is the existing restart: four devices load the page after adding one,
+  three after removing one; the running pages never see the edit.
+- Save writes the draft and the URL bar's address to the loaded file
+  atomically; the demo workspace reports that it has no file.
+- The state file gets the workspace path and the window size on close; a
+  start without `--workspace` reopens the most recent existing file.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `cargo test -p broxser-core` | 10 passed, including the new `presets_add_named_unique_devices_and_roll_back_over_budget` and `application_state_remembers_workspaces_and_the_window_without_secrets` |
+| `bash scripts/check.sh` | Passed in 34 s: fmt, `cargo test --locked` (1 CLI, 10 core, 89 engine, 36 desktop), strict Clippy for the workspace and the desktop crate |
+| Live Helium suite as `broxsertest` (`--ignored`, 4 threads; the engine is untouched, `broxser-core` only gained derives) | 42 of 43 passed in 74 s; `live_subframe_navigations_never_sync` failed at its close with "browser processes still running" (the browser's exit outlasted the 5 s cleanup bound, as recorded under P1.4) and passed 3 of 3 alone afterwards |
+| New smoke run "workspace panel edits a draft and saves it", alone | Passed in 5.9 s: `Ctrl+Shift+W` opened the panel; Add on the first preset; Apply restarted with four page loads; Remove on the first device; Apply restarted with three; Save wrote `small-phone` and no `phone` into the copy; after Ctrl+Q the state file named the copy and the window size and held no `http` |
+| Full `scripts/desktop-smoke.sh` (Xvfb 1600 × 1000, debug build) | 10 of 10 scenarios passed in 1 m 18 s with the new run last; no browser process, profile or window left |
+| Real window, screenshots | The panel after `Ctrl+Shift+W` (file line, Save, three device rows with Remove, eight presets with Add) and after Add (the notice, Apply and Discard beside Save) were captured with `xwd` and inspected; the toolbar "Workspace" toggle closed it again |
+| Rerun after the cherry-pick onto `main` (`922bb96`, PR #22 merged; along the PR chain this commit was merged with the owner's `touch_run` in `scripts/desktop-smoke.sh`, both runs kept and `touch_run` now using `size_window`, and with the owner's Restart row in the README) | `check.sh` passed: 1 CLI, 10 core, 142 engine and 36 desktop tests, 51 live tests ignored by default. Live Helium suite 51 of 51 in 88.3 s; full smoke 14 of 14 runs in 1 m 31 s, the workspace run and the touch run included; no browser process, profile or window left |
+
+Two smoke findings on the way: with the fixture's default caching, two devices of one session loaded the page from the browser cache, so requests did not count devices; the fixture now sends `Cache-Control: no-store`. And a desktop that reopens at its last size gets no configure event from a resize to that same size, so GPUI drew nothing and clicks hit nothing (the "Restart runtime" run failed twice); the smoke now keeps a private state file and resizes to 860 then 861 px. A failing "Restart runtime" run used to leave the desktop open, and the next run's window search found the stale window; it now closes the desktop before returning.
+
+### Limits
+
+- Names, sizes and sessions are not editable in the panel; the file is.
+- No file dialog: a workspace is chosen on the command line or from the
+  state's most recent file. The Linux desktop portal that GPUI's dialogs need
+  is missing here, so it stays unmeasured.
+- The panel exists in the live view only; static mode is unchanged.
+- The smoke scenario clicks by button color at fixed panel columns; a theme or
+  layout change moves them and needs the scenario updated with it.
+- The window size restore was measured only through the smoke's state file
+  and the resize behaviour above; no multi-monitor or HiDPI case.
+
 ## P2.2 persistent session audit, 27 September 2026 (cloud container)
 
 Audit only; nothing is implemented, and the proposal is

@@ -3,6 +3,10 @@
 //! A workspace is untrusted input. Call [`Workspace::validate`] before using a
 //! value built in memory; [`Workspace::load`] and [`Workspace::save`] do this for you.
 
+mod state;
+
+pub use state::{AppState, MAX_RECENT_WORKSPACES, STATE_SCHEMA_VERSION, WindowSize};
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -28,6 +32,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("unsupported workspace schema version {0}; expected {SCHEMA_VERSION}")]
     UnsupportedSchema(u32),
+    #[error("unsupported application state schema version {0}; expected {STATE_SCHEMA_VERSION}")]
+    UnsupportedStateSchema(u32),
     #[error("invalid workspace: {0}")]
     Invalid(String),
     #[error("sync event sequence {sequence} is not newer than {previous} for device {device}")]
@@ -38,7 +44,7 @@ pub enum Error {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub schema_version: u32,
     pub name: String,
@@ -47,13 +53,13 @@ pub struct Workspace {
     pub devices: Vec<Device>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub name: String,
@@ -117,17 +123,7 @@ impl Workspace {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        // Cap input before parsing so a malformed config cannot allocate without bound.
-        let file = fs::File::open(path)?;
-        if file.metadata()?.len() > MAX_CONFIG_BYTES {
-            return Err(Error::Invalid("workspace file exceeds 1 MiB".into()));
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_CONFIG_BYTES {
-            return Err(Error::Invalid("workspace file exceeds 1 MiB".into()));
-        }
-        let workspace: Self = serde_json::from_slice(&bytes)?;
+        let workspace: Self = serde_json::from_slice(&read_config(path.as_ref(), "workspace")?)?;
         workspace.validate()?;
         Ok(workspace)
     }
@@ -205,7 +201,183 @@ impl Workspace {
     /// Atomically replaces a config in the same directory after validation.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         self.validate()?;
-        let path = path.as_ref();
+        write_config(
+            path.as_ref(),
+            &serde_json::to_vec_pretty(self)?,
+            "workspace",
+        )
+    }
+
+    /// Adds a device from `preset` to `session`, named after the preset with a
+    /// number when the name is taken, under a unique id, and validates the
+    /// result; the workspace is unchanged when that fails. Returns the index
+    /// of the new device.
+    pub fn add_device_from_preset(
+        &mut self,
+        preset: &DevicePreset,
+        session: &str,
+    ) -> Result<usize> {
+        if !self.sessions.iter().any(|known| known.id == session) {
+            return Err(Error::Invalid(format!("unknown session id: {session}")));
+        }
+        let base = slug(preset.name);
+        let mut id = base.clone();
+        let mut next = 2;
+        while self.devices.iter().any(|device| device.id == id) {
+            id = format!("{base}-{next}");
+            next += 1;
+        }
+        let same_name = self
+            .devices
+            .iter()
+            .filter(|device| {
+                device.name == preset.name
+                    || device
+                        .name
+                        .strip_prefix(preset.name)
+                        .is_some_and(|rest| rest.trim().parse::<u32>().is_ok())
+            })
+            .count();
+        let name = if same_name == 0 {
+            preset.name.to_owned()
+        } else {
+            format!("{} {}", preset.name, same_name + 1)
+        };
+        self.devices.push(Device {
+            id,
+            name,
+            width: preset.width,
+            height: preset.height,
+            device_scale_factor: preset.device_scale_factor,
+            mobile: preset.mobile,
+            touch: preset.touch,
+            session: session.to_owned(),
+        });
+        if let Err(error) = self.validate() {
+            self.devices.pop();
+            return Err(error);
+        }
+        Ok(self.devices.len() - 1)
+    }
+
+    /// Removes the device at `index`; a workspace keeps at least one device.
+    pub fn remove_device(&mut self, index: usize) -> Result<Device> {
+        if index >= self.devices.len() {
+            return Err(Error::Invalid(format!("no device at index {index}")));
+        }
+        if self.devices.len() == 1 {
+            return Err(Error::Invalid(
+                "a workspace needs at least one device".into(),
+            ));
+        }
+        Ok(self.devices.remove(index))
+    }
+}
+
+/// A device to add to a workspace: a generic viewport class, not a product.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DevicePreset {
+    pub name: &'static str,
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: f64,
+    pub mobile: bool,
+    pub touch: bool,
+}
+
+/// Viewport classes a workspace can add a device from. Phones and tablets
+/// emulate mobile with touch at a scale of 2; larger classes are mouse devices
+/// at a scale of 1, so eight of them stay within the physical pixel budget.
+pub const PRESETS: [DevicePreset; 8] = [
+    DevicePreset {
+        name: "Small phone",
+        width: 360,
+        height: 640,
+        device_scale_factor: 2.0,
+        mobile: true,
+        touch: true,
+    },
+    DevicePreset {
+        name: "Phone",
+        width: 390,
+        height: 844,
+        device_scale_factor: 2.0,
+        mobile: true,
+        touch: true,
+    },
+    DevicePreset {
+        name: "Large phone",
+        width: 430,
+        height: 932,
+        device_scale_factor: 2.0,
+        mobile: true,
+        touch: true,
+    },
+    DevicePreset {
+        name: "Tablet",
+        width: 768,
+        height: 1024,
+        device_scale_factor: 2.0,
+        mobile: true,
+        touch: true,
+    },
+    DevicePreset {
+        name: "Large tablet",
+        width: 1024,
+        height: 1366,
+        device_scale_factor: 2.0,
+        mobile: true,
+        touch: true,
+    },
+    DevicePreset {
+        name: "Laptop",
+        width: 1366,
+        height: 768,
+        device_scale_factor: 1.0,
+        mobile: false,
+        touch: false,
+    },
+    DevicePreset {
+        name: "Desktop",
+        width: 1440,
+        height: 900,
+        device_scale_factor: 1.0,
+        mobile: false,
+        touch: false,
+    },
+    DevicePreset {
+        name: "Large desktop",
+        width: 1920,
+        height: 1080,
+        device_scale_factor: 1.0,
+        mobile: false,
+        touch: false,
+    },
+];
+
+/// An ASCII slug of `name` for a device id: lowercase letters and digits with
+/// single hyphens between them; `device` when nothing usable remains.
+fn slug(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "device".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+/// Atomically replaces a config file in its own directory: written to a fresh
+/// temporary file next to it, synced, then renamed over it.
+pub(crate) fn write_config(path: &Path, data: &[u8], what: &str) -> Result<()> {
+    {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -213,9 +385,8 @@ impl Workspace {
         let filename = path
             .file_name()
             .ok_or_else(|| Error::Invalid("save path needs a filename".into()))?;
-        let data = serde_json::to_vec_pretty(self)?;
         if data.len() as u64 > MAX_CONFIG_BYTES {
-            return Err(Error::Invalid("workspace file exceeds 1 MiB".into()));
+            return Err(Error::Invalid(format!("{what} file exceeds 1 MiB")));
         }
         for _ in 0..16 {
             let seq = SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -232,7 +403,7 @@ impl Workspace {
                 Err(e) => return Err(e.into()),
             };
             let result = (|| -> std::io::Result<()> {
-                file.write_all(&data)?;
+                file.write_all(data)?;
                 file.sync_all()?;
                 fs::rename(&temp_path, path)?;
                 fs::File::open(parent)?.sync_all()?;
@@ -243,10 +414,25 @@ impl Workspace {
             }
             return result.map_err(Error::Io);
         }
-        Err(Error::Invalid(
-            "could not reserve temporary workspace file".into(),
-        ))
+        Err(Error::Invalid(format!(
+            "could not reserve temporary {what} file"
+        )))
     }
+}
+
+/// Reads a config file of at most [`MAX_CONFIG_BYTES`], so a malformed file
+/// cannot allocate without bound.
+pub(crate) fn read_config(path: &Path, what: &str) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_CONFIG_BYTES {
+        return Err(Error::Invalid(format!("{what} file exceeds 1 MiB")));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(Error::Invalid(format!("{what} file exceeds 1 MiB")));
+    }
+    Ok(bytes)
 }
 
 fn validate_id(kind: &str, id: &str) -> Result<()> {

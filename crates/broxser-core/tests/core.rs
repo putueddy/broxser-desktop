@@ -248,3 +248,110 @@ fn pointer_and_keys_need_separate_opt_in() {
             .is_err()
     );
 }
+
+#[test]
+fn presets_add_named_unique_devices_and_roll_back_over_budget() {
+    use broxser_core::{MAX_DEVICES, PRESETS};
+    for preset in &PRESETS {
+        let mut workspace = Workspace::demo();
+        workspace.devices.clear();
+        workspace.devices.push(Workspace::demo().devices[0].clone());
+        workspace.add_device_from_preset(preset, "guest").unwrap();
+        workspace.validate().unwrap();
+    }
+    let mut workspace = Workspace::demo();
+    let phone = PRESETS
+        .iter()
+        .find(|preset| preset.name == "Phone")
+        .unwrap();
+    // The demo already has a device named Phone with the id `phone`.
+    let index = workspace.add_device_from_preset(phone, "admin").unwrap();
+    assert_eq!(index, 3);
+    assert_eq!(workspace.devices[3].id, "phone-2");
+    assert_eq!(workspace.devices[3].name, "Phone 2");
+    assert_eq!(workspace.devices[3].session, "admin");
+    assert_eq!(workspace.devices[3].device_scale_factor, 2.0);
+    let index = workspace.add_device_from_preset(phone, "guest").unwrap();
+    assert_eq!(workspace.devices[index].id, "phone-3");
+    assert_eq!(workspace.devices[index].name, "Phone 3");
+    let large = PRESETS
+        .iter()
+        .find(|preset| preset.name == "Large desktop")
+        .unwrap();
+    let index = workspace.add_device_from_preset(large, "guest").unwrap();
+    assert_eq!(workspace.devices[index].id, "large-desktop");
+    assert!(matches!(
+        workspace.add_device_from_preset(phone, "nobody"),
+        Err(Error::Invalid(message)) if message.contains("unknown session")
+    ));
+    // Eight devices at most; the ninth leaves the workspace unchanged.
+    while workspace.devices.len() < MAX_DEVICES {
+        workspace.add_device_from_preset(large, "guest").unwrap();
+    }
+    let before = workspace.clone();
+    assert!(workspace.add_device_from_preset(large, "guest").is_err());
+    assert_eq!(workspace, before);
+    // Removal keeps at least one device.
+    let mut workspace = Workspace::demo();
+    let removed = workspace.remove_device(1).unwrap();
+    assert_eq!(removed.id, "tablet");
+    assert_eq!(workspace.devices.len(), 2);
+    workspace.remove_device(0).unwrap();
+    assert!(workspace.remove_device(0).is_err());
+    assert_eq!(workspace.devices.len(), 1);
+    assert!(workspace.remove_device(5).is_err());
+}
+
+#[test]
+fn application_state_remembers_workspaces_and_the_window_without_secrets() {
+    use broxser_core::{AppState, MAX_RECENT_WORKSPACES, WindowSize};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state").join("state.json");
+    // A missing file is the default state; its directory is created on save.
+    let mut state = AppState::load(&path).unwrap();
+    assert_eq!(state, AppState::default());
+    let workspace = dir.path().join("a.json");
+    Workspace::demo().save(&workspace).unwrap();
+    state.remember_workspace(&workspace);
+    state.remember_workspace(&dir.path().join("gone.json"));
+    state.remember_workspace(&workspace);
+    assert_eq!(
+        state.recent_workspaces,
+        [workspace.clone(), dir.path().join("gone.json")]
+    );
+    assert_eq!(state.latest_existing_workspace(), Some(workspace.as_path()));
+    state.window = Some(WindowSize {
+        width: 1280,
+        height: 800,
+    });
+    state.save(&path).unwrap();
+    assert_eq!(AppState::load(&path).unwrap(), state);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("url") && !text.contains("cookie"), "{text}");
+    // Bounded, most recent first.
+    for n in 0..20 {
+        state.remember_workspace(&dir.path().join(format!("{n}.json")));
+    }
+    assert_eq!(state.recent_workspaces.len(), MAX_RECENT_WORKSPACES);
+    assert_eq!(state.recent_workspaces[0], dir.path().join("19.json"));
+    // Invalid contents are refused, not repaired silently.
+    std::fs::write(&path, r#"{"schema_version": 2}"#).unwrap();
+    assert!(matches!(
+        AppState::load(&path),
+        Err(Error::UnsupportedStateSchema(2))
+    ));
+    std::fs::write(
+        &path,
+        r#"{"schema_version": 1, "recent_workspaces": ["relative.json"]}"#,
+    )
+    .unwrap();
+    assert!(AppState::load(&path).is_err());
+    std::fs::write(
+        &path,
+        r#"{"schema_version": 1, "window": {"width": 10, "height": 10}}"#,
+    )
+    .unwrap();
+    assert!(AppState::load(&path).is_err());
+    std::fs::write(&path, "not json").unwrap();
+    assert!(AppState::load(&path).is_err());
+}

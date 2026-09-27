@@ -361,7 +361,21 @@ Autentikasi X11 mempertahankan `XAUTHORITY` asli dan `SSLKEYLOGFILE` dibuang pad
 launch; environment native lainnya tetap diwarisi, jadi batas NSS/profil ini
 tidak menjamin isolasi seluruh akses filesystem.
 
-**Status P2.2 (27 September 2026, audit; belum ada implementasi; PR menunggu review):** pengukuran
+**Status P2.2a (27 September 2026, PR menunggu review):** keputusan ada di
+[ADR 0022](docs/adr/0022-workspace-panel-presets-and-application-state.md).
+Sebelumnya workspace hanya bisa diedit di file dan start berikutnya melupakan
+file dan ukuran window. Kini panel Workspace (`Ctrl+Shift+W`) mengedit draft:
+tambah device dari delapan preset kelas viewport generik ke session device
+terpilih, hapus device (bukan yang terakhir), Apply menjalankan ulang runtime
+dengan draft (runtime yang berjalan tidak diubah di tempat), Save menulis draft
+dan URL ke file yang dimuat secara atomik. File state aplikasi
+(`$XDG_STATE_HOME/broxser/state.json`) menyimpan file workspace terakhir (maks.
+10) dan ukuran window; tanpa `--workspace` desktop membuka file terakhir yang
+masih ada. Tidak ada alamat halaman, cookie atau kredensial di state. Belum ada:
+edit nama/ukuran/session di panel, dialog buka file (portal desktop tidak
+tersedia di container), panel di mode statis.
+
+**Status P2.2 (27–28 September 2026, audit merged melalui PR #22; belum ada implementasi):** pengukuran
 ada di `docs/validation.md` (P2.2) dan usulannya di
 [ADR 0021](docs/adr/0021-persistent-sessions-one-profile-per-session.md)
 (proposed, belum diterima). Context CDP tidak punya opsi persisten; usulan adapter
@@ -480,6 +494,7 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   ADR 0019, merged melalui PR #20).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian
   (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
-  session: audit dan ADR 0021 proposed, PR menunggu review).
+  session: audit dan ADR 0021 proposed, merged melalui PR #22; P2.2a panel workspace,
+  preset dan file state: ADR 0022, PR menunggu review).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.
