@@ -542,6 +542,17 @@ impl FakePeer {
         }
     }
 
+    /// Parameters of every `method` sent to the browser itself, not a session.
+    fn browser_requests(&self, method: &str) -> Vec<Value> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, s, _, _)| m == method && s.is_none())
+            .map(|(_, _, _, params)| params.clone())
+            .collect()
+    }
+
     /// Requests received so far for `method` on `session`.
     fn count(&self, method: &str, session: &str) -> usize {
         self.received
@@ -1964,6 +1975,127 @@ fn a_new_document_a_crash_or_a_detach_ends_the_dialog_and_its_token() {
     drop(live);
 }
 
+#[test]
+fn popups_are_closed_at_once_and_reported_for_their_device() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    let origin = "http://127.0.0.1:4173";
+    let window_open = |session: &str, url: &str| {
+        json!({"method": "Page.windowOpen", "sessionId": session, "params": {
+            "url": url, "windowName": "_blank", "windowFeatures": [], "userGesture": true}})
+    };
+    let created = |target: &str, opener: Option<&str>, context: &str| {
+        let mut info = json!({"targetId": target, "type": "page", "title": "", "url": "",
+            "attached": false, "canAccessOpener": false, "browserContextId": context});
+        if let Some(opener) = opener {
+            info["openerId"] = json!(opener);
+        }
+        json!({"method": "Target.targetCreated", "params": {"targetInfo": info}})
+    };
+    let closed = |peer: &FakePeer| -> Vec<String> {
+        peer.browser_requests("Target.closeTarget")
+            .iter()
+            .map(|params| params["targetId"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    // The phone opens a window: it is closed and reported with its URL.
+    peer.event(window_open("S0", &format!("{origin}/popup")));
+    peer.event(created("P1", Some("T0"), "CTX1"));
+    let popup = wait_for(&live, "the report", Duration::from_secs(2), |s| {
+        s.devices[0].popup.is_some()
+    })
+    .devices[0]
+        .popup
+        .clone()
+        .unwrap();
+    assert_eq!(popup.url, format!("{origin}/popup"));
+    assert!(popup.openable);
+    assert_eq!(closed(&peer), ["P1"]);
+    // Only the report of the latest window opens, and only once.
+    peer.event(window_open("S0", "javascript:alert(1)"));
+    peer.event(created("P2", Some("T0"), "CTX1"));
+    let script = wait_for(&live, "the second report", Duration::from_secs(2), |s| {
+        s.devices[0].popups == 2
+    })
+    .devices[0]
+        .popup
+        .clone()
+        .unwrap();
+    assert!(!script.openable, "a javascript: URL is not a destination");
+    assert!(live.send(Command::OpenPopup {
+        device: 0,
+        token: popup.token,
+    }));
+    assert!(live.send(Command::OpenPopup {
+        device: 0,
+        token: script.token,
+    }));
+    // A long address is shown shortened but never loaded shortened.
+    let long = format!("{origin}/long?{}", "x".repeat(9000));
+    peer.event(window_open("S0", &long));
+    peer.event(created("P3", Some("T0"), "CTX1"));
+    let long_popup = wait_for(&live, "the long report", Duration::from_secs(2), |s| {
+        s.devices[0].popups == 3
+    })
+    .devices[0]
+        .popup
+        .clone()
+        .unwrap();
+    assert!(!long_popup.openable);
+    assert!(
+        long_popup.url.ends_with('…') && long_popup.url.chars().count() == MAX_DIALOG_CHARS + 1
+    );
+    assert!(live.send(Command::OpenPopup {
+        device: 0,
+        token: long_popup.token,
+    }));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.navigations("S0").len(), 1, "no report was openable");
+
+    // Broxser's own targets have no opener; other contexts are not Broxser's.
+    peer.event(created("T9", None, "CTX1"));
+    peer.event(created("P4", Some("T9"), "default"));
+    // A window whose opener is not a device, such as a frame's, is closed
+    // without a report.
+    peer.event(created("P5", Some("F1"), "CTX2"));
+    // The tablet's window is reported on the tablet.
+    peer.event(window_open("S1", &format!("{origin}/tablet-popup")));
+    peer.event(created("P6", Some("T1"), "CTX1"));
+    let tablet = wait_for(&live, "the tablet's report", Duration::from_secs(2), |s| {
+        s.devices[1].popup.is_some()
+    })
+    .devices[1]
+        .popup
+        .clone()
+        .unwrap();
+    assert_eq!(closed(&peer), ["P1", "P2", "P3", "P5", "P6"]);
+    let status = live.status();
+    assert_eq!(status.devices[0].popups, 3);
+    assert_eq!(status.devices[1].popups, 1);
+    assert_eq!(status.devices[2].popups, 0);
+
+    // The user opens the tablet's window in the tablet: its URL is loaded once.
+    assert!(live.send(Command::OpenPopup {
+        device: 1,
+        token: tablet.token,
+    }));
+    wait_for_requests(&peer, "Page.navigate", "S1", 2);
+    assert_eq!(peer.navigations("S1")[1], format!("{origin}/tablet-popup"));
+    wait_for(&live, "the report consumed", Duration::from_secs(2), |s| {
+        s.devices[1].popup.is_none()
+    });
+    assert!(live.send(Command::OpenPopup {
+        device: 1,
+        token: tablet.token,
+    }));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.navigations("S1").len(), 2);
+    assert_eq!(peer.navigations("S0").len(), 1);
+    drop(live);
+}
+
 fn send_keys(live: &LiveSession, device: usize, presses: usize) {
     for _ in 0..presses {
         for down in [true, false] {
@@ -2296,6 +2428,24 @@ field.addEventListener('input', () => report('input', {v: field.value}));
 addEventListener('beforeunload', e => { if (field.value) { e.preventDefault(); e.returnValue = 'unsaved'; } });
 </script></body></html>"#;
 
+/// Opens a window three ways, 60 px apart: `window.open`, a `target=_blank`
+/// link and a named window with features.
+const OPENER_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0}button,a{position:absolute;left:20px;width:160px;height:40px;display:block;background:#08f;color:#fff}
+#open{top:100px}#blank{top:160px}#named{top:220px}</style></head><body>
+<button id=open onclick="window.open('/popup-page?opener', '_blank')">open</button>
+<a id=blank href="/popup-page?blank" target=_blank>blank</a>
+<button id=named onclick="window.open('/popup-page?named', 'win', 'width=300,height=300')">named</button>
+</body></html>"#;
+
+/// A window that keeps reporting that it runs and, 300 ms after it starts,
+/// sends its opener elsewhere, as a hostile or careless popup can.
+const POPUP_PAGE: &str = r#"<!doctype html><script>
+const q = location.search.slice(1);
+setInterval(() => fetch('/event?' + new URLSearchParams({kind: 'alive', q, opener: !!window.opener})), 200);
+setTimeout(() => { if (window.opener) window.opener.location = '/hijacked'; }, 300);
+</script>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -2428,6 +2578,8 @@ fn fixture() -> Fixture {
             "/frame" => FRAME_PAGE.into(),
             "/frame-dest" => "<!doctype html><p>frame destination</p>".into(),
             "/dialogs" => DIALOG_PAGE.into(),
+            "/popups" => OPENER_PAGE.into(),
+            "/popup-page" => POPUP_PAGE.into(),
             "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
@@ -4344,6 +4496,88 @@ fn live_cancelled_and_superseded_link_navigations_sync_at_most_the_latest() {
     assert_eq!(count(&fixture, "/slow"), 3);
     assert_eq!(count(&fixture, "/landed?go"), 3);
     assert!(loaded(&live.session().status(), &fixture, "/landed?go"));
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_popups_are_closed_before_they_act_and_open_only_on_request() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/popups")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/popups")
+    });
+    let alive = |fixture: &Fixture| events(fixture, "alive").len();
+    for (y, query, closed) in [
+        (120.0, "opener", 1),
+        (180.0, "blank", 2),
+        (240.0, "named", 3),
+    ] {
+        click(&live, 0, 100.0, y);
+        let popup = live
+            .wait(query, Duration::from_secs(10), |s| {
+                s.devices[0].popups == closed
+            })
+            .devices[0]
+            .popup
+            .clone()
+            .unwrap();
+        assert_eq!(popup.url, fixture.url(&format!("/popup-page?{query}")));
+        assert!(popup.openable);
+        // Past the popup's 300 ms attempt to move its opener, and its pings.
+        thread::sleep(Duration::from_millis(1000));
+        let status = live.session().status();
+        assert_eq!(
+            status.devices[0].url,
+            fixture.url("/popups"),
+            "{query} moved its opener"
+        );
+        assert_eq!(count(&fixture, "/hijacked"), 0);
+        assert_eq!(
+            alive(&fixture),
+            0,
+            "{query} kept running: {:?}",
+            events(&fixture, "alive")
+        );
+    }
+    let status = live.session().status();
+    assert!(status.devices[1..].iter().all(|device| device.popups == 0));
+    let named = status.devices[0].popup.clone().unwrap();
+
+    // Opening a report loads its URL in the phone alone, once, with no opener.
+    live.send(Command::OpenPopup {
+        device: 0,
+        token: named.token,
+    });
+    let url = fixture.url("/popup-page?named");
+    live.wait(
+        "the popup's page in the phone",
+        Duration::from_secs(10),
+        |s| s.devices[0].url == url && !s.devices[0].loading && s.devices[0].popup.is_none(),
+    );
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| alive(fixture) > 0));
+    assert!(
+        events(&fixture, "alive")
+            .iter()
+            .all(|event| event["opener"] == "false")
+    );
+    live.send(Command::OpenPopup {
+        device: 0,
+        token: named.token,
+    });
+    thread::sleep(Duration::from_millis(700));
+    let status = live.session().status();
+    assert_eq!(status.devices[1].url, fixture.url("/popups"));
+    assert_eq!(count(&fixture, "/hijacked"), 0);
+    let loads = fixture
+        .requests()
+        .iter()
+        .filter(|request| request.path == "/popup-page?named")
+        .count();
+    assert!(
+        loads <= 2,
+        "the popup's own first request and one explicit load: {loads}"
+    );
     live.close();
 }
 

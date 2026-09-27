@@ -330,7 +330,9 @@ typing_run() {
 # of the pixels within TOLERANCE per channel of color RRGGBB in the window
 # region X Y WIDTH HEIGHT, as soon as at least 20 match within TIMEOUT seconds.
 # Fails once TIMEOUT passes without a match. With a ninth argument "absent" it
-# instead succeeds, printing nothing, once fewer than 20 pixels match.
+# instead succeeds, printing nothing, once fewer than 20 pixels match; with
+# "filled" it counts only pixels whose neighbor two rows below also matches, so
+# one-pixel borders of the same color do not count. "absent,filled" combines both.
 find_color() {
   python3 - "$@" <<'PY'
 import ctypes, sys, time
@@ -339,7 +341,9 @@ x, y, width, height = (int(value) for value in sys.argv[2:6])
 wanted = int(sys.argv[6], 16)
 tolerance = int(sys.argv[7])
 deadline = time.monotonic() + float(sys.argv[8])
-absent = len(sys.argv) > 9 and sys.argv[9] == "absent"
+modes = set(sys.argv[9].split(",")) if len(sys.argv) > 9 else set()
+absent = "absent" in modes
+filled = "filled" in modes
 
 class XImage(ctypes.Structure):
     _fields_ = [(name, ctypes.c_int) for name in ("width", "height", "xoffset", "format")]
@@ -365,14 +369,13 @@ while time.monotonic() < deadline:
         pixels = ctypes.string_at(image.contents.data, stride * image.contents.height)
         xlib.XFree(image.contents.data)
         xlib.XFree(image)
-        hits = []
-        for row in range(height):
-            line = pixels[row * stride:row * stride + width * 4]
-            for column in range(width):
-                b, g, r = line[column * 4], line[column * 4 + 1], line[column * 4 + 2]
-                if abs(r - target[0]) <= tolerance and abs(g - target[1]) <= tolerance \
-                        and abs(b - target[2]) <= tolerance:
-                    hits.append((column, row))
+        def matches(column, row):
+            offset = row * stride + column * 4
+            b, g, r = pixels[offset], pixels[offset + 1], pixels[offset + 2]
+            return abs(r - target[0]) <= tolerance and abs(g - target[1]) <= tolerance \
+                and abs(b - target[2]) <= tolerance
+        hits = [(column, row) for row in range(height) for column in range(width)
+                if matches(column, row) and (not filled or (row + 2 < height and matches(column, row + 2)))]
         if absent and len(hits) < 20:
             sys.exit(0)
         if not absent and len(hits) >= 20:
@@ -470,6 +473,78 @@ dialog_run() {
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Opens a page whose only button calls window.open(), clicks it in the phone
+# frame and checks that the window never runs (ADR 0015): the target page
+# reports "popup" to the fixture while it runs as a window. The card then shows
+# the closed window with "Open here"; clicking it loads the page in the phone
+# itself, which reports "page". Every path closes the desktop and checks for
+# leftovers.
+popup_run() {
+  local label=$1
+  local before app window= failure= button code=0 left_processes left_profiles
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/popup.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    xdotool windowsize "$window" 1360 861 || true
+    xdotool mousemove --window "$window" 600 400 || true
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /popup.html || true) -gt 0 ]] && break
+      sleep 0.1
+    done
+    if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+      failure="the phone frame did not show the page"
+    else
+      read -r x y x0 y0 x1 y1 < <(echo "$button")
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      # The notice's "Open here" button is accent-filled, below the frame; the
+      # selected card's one-pixel border has the same color.
+      if ! button=$(find_color "$window" 262 $((y1 + 1)) 206 $((820 - y1 - 1)) 7ce29b 6 10 filled); then
+        failure="the card did not report the closed window"
+      else
+        sleep 2
+        if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "popup-alive=popup" || true) -gt 0 ]]; then
+          failure="the window ran although Broxser closed it"
+        else
+          read -r x y _ < <(echo "$button")
+          xdotool mousemove --window "$window" "$x" "$y" click 1
+          for _ in $(seq 100); do
+            [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "popup-alive=page" || true) -gt 0 ]] && break
+            sleep 0.1
+          done
+          if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "popup-alive=page" || true) -eq 0 ]]; then
+            failure="Open here did not load the page in the phone within 10 s"
+          elif ! find_color "$window" 250 60 230 760 16a34a 40 10 >/dev/null; then
+            failure="the phone frame did not show the opened page"
+          elif ! find_color "$window" 262 $((y1 + 1)) 206 $((820 - y1 - 1)) 7ce29b 6 5 absent,filled; then
+            failure="the report stayed after Open here"
+          fi
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-closed at once, opened here on request}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -479,4 +554,5 @@ restart_run "live Restart clicked twice" stay
 restart_run "live Restart clicked twice, then Ctrl+Q" quit
 typing_run "typing while pages animate" animation.html
 dialog_run "dialog answered on the card"
+popup_run "popup closed and opened on the card"
 echo "desktop smoke passed"

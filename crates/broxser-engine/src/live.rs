@@ -213,13 +213,28 @@ pub struct DeviceStatus {
     pub frames: u64,
     /// Frames replaced before the UI took them. Each was still acknowledged.
     pub dropped_frames: u64,
-    /// Windows the page opened; they are not displayed yet.
+    /// Windows the page opened that Broxser closed (ADR 0015).
     pub popups: u32,
+    /// The latest of them, until the user opens it in the device or the page
+    /// opens another.
+    pub popup: Option<PopupState>,
     /// Current main-frame editable caret. Cleared whenever its target is unsafe.
     pub text_input: Option<TextInputState>,
     /// A JavaScript dialog the page is waiting on. The page, its frames and
     /// its input stay blocked until the user answers it (ADR 0014).
     pub dialog: Option<DialogState>,
+}
+
+/// A window the page opened and Broxser closed as soon as the browser
+/// reported it. `url` is untrusted page text, bounded for display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PopupState {
+    pub url: String,
+    /// The complete URL is an HTTP(S) address within the navigation limit, so
+    /// [`Command::OpenPopup`] can load it in the device.
+    pub openable: bool,
+    /// Engine-assigned identity; opening an older report does nothing.
+    pub token: u64,
 }
 
 /// An open JavaScript dialog, as the page requested it. `message` and
@@ -330,6 +345,12 @@ pub enum Command {
         token: u64,
         accept: bool,
         text: Option<String>,
+    },
+    /// Explicitly loads the reported popup `token` in its device, replacing
+    /// the device's page. Only the URL the engine recorded is loaded.
+    OpenPopup {
+        device: usize,
+        token: u64,
     },
     /// Hidden devices stop their screencast and keep no frame.
     SetVisible {
@@ -721,6 +742,7 @@ struct Controller<'a> {
     pending: HashMap<u64, Pending>,
     next_ime_target: u64,
     next_dialog: u64,
+    next_popup: u64,
 }
 
 struct LinkIntent {
@@ -793,6 +815,11 @@ struct LiveDevice {
     /// The open JavaScript dialog. Input and navigation wait for the user's
     /// answer; nothing answers it for them (ADR 0014).
     dialog: Option<OpenDialog>,
+    /// URL of the page's latest `window.open`, reported just before its
+    /// target appears.
+    window_open: Option<String>,
+    /// The closed popup the user may load here: its token and complete URL.
+    popup: Option<(u64, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -960,6 +987,7 @@ impl<'a> Controller<'a> {
             pending: HashMap::new(),
             next_ime_target: 0,
             next_dialog: 0,
+            next_popup: 0,
         })
     }
 
@@ -1060,6 +1088,8 @@ impl<'a> Controller<'a> {
                 unresponsive: false,
                 navigation: None,
                 dialog: None,
+                window_open: None,
+                popup: None,
             });
             self.command(
                 "Runtime.enable",
@@ -1158,6 +1188,15 @@ impl<'a> Controller<'a> {
                 text,
             } if device < count => {
                 self.answer_dialog(device, token, accept, text)?;
+            }
+            Command::OpenPopup { device, token } if device < count => {
+                if let Some((current, url)) = self.devices[device].popup.clone()
+                    && current == token
+                {
+                    self.devices[device].popup = None;
+                    self.shared.device(device, |status| status.popup = None);
+                    self.navigate(device, &url, true)?;
+                }
             }
             Command::SetVisible { device, visible } if device < count => {
                 if visible {
@@ -1377,6 +1416,30 @@ impl<'a> Controller<'a> {
                 .error
                 .get_or_insert_with(|| NOT_RESPONDING.to_owned());
         });
+    }
+
+    /// Reports a window that the page of device `index` opened and Broxser
+    /// closed. Its URL is the one of the page's latest `window.open`.
+    fn popup_closed(&mut self, index: usize) -> Result<()> {
+        self.next_popup = self
+            .next_popup
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("popup token exhausted"))?;
+        let token = self.next_popup;
+        let url = self.devices[index].window_open.take().unwrap_or_default();
+        // The complete URL, never a shortened one, is what the user may load.
+        let openable = url.len() <= MAX_LINK_INTENT_BYTES && validate_url(&url).is_ok();
+        self.devices[index].popup = openable.then(|| (token, url.clone()));
+        let state = PopupState {
+            url: dialog_text(&url),
+            openable,
+            token,
+        };
+        self.shared.device(index, |device| {
+            device.popups = device.popups.saturating_add(1);
+            device.popup = Some(state);
+        });
+        Ok(())
     }
 
     /// Sends the user's answer to the open dialog of device `index`, if `token`
@@ -2123,15 +2186,32 @@ impl<'a> Controller<'a> {
                          session context and can reload pages or replay navigations (ADR 0004)"
                     );
                 }
+                // A page with an opener in a Broxser session is a window a
+                // page opened. Nothing shows it, so it would run unseen with
+                // the session's cookies and could navigate its opener. It is
+                // closed at once and reported (ADR 0015); Broxser's own
+                // targets have no opener.
                 if event.method == "Target.targetCreated"
                     && info.get("type").and_then(Value::as_str) == Some("page")
                     && let Some(opener) = info.get("openerId").and_then(Value::as_str)
-                    && let Some(index) = self
+                    && let Some(target) = info.get("targetId").and_then(Value::as_str)
+                    && info
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|context| self.contexts.contains(context))
+                {
+                    self.cdp.send_detached(
+                        "Target.closeTarget",
+                        json!({"targetId": target}),
+                        None,
+                    )?;
+                    if let Some(index) = self
                         .devices
                         .iter()
                         .position(|device| device.target_id == opener)
-                {
-                    self.shared.device(index, |device| device.popups += 1);
+                    {
+                        self.popup_closed(index)?;
+                    }
                 }
                 return Ok(());
             }
@@ -2580,6 +2660,9 @@ impl<'a> Controller<'a> {
             "Page.javascriptDialogClosed" => {
                 let accepted = params.get("result").and_then(Value::as_bool) == Some(true);
                 self.dialog_closed(index, accepted)?;
+            }
+            "Page.windowOpen" => {
+                self.devices[index].window_open = text("url").map(str::to_owned);
             }
             _ => {}
         }

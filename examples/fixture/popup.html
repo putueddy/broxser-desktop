@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broxser popup fixture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #ffffff; font: 16px sans-serif; }
+  /* One button fills the viewport, so a click anywhere in the frame opens the window. */
+  #open { position: absolute; inset: 0; border: 0; background: #3b82f6; color: #fff; font: inherit; }
+</style>
+</head>
+<body>
+<button id="open">Open a window</button>
+<script>
+  document.getElementById('open').addEventListener('click', () => {
+    window.open('/popup-target.html', '_blank');
+  });
+</script>
+</body>
+</html>

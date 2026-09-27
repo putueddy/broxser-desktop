@@ -70,11 +70,53 @@ log. A first version checked that the panel was gone by looking for its border
 once, right after the page's report, before the card had repainted; it now waits
 for the border to be absent.
 
+### Popups ([ADR 0015](adr/0015-popups-closed-and-reported.md))
+
+A second scratch Node script, not committed, opened windows from one page target
+and counted, on the fixture, each window's document request, whether its script
+ran and its periodic reports. Five windows per case unless noted:
+
+| Case | Left running (as on `main`) | Closed at `Target.targetCreated` | Held by browser-level auto-attach, closed, then resumed |
+| --- | --- | --- | --- |
+| `window.open` with a gesture | 5 requests, 5 scripts, reports continue, 5 windows left | 5 requests, 1 script, no reports, 0 left | 0 requests, 0 scripts, 0 left |
+| `target=_blank` link (`noopener`) | 5, 5, continue, left | 5, 0, none, 0 | 5, 0, none, 0 |
+| Named window with features (2 opens) | 2, 2, continue, left | 0, 0, none, 0 | 0, 0, none, 0 |
+| `window.open` from a same-origin frame (1) | 1, 1, continue, left | 1, 0, none, 0 | 0, 0, none, 0 |
+| `window.open` without a gesture | Blocked by Chromium: `null`, no target | Same | Same |
+| `about:blank` window written by the opener | Opened and kept | Closed | — |
+
+`Page.windowOpen` precedes `Target.targetCreated` by about 4 ms and carries the
+address; the target's own URL is still empty then. `openerId` names the device for
+windows opened by its main frame and its same-origin frames, `noopener` included.
+With auto-attach, detaching a held window instead of resuming it left the opener
+page unresponsive, and page-level auto-attach did not attach popups at all.
+
+A temporary test through the live runtime at `06e0f5d`, with a window that reports
+every 200 ms and sets `window.opener.location = '/hijacked'` after 300 ms:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Click the `window.open` button on the phone | The phone moved to `/hijacked`; 7 reports in 1.5 s and 10 in the next 2 s; counted "1 popup(s) not shown" | The phone stays; no `/hijacked` request; no reports; "Closed a window the page opened" with its address and Open here |
+| Reload the page, click the `target=_blank` link and the named window | 15 reports in 1.5 s from all three windows, including the first, whose opener page was gone | Each closed and reported, counted 3 |
+| Open here on the named window's report | — | The phone loads it alone, once, without an opener; the tablet stays |
+
+| Check | Result |
+| --- | --- |
+| `popups_are_closed_at_once_and_reported_for_their_device` (fake CDP) | Passed |
+| `live_popups_are_closed_before_they_act_and_open_only_on_request` (Helium) | Passed 1 of 1 alone and 5 of 5 beside two other live tests on 3 threads |
+| `scripts/desktop-smoke.sh`, new run "popup closed and opened on the card" | Passed 2 of 2 alone: no report from a running window after the click, the card's Open here loads the page (the phone frame turns green, the page reports that it runs as a page), and the report disappears. A first version found the card's one-pixel accent border when checking that Open here was gone; the check now counts filled areas only |
+| `bash scripts/check.sh` with popups | Passed: 1 CLI, 8 core, 67 engine and 24 desktop tests; 37 live tests ignored by default |
+| Live Helium suite with popups (`--ignored`, 4 threads) | 37 of 37 passed in 61.9 s |
+| Full `scripts/desktop-smoke.sh` with popups (debug build) | 10 of 10 runs passed; no browser process, profile or window left |
+
 ### Limits
 
-- Popups, downloads, uploads, permissions, touch input and hover media, drag and
-  drop and accessibility keep today's behavior; each is a separate decision. The
-  audit above is their evidence.
+- Downloads, uploads, permissions, touch input and hover media, drag and drop and
+  accessibility keep today's behavior; each is a separate decision. The audit
+  above is their evidence.
+- A closed window's first document request reaches the server, and its script
+  can start before the close; flows that need their window (sign-in, payment)
+  do not complete.
 - A prompt's text field is the URL bar's single-line field: no IME composition,
   partial selection or copy.
 - Dialogs opened by a subframe are reported for the device like the main frame's;
