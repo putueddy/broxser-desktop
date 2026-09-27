@@ -2,6 +2,8 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
 cargo fmt --all -- --check
+# The SBOM must stay valid as dependencies change (ADR 0025).
+python3 scripts/sbom.py --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked -p broxser-desktop --all-targets -- -D warnings

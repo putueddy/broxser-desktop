@@ -3,6 +3,61 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P3.1 release archive and SBOM, 27 September 2026 (cloud container)
+
+Same container. Decisions and open owner decisions:
+[ADR 0025](adr/0025-linux-release-archive-and-sbom.md).
+
+### Before the change
+
+- No release build, archive, SBOM, checksum of Broxser artifacts or signature;
+  CI builds nothing with `--release`. `NOTICE.md` called `Cargo.lock` an
+  inventory, not an SBOM. Helium is pinned by manifest and checksum and was
+  current: `git ls-remote --tags` of `imputnet/helium-linux` listed 0.18.1.1 as
+  the newest tag.
+- `cargo metadata --filter-platform x86_64-unknown-linux-gnu` resolves 549
+  crates.io crates; the per-binary `cargo tree -e normal` of `broxser-desktop`
+  and `broxser-cli` links 525: 24 crates, such as `wasm-bindgen`, `quinn` and
+  `zed-scap`, come only from features other workspace targets unify.
+
+### After the change
+
+- `python3 scripts/sbom.py --check`: "SBOM ok: 531 components (525 crates.io
+  crates), 1387 relationships", in about 5 s; the component set equals the
+  per-binary `cargo tree` set exactly. Components: 525 crates with SHA-256 and
+  purl, GPUI vendored, four Broxser crates without license (none chosen), and
+  Helium 0.18.1.1 as the engine's runtime dependency with its pinned URL and
+  SHA-256.
+- `bash scripts/package.sh` after the release build (2 m 49 s) took 17 s and
+  wrote `broxser-0.1.0-linux-x86_64.tar.xz` (6.2 MB) with `bin/broxser-desktop`
+  (23.6 MB), `bin/broxser` (2.2 MB), the notices, `sbom.spdx.json` (644 KB),
+  `THIRD-PARTY.md`, the Helium manifest and fetch script, `COMMIT` and
+  `SHA256SUMS`, owned by 0/0 with the commit's time. A second run gave the same
+  SHA-256 (`0409ad40…025e0af`).
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| Archive reproducibility | Two builds of one commit's binaries: identical SHA-256 |
+| Archive as the unprivileged user | `sha256sum -c` of the `.sha256`: OK; unpacked; `sha256sum -c SHA256SUMS`: all files OK; `bin/broxser --version`: `broxser 0.1.0` |
+| Packaged `scripts/fetch-helium.sh` | Downloaded and verified Helium 0.18.1.1 into the unpacked folder in 10 s; run as root here because the unprivileged user cannot read this container's proxy CA bundle, then handed to that user |
+| Packaged CLI | `doctor` found the fetched browser; `validate` accepted the example workspace |
+| Full `scripts/desktop-smoke.sh` with the packaged release desktop and the packaged Helium | 15 of 15 scenarios passed in 1 m 23 s; the Restart-then-Ctrl+Q run started one browser, within ADR 0009's limit of one, where the debug build had started none |
+| `bash scripts/check.sh` with the SBOM check | Passed in 51 s: the SBOM check, fmt, `cargo test --locked` (1 CLI, 2 + 10 core, 107 engine, 41 desktop), strict Clippy for the workspace and the desktop crate |
+| Rerun after the cherry-pick onto `main` (`3c01ad5`, PR #25 merged with the owner's corrections `1040bcb`; one conflict in this file, both sections kept) | `check.sh` passed in 278 s: the SBOM check ("531 components (525 crates.io crates), 1388 relationships", one relationship more than at the first run), fmt, 1 CLI, 17 core, 159 engine and 50 desktop tests, strict Clippy. Two archive builds of one commit gave one SHA-256. As the unprivileged user: the `.sha256` and `SHA256SUMS` checked OK, `bin/broxser --version` printed `broxser 0.1.0`, the packaged fetch script (run as root, as above) prepared Helium 0.18.1.1 in 10 s, `doctor` found it and `validate` accepted the example workspace. The full smoke with the packaged release desktop and Helium passed 18 of 18 in 1 m 45 s |
+
+### Limits
+
+- Unsigned: the `.sha256` protects integrity only when it comes through a
+  trusted channel.
+- The binaries are reproducible only with the same toolchain, dependencies and
+  build path; only the archive around them is deterministic.
+- System libraries (X11/Wayland, Vulkan, fonts) are not bundled; no
+  distribution other than this container was tried.
+- No Helium update or rollback was qualified: the pinned engine is the newest,
+  and the qualification script is the next part.
+
 ## PR #25 review corrections, 28 September 2026 (Linux X11)
 
 Review of `424fd6e` found and corrected the following export problems:

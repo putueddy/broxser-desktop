@@ -382,7 +382,10 @@ SwiftShader tanpa GPU, `deviceMemory` dan kuota storage berbeda dari Chromium;
 hasil mewakili pengguna Helium dengan blocker mati, bukan pengguna Chrome, dan
 headless tidak identik dengan mode interaktif/extension.
 Review lisensi dilakukan sebelum packaging; [NOTICE.md](../NOTICE.md) merangkum
-status tanpa menganggap pemisahan proses menghapus kewajiban distribusi.
+status tanpa menganggap pemisahan proses menghapus kewajiban distribusi. Arsip
+rilis Linux (`scripts/package.sh`, ADR 0025) berisi binary, notices, SBOM SPDX
+dari graph yang benar-benar di-link dan `SHA256SUMS`, deterministik per commit,
+tanpa Helium dan belum ber-signature.
 
 ## 9. Operational readiness and ten year stewardship
 

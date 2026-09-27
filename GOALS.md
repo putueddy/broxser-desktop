@@ -401,7 +401,7 @@ penulis profil terakhir, resource dan migrasi. Profil tidak kompatibel tidak
 boleh menahan update keamanan browser. Default tetap ephemeral; merge dokumen
 audit ini bukan penerimaan desain atau pengiriman persistent login.
 
-**Status P2.3 (27–28 September 2026, dua bagian; console merged melalui PR #24):** keputusan ada
+**Status P2.3 (27–28 September 2026, dua bagian; merged melalui PR #24 dan PR #25):** keputusan ada
 di [ADR 0023](docs/adr/0023-device-console-in-memory.md) dan pengukuran di
 `docs/validation.md` (P2.3). Sebelumnya setiap session device sudah
 menjalankan `Runtime.enable`, sehingga browser mengirim setiap panggilan
@@ -424,8 +424,8 @@ worker. Koreksi review di PR #24: Clear bekerja lokal walau browser sudah
 berhenti, entri tanpa identitas frame ditandai *frame unknown*, dan referensi
 objek debugger console dilepas berkala per session.
 
-Bagian kedua P2.3 ([ADR 0024](docs/adr/0024-bug-reports-on-request.md), PR
-menunggu review): sebelumnya desktop live tidak mengekspor apa pun, dan screencast
+Bagian kedua P2.3 ([ADR 0024](docs/adr/0024-bug-reports-on-request.md), merged
+melalui PR #25): sebelumnya desktop live tidak mengekspor apa pun, dan screencast
 phone 390 × 844 pada 50 % hanya sekitar 195 × 422 piksel. Kini **Save report**
 di panel Console mengambil screenshot PNG viewport device pada skalanya
 (`Page.captureScreenshot`; ditolak dengan alasan untuk device tersembunyi,
@@ -437,7 +437,27 @@ session, halaman, browser, versi, waktu UTC dan console lama ke baru; alamat
 hanya skema, host dan path, dan teks console kehilangan query, fragment, user
 info, token berbentuk JWT dan kredensial bearer, dengan catatan bahwa sisa teks
 halaman tetap ada. Tidak ada yang ditulis tanpa klik; Broxser tidak pernah
-membaca ulang, mengirim atau menghapus laporan.
+membaca ulang, mengirim atau menghapus laporan. Koreksi review di PR #25:
+laporan ditulis di thread I/O sendiri yang ditunggu saat Close dan satu per
+satu, screenshot terikat revisi halaman sehingga hasil basi dibatalkan, redaksi
+juga mencakup alamat IPv6, host Unicode, bearer pendek dan JWT di path, metadata
+ditulis sebagai kode literal, dan PNG divalidasi utuh.
+
+**Status P3.1 (27–28 September 2026, bagian pertama; PR menunggu review):** audit dan
+keputusan ada di [ADR 0025](docs/adr/0025-linux-release-archive-and-sbom.md) dan
+`docs/validation.md` (P3.1). Sebelumnya tidak ada build release, arsip, SBOM,
+checksum artefak Broxser atau signature; Helium sudah dipin dengan checksum dan
+0.18.1.1 masih tag terbaru. Kini `scripts/sbom.py` menulis SBOM SPDX 2.3 dari
+graph yang benar-benar di-link binary Linux (525 crate crates.io dengan SHA-256
+dari `Cargo.lock`, GPUI vendored, Helium sebagai dependensi runtime yang tidak
+ikut dikemas) dan dicek di `check.sh` dan CI; `scripts/package.sh` membangun
+arsip `tar.xz` deterministik tanpa signature berisi binary release, notices,
+SBOM, inventory lisensi, manifest dan skrip unduh Helium serta `SHA256SUMS`.
+Arsip itu diverifikasi, dibongkar, mengunduh Helium sendiri dan lulus seluruh
+smoke di window X11 nyata (18/18 pada rerun terakhir). Menunggu pemilik: lisensi kode Broxser, identitas
+signing, kanal rilis, format pengguna (AppImage atau paket distro) dan owner
+utama serta cadangan. Bagian berikutnya: skrip kualifikasi update Helium dan
+latihan rollback.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -534,6 +554,7 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
   session: audit dan ADR 0021 proposed, merged melalui PR #22; P2.2a panel workspace,
   preset dan file state: ADR 0022, merged melalui PR #23; P2.3a console per device:
-  ADR 0023, merged melalui PR #24; P2.3b laporan bug: ADR 0024, PR menunggu review).
-- [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
+  ADR 0023, merged melalui PR #24; P2.3b laporan bug: ADR 0024, merged melalui PR #25).
+- [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan (P3.1 arsip
+  rilis tanpa signature dan SBOM: ADR 0025, PR menunggu review).
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

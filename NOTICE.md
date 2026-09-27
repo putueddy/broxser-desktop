@@ -10,8 +10,10 @@ should choose its intended distribution policy before a public release.
 - Helium: its original code and patches use GPL-3.0; imported Chromium and other
   upstream components retain their respective licenses. The engine is obtained
   separately from the official release, is not vendored, and is not included in Git.
-- Rust transitive dependencies retain their own licenses. Cargo.lock is an
-  inventory of versions, not a completed license audit or SBOM.
+- Rust transitive dependencies retain their own licenses. `scripts/sbom.py`
+  writes an SPDX SBOM of the crates the Linux binaries link and a list by
+  declared license (`THIRD-PARTY.md` in the release archive, ADR 0025); it is an
+  inventory for the license owner's review, not a completed license audit.
 - Sizzy is a functional reference. Its DMG, code, artwork, branding and license
   mechanism are not part of this repository.
 
