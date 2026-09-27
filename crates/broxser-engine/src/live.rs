@@ -803,6 +803,8 @@ struct LiveDevice {
     target_id: String,
     session: String,
     css: (f64, f64),
+    /// A touch device: pointer input reaches the page as touches (ADR 0018).
+    touch: bool,
     visible: bool,
     /// The UI shows part of the frame; otherwise the screencast pauses.
     on_screen: bool,
@@ -1180,6 +1182,7 @@ impl<'a> Controller<'a> {
                 target_id,
                 session,
                 css: (f64::from(device.width), f64::from(device.height)),
+                touch: device.touch,
                 visible: true,
                 on_screen: true,
                 streaming: false,
@@ -1762,6 +1765,14 @@ impl<'a> Controller<'a> {
             }
         }
         let device = &mut self.devices[index];
+        if device.touch && !is_touch(event) {
+            // A touch device has no hover and no second button: a move
+            // without the finger down and any other button send nothing.
+            if event.kind == PointerKind::Move {
+                device.pointer_move = None;
+            }
+            return Ok(());
+        }
         if event.kind == PointerKind::Move {
             // Coalesce moves: only the newest one waits while another is in flight.
             device.pointer_move = Some(event);
@@ -1769,10 +1780,8 @@ impl<'a> Controller<'a> {
         }
         device.pointer_move = None;
         let session = device.session.clone();
-        let params = mouse_params(event, device.css);
-        let id = self
-            .cdp
-            .send("Input.dispatchMouseEvent", params, Some(&session))?;
+        let (method, params) = pointer_params(event, device.css, device.touch);
+        let id = self.cdp.send(method, params, Some(&session))?;
         self.track(id, Pending::Input { device: index })
     }
 
@@ -2117,11 +2126,9 @@ impl<'a> Controller<'a> {
             if !device.move_in_flight
                 && let Some(event) = device.pointer_move.take()
             {
-                let params = mouse_params(event, device.css);
+                let (method, params) = pointer_params(event, device.css, device.touch);
                 let session = device.session.clone();
-                let id = self
-                    .cdp
-                    .send("Input.dispatchMouseEvent", params, Some(&session))?;
+                let id = self.cdp.send(method, params, Some(&session))?;
                 self.devices[index].move_in_flight = true;
                 self.track(id, Pending::Move { device: index })?;
             }
@@ -3518,6 +3525,36 @@ impl<'a> Controller<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a pointer event is the finger of a touch device: the left button
+/// pressed, released, or held while moving.
+fn is_touch(event: PointerEvent) -> bool {
+    match event.kind {
+        PointerKind::Move => event.buttons & 1 != 0,
+        PointerKind::Down | PointerKind::Up => event.button == PointerButton::Left,
+    }
+}
+
+/// The CDP input method and parameters for a pointer event: a single touch
+/// point on a touch device, a mouse event otherwise.
+fn pointer_params(event: PointerEvent, css: (f64, f64), touch: bool) -> (&'static str, Value) {
+    if !touch {
+        return ("Input.dispatchMouseEvent", mouse_params(event, css));
+    }
+    let point = json!({
+        "x": event.x.clamp(0.0, css.0 - 1.0),
+        "y": event.y.clamp(0.0, css.1 - 1.0),
+    });
+    let (kind, points) = match event.kind {
+        PointerKind::Down => ("touchStart", vec![point]),
+        PointerKind::Move => ("touchMove", vec![point]),
+        PointerKind::Up => ("touchEnd", Vec::new()),
+    };
+    (
+        "Input.dispatchTouchEvent",
+        json!({"type": kind, "touchPoints": points, "modifiers": event.modifiers.cdp()}),
+    )
 }
 
 fn mouse_params(event: PointerEvent, css: (f64, f64)) -> Value {

@@ -2116,6 +2116,98 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
 }
 
 #[test]
+fn touch_devices_send_touches_and_nothing_for_hover_or_other_buttons() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let mut workspace = workspace("http://127.0.0.1:4173/".into());
+    workspace.devices[0].touch = true;
+    let live = LiveSession::start_with(
+        workspace,
+        fake_options(root.path()),
+        Limits::default(),
+        || {},
+    )
+    .unwrap();
+    wait_for(&live, "the runtime", Duration::from_secs(10), running);
+    let pointer = |kind, x, y, button, buttons| Command::Pointer {
+        device: 0,
+        event: PointerEvent {
+            kind,
+            x,
+            y,
+            button,
+            buttons,
+            click_count: 1,
+            modifiers: Modifiers::default(),
+        },
+    };
+    // Hover, a right click and a middle click send nothing to a touch device.
+    for command in [
+        pointer(PointerKind::Move, 10.0, 10.0, PointerButton::None, 0),
+        pointer(PointerKind::Down, 10.0, 10.0, PointerButton::Right, 2),
+        pointer(PointerKind::Up, 10.0, 10.0, PointerButton::Right, 0),
+        pointer(PointerKind::Down, 10.0, 10.0, PointerButton::Middle, 4),
+    ] {
+        assert!(live.send(command));
+    }
+    // A press, a drag and a release are one finger. The move is coalesced
+    // and sent by the loop; a release arriving before that drops it, as for
+    // a mouse, so the release waits for the move here.
+    assert!(live.send(pointer(
+        PointerKind::Down,
+        20.0,
+        30.0,
+        PointerButton::Left,
+        1
+    )));
+    assert!(live.send(pointer(
+        PointerKind::Move,
+        20.0,
+        40.0,
+        PointerButton::None,
+        1
+    )));
+    wait_for_requests(&peer, "Input.dispatchTouchEvent", "S0", 2);
+    assert!(live.send(pointer(PointerKind::Up, 20.0, 40.0, PointerButton::Left, 0)));
+    wait_for_requests(&peer, "Input.dispatchTouchEvent", "S0", 3);
+    let touches: Vec<Value> = peer
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, session, _, _)| {
+            method == "Input.dispatchTouchEvent" && session.as_deref() == Some("S0")
+        })
+        .map(|(_, _, _, params)| params.clone())
+        .collect();
+    assert_eq!(
+        touches,
+        [
+            json!({"type": "touchStart", "touchPoints": [{"x": 20.0, "y": 30.0}], "modifiers": 0}),
+            json!({"type": "touchMove", "touchPoints": [{"x": 20.0, "y": 40.0}], "modifiers": 0}),
+            json!({"type": "touchEnd", "touchPoints": [], "modifiers": 0}),
+        ]
+    );
+    assert_eq!(peer.count("Input.dispatchMouseEvent", "S0"), 0);
+    // The mouse tablet still gets mouse events, hover included.
+    assert!(live.send(Command::Pointer {
+        device: 1,
+        event: PointerEvent {
+            kind: PointerKind::Move,
+            x: 5.0,
+            y: 5.0,
+            button: PointerButton::None,
+            buttons: 0,
+            click_count: 0,
+            modifiers: Modifiers::default(),
+        },
+    }));
+    wait_for_requests(&peer, "Input.dispatchMouseEvent", "S1", 1);
+    assert_eq!(peer.count("Input.dispatchTouchEvent", "S1"), 0);
+    drop(live);
+}
+
+#[test]
 fn permission_prompts_are_denied_in_every_session_context() {
     let root = profile_root();
     let peer = FakePeer::start(root.path(), |_, _| false);
@@ -2659,6 +2751,20 @@ for (const [name, descriptor] of [
 }
 </script>"#;
 
+/// Reports every pointer, mouse and touch event on its button with the
+/// pointer type, and its scroll position after a drag.
+const TOUCH_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;height:3000px}#t{position:absolute;left:20px;top:100px;width:200px;height:200px;background:#36c;touch-action:pan-y}</style></head><body>
+<div id=t></div>
+<script>
+let n = 0;
+const ping = (name, value) => fetch('/event?' + new URLSearchParams({kind: 'touch', name, value: String(value), w: innerWidth, n: n++}));
+for (const type of ['pointerdown', 'pointerup', 'pointermove', 'touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'click']) {
+  t.addEventListener(type, e => ping(type, e.pointerType || (e.touches ? 'touches=' + e.touches.length : 'mouse')));
+}
+addEventListener('scrollend', () => ping('scrollend', Math.round(scrollY)));
+</script></body></html>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -2807,6 +2913,7 @@ fn fixture() -> Fixture {
             "/frame-download" => FRAME_DOWNLOAD_PAGE.into(),
             "/permissions" => PERMISSION_PAGE.into(),
             "/camera-permissions" => CAMERA_PERMISSION_PAGE.into(),
+            "/touch" => TOUCH_PAGE.into(),
             "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
@@ -6717,5 +6824,110 @@ fn live_permission_requests_are_denied_at_once() {
             other => panic!("unexpected report {other}"),
         }
     }
+    live.close();
+}
+
+/// Events of `TOUCH_PAGE` on the device with viewport width `width`, in order.
+fn touch_events(fixture: &Fixture, width: &str) -> Vec<String> {
+    // Reports are separate requests, so the page numbers them.
+    let mut reports: Vec<_> = events(fixture, "touch")
+        .into_iter()
+        .filter(|event| event["w"] == width)
+        .collect();
+    reports.sort_by_key(|event| event["n"].parse::<u32>().unwrap());
+    reports
+        .iter()
+        .map(|event| format!("{} {}", event["name"], event["value"]))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_touch_devices_get_touches_and_mouse_devices_get_a_mouse() {
+    let fixture = fixture();
+    let mut workspace = workspace(fixture.url("/touch"));
+    workspace.devices[0].touch = true;
+    let live = Live::start(workspace);
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/touch")
+    });
+    // A tap on the touch phone and a click on the mouse desktop.
+    click(&live, 0, 100.0, 200.0);
+    click(&live, 2, 100.0, 200.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| {
+            touch_events(f, "360").contains(&"click touch".to_owned())
+                && touch_events(f, "1000").contains(&"click mouse".to_owned())
+        }),
+        "phone {:?}, desktop {:?}",
+        touch_events(&fixture, "360"),
+        touch_events(&fixture, "1000")
+    );
+    assert_eq!(
+        touch_events(&fixture, "360"),
+        [
+            "pointerdown touch",
+            "touchstart touches=1",
+            "pointerup touch",
+            "touchend touches=0",
+            "mousedown mouse",
+            "mouseup mouse",
+            "click touch"
+        ]
+    );
+    assert_eq!(
+        touch_events(&fixture, "1000"),
+        [
+            "pointerdown mouse",
+            "mousedown mouse",
+            "pointerup mouse",
+            "mouseup mouse",
+            "click mouse"
+        ]
+    );
+    // A drag on the phone is a swipe: the page scrolls and sees touch moves.
+    let before = events(&fixture, "touch").len();
+    for (kind, buttons, y) in [
+        (PointerKind::Down, 1, 250.0),
+        (PointerKind::Move, 1, 200.0),
+        (PointerKind::Move, 1, 150.0),
+        (PointerKind::Move, 1, 100.0),
+        (PointerKind::Up, 0, 100.0),
+    ] {
+        live.send(Command::Pointer {
+            device: 0,
+            event: PointerEvent {
+                kind,
+                x: 100.0,
+                y,
+                button: PointerButton::Left,
+                buttons,
+                click_count: 1,
+                modifiers: Modifiers::default(),
+            },
+        });
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| {
+            events(f, "touch")[before..]
+                .iter()
+                .any(|e| e["name"] == "scrollend")
+        }),
+        "{:?}",
+        &events(&fixture, "touch")[before..]
+    );
+    let after: Vec<String> = touch_events(&fixture, "360")[7..].to_vec();
+    assert!(
+        after.contains(&"touchmove touches=1".to_owned()),
+        "{after:?}"
+    );
+    let scrolled: u32 = after
+        .iter()
+        .find_map(|e| e.strip_prefix("scrollend "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(scrolled > 0, "{after:?}");
     live.close();
 }
