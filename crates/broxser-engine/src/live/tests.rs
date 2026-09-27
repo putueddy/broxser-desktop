@@ -500,10 +500,19 @@ impl FakePeer {
                     }),
                     "Page.navigate" => {
                         loaders += 1;
-                        json!({
+                        let mut result = json!({
                             "frameId": session.as_deref().unwrap_or_default().replacen('S', "T", 1),
                             "loaderId": format!("L{loaders}")
-                        })
+                        });
+                        // Helium's answer when the address is a download.
+                        if request["params"]["url"]
+                            .as_str()
+                            .is_some_and(|url| url.contains("/download"))
+                        {
+                            result["errorText"] = json!("net::ERR_ABORTED");
+                            result["isDownload"] = json!(true);
+                        }
+                        result
                     }
                     "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
                     _ => json!({}),
@@ -2096,6 +2105,134 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
     drop(live);
 }
 
+#[test]
+fn downloads_and_file_choosers_are_refused_and_reported_for_their_device() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    // Every session context denies downloads and reports them; every device
+    // intercepts file choosers and still cancels them for the page.
+    assert_eq!(
+        peer.browser_requests("Browser.setDownloadBehavior"),
+        [
+            json!({"behavior": "deny", "browserContextId": "CTX1", "eventsEnabled": true}),
+            json!({"behavior": "deny", "browserContextId": "CTX2", "eventsEnabled": true}),
+        ]
+    );
+    for session in ["S0", "S1", "S2"] {
+        assert_eq!(
+            peer.last_params("Page.setInterceptFileChooserDialog", session),
+            json!({"enabled": true, "cancel": true})
+        );
+    }
+    let origin = "http://127.0.0.1:4173";
+    let download = |frame: &str, url: &str, name: &str| {
+        json!({"method": "Browser.downloadWillBegin", "params": {
+            "frameId": frame, "guid": "G", "url": url, "suggestedFilename": name}})
+    };
+    let on = |session: &str, method: &str, params: Value| json!({"method": method, "sessionId": session, "params": params});
+
+    // The phone's page: reported on the phone, on one line, without controls.
+    peer.event(download(
+        "T0",
+        &format!("{origin}/report"),
+        "re\u{7}port\n.pdf",
+    ));
+    let status = wait_for(&live, "the phone's report", Duration::from_secs(2), |s| {
+        s.devices[0].downloads == 1
+    });
+    assert_eq!(
+        status.devices[0].download,
+        Some(DownloadState {
+            filename: "report.pdf".into(),
+            url: format!("{origin}/report"),
+        })
+    );
+    // A tablet frame that another renderer process took over is the tablet's.
+    peer.event(on(
+        "S1",
+        "Page.frameAttached",
+        json!({"frameId": "F1", "parentFrameId": "T1"}),
+    ));
+    peer.event(on(
+        "S1",
+        "Page.frameDetached",
+        json!({"frameId": "F1", "reason": "swap"}),
+    ));
+    peer.event(download("F1", "http://localhost:4173/frame", "frame.pdf"));
+    wait_for(&live, "the tablet's report", Duration::from_secs(2), |s| {
+        s.devices[1].downloads == 1
+    });
+    // A removed frame, a frame of the desktop's previous document and an
+    // unknown frame are nobody's.
+    peer.event(on(
+        "S1",
+        "Page.frameDetached",
+        json!({"frameId": "F1", "reason": "remove"}),
+    ));
+    peer.event(on(
+        "S2",
+        "Page.frameAttached",
+        json!({"frameId": "F2", "parentFrameId": "T2"}),
+    ));
+    peer.event(on(
+        "S2",
+        "Page.frameNavigated",
+        json!({"frame": {"id": "T2", "loaderId": "L9", "url": format!("{origin}/next")}}),
+    ));
+    for frame in ["F1", "F2", "F404"] {
+        peer.event(download(frame, &format!("{origin}/{frame}"), "x"));
+    }
+    // A long address is shown shortened.
+    peer.event(download(
+        "T2",
+        &format!("{origin}/{}", "x".repeat(3000)),
+        "long.bin",
+    ));
+    let status = wait_for(&live, "the desktop's report", Duration::from_secs(2), |s| {
+        s.devices[2].downloads == 1
+    });
+    let url = &status.devices[2].download.as_ref().unwrap().url;
+    assert!(url.ends_with('…') && url.chars().count() == MAX_DIALOG_CHARS + 1);
+    assert_eq!(
+        status
+            .devices
+            .iter()
+            .map(|device| device.downloads)
+            .collect::<Vec<_>>(),
+        [1, 1, 1]
+    );
+
+    // The phone's page opens file choosers: counted, never given files.
+    for mode in ["selectSingle", "selectMultiple"] {
+        peer.event(on(
+            "S0",
+            "Page.fileChooserOpened",
+            json!({"frameId": "T0", "mode": mode, "backendNodeId": 7}),
+        ));
+    }
+    let status = wait_for(&live, "the file choosers", Duration::from_secs(2), |s| {
+        s.devices[0].file_choosers == 2
+    });
+    assert_eq!(status.devices[1].file_choosers, 0);
+    assert_eq!(peer.count("DOM.setFileInputFiles", "S0"), 0);
+
+    // Going to an address that is a download ends without a navigation error;
+    // the download report tells what happened.
+    assert!(live.send(Command::NavigateAll {
+        url: format!("{origin}/download"),
+    }));
+    for session in ["S0", "S1", "S2"] {
+        wait_for_requests(&peer, "Page.navigate", session, 2);
+    }
+    thread::sleep(Duration::from_millis(200));
+    for device in live.status().devices {
+        assert_eq!(device.error, None);
+        assert!(!device.loading);
+    }
+    drop(live);
+}
+
 fn send_keys(live: &LiveSession, device: usize, presses: usize) {
     for _ in 0..presses {
         for down in [true, false] {
@@ -2446,6 +2583,23 @@ setInterval(() => fetch('/event?' + new URLSearchParams({kind: 'alive', q, opene
 setTimeout(() => { if (window.opener) window.opener.location = '/hijacked'; }, 300);
 </script>"#;
 
+/// An attachment link, a `download` attribute link, a file input and a
+/// cross-site frame (another renderer process) with its own attachment link.
+const DOWNLOAD_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;font:16px sans-serif}a,input,iframe{position:absolute;left:20px;width:200px;height:40px;display:block;border:0}</style></head><body>
+<a id=file href="/download?name=report.pdf" style="top:100px;background:#36c;color:#fff">attachment</a>
+<a id=named href="/download" download="notes.txt" style="top:160px;background:#3a3;color:#fff">download attribute</a>
+<input id=chooser type=file style="top:220px">
+<iframe id=frame style="top:280px;width:300px;height:120px"></iframe>
+<script>
+const ping = result => fetch('/event?kind=chooser&result=' + result);
+chooser.addEventListener('cancel', () => ping('cancel'));
+chooser.addEventListener('change', () => ping('change'));
+frame.src = 'http://localhost:' + location.port + '/frame-download';
+</script></body></html>"#;
+
+const FRAME_DOWNLOAD_PAGE: &str = r#"<!doctype html><body style="margin:0" onload="fetch('/event?kind=frame')"><a href="/download?name=frame.pdf" style="display:block;width:300px;height:120px;background:#c63">frame download</a></body>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -2493,6 +2647,16 @@ fn fixture() -> Fixture {
                 };
             }
             "/dropped" => return Reply::Drop,
+            // `/download?name=<file name>`: an attachment; without a name, a
+            // plain text file that only a `download` attribute saves.
+            "/download" => {
+                return Reply::File {
+                    filename: request
+                        .path
+                        .split_once("?name=")
+                        .map(|(_, name)| query_value(name)),
+                };
+            }
             _ => {}
         }
         let body = match path {
@@ -2580,6 +2744,8 @@ fn fixture() -> Fixture {
             "/dialogs" => DIALOG_PAGE.into(),
             "/popups" => OPENER_PAGE.into(),
             "/popup-page" => POPUP_PAGE.into(),
+            "/downloads" => DOWNLOAD_PAGE.into(),
+            "/frame-download" => FRAME_DOWNLOAD_PAGE.into(),
             "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
@@ -5435,4 +5601,145 @@ fn live_busy_page_does_not_stop_other_devices() {
     );
     assert!(running(&live.session().status()));
     live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_downloads_and_file_choosers_are_refused_and_reported() {
+    let fixture = fixture();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let downloads_before = download_names(&home.join("Downloads"));
+    let live = Live::start(workspace(fixture.url("/downloads")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/downloads")
+    });
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| events(f, "frame").len() == 3),
+        "the cross-site frames did not load"
+    );
+    let requested = |path: &str| {
+        fixture
+            .requests()
+            .iter()
+            .filter(|request| request.path == path)
+            .count()
+    };
+    // Each click starts one download on its own device; the browser refuses
+    // it and that device reports it. The desktop's link is in a cross-site
+    // frame that another renderer process runs.
+    for (device, y, filename, url) in [
+        (
+            0,
+            120.0,
+            "report.pdf",
+            fixture.url("/download?name=report.pdf"),
+        ),
+        (1, 180.0, "notes.txt", fixture.url("/download")),
+        (
+            2,
+            340.0,
+            "frame.pdf",
+            fixture
+                .url("/download?name=frame.pdf")
+                .replacen("127.0.0.1", "localhost", 1),
+        ),
+    ] {
+        click(&live, device, 100.0, y);
+        let status = live.wait(filename, Duration::from_secs(10), |s| {
+            s.devices[device].downloads == 1
+        });
+        assert_eq!(
+            status.devices[device].download,
+            Some(DownloadState {
+                filename: filename.into(),
+                url,
+            })
+        );
+    }
+    let status = live.session().status();
+    for device in &status.devices {
+        assert_eq!(device.downloads, 1);
+        assert_eq!(device.url, fixture.url("/downloads"));
+        assert_eq!(device.error, None);
+    }
+    for path in [
+        "/download?name=report.pdf",
+        "/download",
+        "/download?name=frame.pdf",
+    ] {
+        assert_eq!(requested(path), 1, "{path} was requested once");
+    }
+
+    // The phone's file input: reported, cancelled for the page, no file given.
+    click(&live, 0, 100.0, 240.0);
+    live.wait("the file chooser", Duration::from_secs(10), |s| {
+        s.devices[0].file_choosers == 1
+    });
+    assert!(fixture.wait_for(Duration::from_secs(10), |f| {
+        !events(f, "chooser").is_empty()
+    }));
+    thread::sleep(Duration::from_millis(300));
+    let answers: Vec<_> = events(&fixture, "chooser")
+        .iter()
+        .map(|event| event["result"].clone())
+        .collect();
+    assert_eq!(answers, ["cancel"]);
+    let status = live.session().status();
+    assert_eq!(
+        status
+            .devices
+            .iter()
+            .map(|device| device.file_choosers)
+            .collect::<Vec<_>>(),
+        [1, 0, 0]
+    );
+
+    // Go to an address that is a download: every device reports it and stays
+    // on its page without a navigation error.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/download?name=go.pdf"),
+    });
+    let status = live.wait("the refused address", Duration::from_secs(10), |s| {
+        s.devices
+            .iter()
+            .all(|device| device.downloads == 2 && !device.loading)
+    });
+    for device in &status.devices {
+        assert_eq!(device.error, None);
+        assert_eq!(device.url, fixture.url("/downloads"));
+        assert_eq!(device.download.as_ref().unwrap().filename, "go.pdf");
+    }
+    assert_eq!(requested("/download?name=go.pdf"), 3);
+
+    // Nothing was saved in the profile or the user's download folder.
+    assert_eq!(download_names(live.root.path()), Vec::<String>::new());
+    assert_eq!(download_names(&home.join("Downloads")), downloads_before);
+    live.close();
+}
+
+/// Files below `root` named like the downloads of `DOWNLOAD_PAGE`, or partial
+/// downloads.
+fn download_names(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut directories = vec![(root.to_owned(), 0)];
+    while let Some((directory, depth)) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ["report", "notes", "frame.pdf", "go.pdf", ".crdownload"]
+                .iter()
+                .any(|part| name.contains(part))
+            {
+                found.push(entry.path().display().to_string());
+            }
+            if depth < 8 && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                directories.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    found.sort();
+    found
 }

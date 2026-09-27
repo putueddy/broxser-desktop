@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broxser download fixture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #ffffff; font: 16px sans-serif; }
+  /* One button fills the viewport, so a click anywhere in the frame starts the download. */
+  #save { position: absolute; inset: 0; border: 0; background: #3b82f6; color: #fff; font: inherit; }
+</style>
+</head>
+<body>
+<button id="save">Save a file</button>
+<script>
+  // A `download` link saves any same-origin address as a file; the smoke check
+  // expects the card to report the refused download and the page to stay.
+  document.getElementById('save').addEventListener('click', () => {
+    const link = document.createElement('a');
+    link.href = '/download.html?file';
+    link.download = 'notes.txt';
+    document.body.append(link);
+    link.click();
+    fetch('/event?download=clicked');
+  });
+</script>
+</body>
+</html>

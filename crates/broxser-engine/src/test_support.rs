@@ -116,6 +116,8 @@ pub(crate) enum Reply {
         status: u16,
         location: Option<String>,
     },
+    /// A small text file; with `filename`, an attachment by that name.
+    File { filename: Option<String> },
     /// Headers and the start of a body, then hold the connection open.
     Stall,
     /// Hold the request open without any response.
@@ -298,6 +300,17 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
                 .unwrap_or_default();
             let response = format!(
                 "HTTP/1.1 {status} Fixture\r\n{location}Content-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        Reply::File { filename } => {
+            let disposition = filename
+                .map(|name| format!("Content-Disposition: attachment; filename=\"{name}\"\r\n"))
+                .unwrap_or_default();
+            let body = "fixture file\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{disposition}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             );
             let _ = stream.write_all(response.as_bytes());
         }

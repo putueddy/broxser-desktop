@@ -10,10 +10,10 @@ use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE,
 use anyhow::{Context as _, Result};
 use broxser_core::{Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, DialogKind, DialogState, Frame, ImeAction, KeyInput,
-    LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton,
-    PointerEvent, PointerKind, PopupState, RuntimeState, Status, SyncSettings, is_paste_key,
-    paste_text, to_viewport,
+    BrowserOptions, Cancellation, Command, DeviceStatus, DialogKind, DialogState, DownloadState,
+    Frame, ImeAction, KeyInput, LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers,
+    PasteRejected, PointerButton, PointerEvent, PointerKind, PopupState, RuntimeState, Status,
+    SyncSettings, is_paste_key, paste_text, to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -159,6 +159,9 @@ struct DeviceView {
     prompt: Option<PromptField>,
     /// Token of the closed-window report the user dismissed.
     dismissed_popup: Option<u64>,
+    /// The device's download count when the user dismissed its report; the
+    /// next refused download shows again.
+    dismissed_download: Option<u32>,
 }
 
 struct PromptField {
@@ -1434,12 +1437,7 @@ impl LiveView {
                         "{} frames · {} replaced",
                         status.frames, status.dropped_frames
                     ))
-                    .child(match (status.popups, status.streaming) {
-                        (0, true) => "Streaming".to_owned(),
-                        (0, false) => "Paused".to_owned(),
-                        (closed, true) => format!("Streaming · {closed} window(s) closed"),
-                        (closed, false) => format!("Paused · {closed} window(s) closed"),
-                    }),
+                    .child(activity_line(&status)),
             )
             .when_some(
                 status
@@ -1447,6 +1445,92 @@ impl LiveView {
                     .clone()
                     .filter(|popup| view.dismissed_popup != Some(popup.token)),
                 |this, popup| this.child(self.popup_notice(index, &popup, width.max(180.), cx)),
+            )
+            .when_some(
+                status
+                    .download
+                    .clone()
+                    .filter(|_| view.dismissed_download != Some(status.downloads)),
+                |this, download| {
+                    this.child(self.download_notice(
+                        index,
+                        &download,
+                        status.downloads,
+                        width.max(180.),
+                        cx,
+                    ))
+                },
+            )
+            .into_any_element()
+    }
+
+    /// The latest download the device's page started, which the browser
+    /// refused (ADR 0016). Nothing saves it; Dismiss only hides the report.
+    fn download_notice(
+        &self,
+        index: usize,
+        download: &DownloadState,
+        count: u32,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = |text: &str, fallback: &'static str| -> SharedString {
+            if text.is_empty() {
+                fallback.into()
+            } else {
+                text.to_owned().into()
+            }
+        };
+        let filename = line(&download.filename, "(no file name)");
+        let url = line(&download.url, "(no address)");
+        div()
+            .w(px(width))
+            .mt_2()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_xs()
+            .child(
+                div()
+                    .text_color(rgb(MUTED))
+                    .child("Refused a download the page started"),
+            )
+            .child(
+                div()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(filename),
+            )
+            .child(
+                div()
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(rgb(MUTED))
+                    .child(url),
+            )
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .id(("download-dismiss", index))
+                        .cursor_pointer()
+                        .rounded_md()
+                        .px_3()
+                        .py_1()
+                        .bg(rgb(ACCENT))
+                        .text_color(rgb(BG))
+                        .child("Dismiss")
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.devices[index].dismissed_download = Some(count);
+                            cx.notify();
+                        })),
+                ),
             )
             .into_any_element()
     }
@@ -2210,10 +2294,30 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
     Ok(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
+/// The card's activity line: the stream state, then what the page tried that
+/// Broxser closed or refused (ADR 0015, ADR 0016).
+fn activity_line(status: &DeviceStatus) -> String {
+    let mut parts = vec![if status.streaming {
+        "Streaming".to_owned()
+    } else {
+        "Paused".to_owned()
+    }];
+    for (count, what) in [
+        (status.popups, "window(s) closed"),
+        (status.downloads, "download(s) refused"),
+        (status.file_choosers, "file chooser(s) cancelled"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {what}"));
+        }
+    }
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CanvasKey, DeviceView, KeyFocus, PressedKeys, canvas_key, field_answer,
+        CanvasKey, DeviceView, KeyFocus, PressedKeys, activity_line, canvas_key, field_answer,
         focus_after_prompt_change, key_down_target, key_input, map_caret, open_dialog,
         prompt_default, selected_after_visibility_change,
     };
@@ -2761,5 +2865,22 @@ mod tests {
                 CanvasKey::Send(0)
             );
         }
+    }
+
+    #[test]
+    fn activity_line_names_only_what_happened() {
+        let mut status = DeviceStatus {
+            streaming: true,
+            ..DeviceStatus::default()
+        };
+        assert_eq!(activity_line(&status), "Streaming");
+        status.streaming = false;
+        status.popups = 2;
+        status.downloads = 1;
+        status.file_choosers = 3;
+        assert_eq!(
+            activity_line(&status),
+            "Paused · 2 window(s) closed · 1 download(s) refused · 3 file chooser(s) cancelled"
+        );
     }
 }

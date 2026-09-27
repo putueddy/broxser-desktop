@@ -65,7 +65,8 @@ canvas scale. See `docs/validation.md` for numbers.
 - Rich or page-initiated clipboard access, touch gestures, drag and drop,
   popups, downloads, permissions, file upload, JavaScript dialogs and
   accessibility are not supported (ADR 0014 adds JavaScript dialogs, answered by
-  the user on the device card; ADR 0015 closes and reports popups). Each needs
+  the user on the device card; ADR 0015 closes and reports popups; ADR 0016
+  refuses and reports downloads and cancels file choosers). Each needs
   its own gate; ADR 0010 covers
   plain-text paste only. ADR 0011 adds native IME composition and caret placement
   for standard main-frame editable controls, qualified with Fcitx5/Pinyin over XIM.

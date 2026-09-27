@@ -109,11 +109,59 @@ every 200 ms and sets `window.opener.location = '/hijacked'` after 300 ms:
 | Live Helium suite with popups (`--ignored`, 4 threads) | 37 of 37 passed in 61.9 s |
 | Full `scripts/desktop-smoke.sh` with popups (debug build) | 10 of 10 runs passed; no browser process, profile or window left |
 
+### Downloads and file choosers ([ADR 0016](adr/0016-downloads-and-file-choosers-refused-and-reported.md))
+
+A third scratch Node script, not committed, drove one page target with Broxser's
+setup and a fixture whose file answers arrive slowly (2 MiB in 64 KiB chunks), so
+an early cancel shows as an aborted body. Each case once, with the headless
+default and then with `Browser.setDownloadBehavior` `deny` and events for the
+context:
+
+| Case | Headless default | Denied per context |
+| --- | --- | --- |
+| Attachment link (`Content-Disposition`), `application/octet-stream`, POST answered as an attachment, redirect to an attachment, `location.href` set by a script | Request sent and aborted; `Page.downloadWillBegin` then `downloadProgress` `canceled` within 2–8 ms; no file; the page stays | The same, plus `Browser.downloadWillBegin` and its cancellation |
+| `download` attribute on a page link; `data:` URL with one | Request sent (none for `data:`) and cancelled; suggested name from the attribute | Same |
+| `blob:` URL with a `download` attribute | No download event at all | `Browser.downloadWillBegin` with the blob URL, cancelled |
+| Three `download` links clicked by one script | One request, one download event | Three requests, three events, each cancelled |
+| Attachment link inside a same-origin frame | Reported with the frame's ID on the page session | Same, at the browser level too |
+| Attachment link inside a cross-site frame (another renderer) | Nothing on the page session | `Browser.downloadWillBegin` only, with the frame ID the device session had seen attached and then detached (reason `swap`) |
+| Hostile `Content-Disposition` (`../../.bashrc`, a right-to-left override, newline, bell, escape sequence) | Suggested name `_fdp.exe___[31m.txt`: the browser sanitizes the path, not every control character | Same |
+| `Page.navigate` to an attachment | `net::ERR_ABORTED` with `isDownload: true`, no `loaderId`; download events follow | Same |
+| `<input type=file>` single, `multiple`, `webkitdirectory`, scripted click with a gesture; `showOpenFilePicker`, `showSaveFilePicker`, `showDirectoryPicker` | No chooser: the input's `cancel` event fires, the pickers reject with `AbortError`; a scripted click without a gesture does nothing | With `Page.setInterceptFileChooserDialog`: `Page.fileChooserOpened` (frame, mode, node) and the page waits; with `cancel: true` the page still gets `cancel` |
+
+No file appeared in the profile, the working directory or `~/Downloads` in any
+case.
+
+A temporary test through the live runtime at `6fefab7` (popups branch), with a
+page holding an attachment link, a `download` attribute link, a file input and a
+cross-site frame with its own attachment link:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Click the attachment link on the phone, the `download` link on the tablet, the frame's link on the desktop | Each request was sent and every device status stayed exactly as before: nothing shown | Each device reports "Refused a download the page started" with `report.pdf`, `notes.txt` and `frame.pdf` and the address; the pages stay; each request was sent once |
+| Click the phone's file input | The page got `cancel` after the headless browser opened nothing; nothing shown | The page still gets `cancel`, no file; the phone counts one file chooser |
+| Go to an attachment address | "Navigation failed: net::ERR_ABORTED; not retried" on all three devices | No error; every device reports the download `go.pdf` and stays on its page; three requests |
+| Files anywhere | None | None |
+
+| Check | Result |
+| --- | --- |
+| `downloads_and_file_choosers_are_refused_and_reported_for_their_device` (fake CDP) | Passed |
+| `live_downloads_and_file_choosers_are_refused_and_reported` (Helium) | Passed 1 of 1 alone |
+| `scripts/desktop-smoke.sh`, new run "download refused on the card" | Passed: the phone frame keeps its page, the card shows the report with the accent Dismiss below the frame, Dismiss hides it, and no file named `notes.txt` exists under the run's private `TMPDIR` or `~/Downloads`. A first version looked for the raised button color and matched the anti-aliased edges of the card's text instead; the button is now accent-filled and the run uses a 1000 px tall window so the report is not cut by the window edge |
+| `bash scripts/check.sh` with downloads | Passed: 1 CLI, 8 core, 68 engine and 25 desktop tests (the new `activity_line` unit test included); 38 live tests ignored by default; fmt and strict Clippy clean |
+| Live Helium suite with downloads (`--ignored`, 4 threads) | 37 of 38 passed in 68.9 s; `live_owner_death_while_frames_stream` failed its check that the dead owner's CDP port refuses connections ("the dead owner's CDP endpoint is open") while its browser processes and profile were gone. That check is a plain TCP connect, so a browser or fixture of one of the three other threads taking the freed port answers it; the test passed alone right after (8.4 s). The pre-existing test is not changed here |
+| Full `scripts/desktop-smoke.sh` with downloads (debug build) | 11 of 11 runs passed; no browser process, profile or window left |
+| Rerun after the cherry-pick onto `main` (42744df, PR #15 merged; conflicts in GOALS, README, `live_view.rs` imports and tests, and `dialog_text` resolved without behavior changes) | `bash scripts/check.sh` passed in 58 s (1 CLI, 8 core, 84 engine, 36 desktop tests, fmt and strict Clippy); live Helium suite 39 of 39 in 70 s; desktop smoke 9 of 9 in 1 m 10 s with nothing left running |
+
 ### Limits
 
-- Downloads, uploads, permissions, touch input and hover media, drag and drop and
-  accessibility keep today's behavior; each is a separate decision. The audit
-  above is their evidence.
+- Permissions, touch input and hover media, drag and drop and accessibility keep
+  today's behavior; each is a separate decision. The audit above is their
+  evidence.
+- A refused download's document request still reaches the server; export and
+  attachment flows produce no file in Broxser, and upload flows see a cancelled
+  chooser. The suggested file name is the browser's, sanitized as a path, shown
+  on one line without control characters.
 - A closed window's first document request reaches the server, and its script
   can start before the close; flows that need their window (sign-in, payment)
   do not complete.

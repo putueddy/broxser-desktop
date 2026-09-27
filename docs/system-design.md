@@ -203,6 +203,10 @@ untuknya ditolak dengan pesan, dan kedua deadline dijeda (ADR 0014). Jendela yan
 dibuka halaman di context session Broxser ditutup begitu browser melaporkannya
 dan dilaporkan pada device pembukanya dengan alamat dan token; hanya
 `Command::OpenPopup` yang memuat alamat utuhnya di device itu (ADR 0015).
+Setiap context session menolak download (`Browser.setDownloadBehavior deny`);
+engine melaporkan download yang ditolak pada device yang frame-nya memulainya,
+dengan nama file dan alamat yang dibatasi, dan menghitung pemilih file yang
+dibatalkan lewat intersepsi; halaman tidak pernah menerima file (ADR 0016).
 
 ## 6. API and data contracts
 

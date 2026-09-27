@@ -545,6 +545,72 @@ popup_run() {
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+download_run() {
+  local label=$1
+  local before app window= failure= button code=0 left_processes left_profiles
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/download.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    # Tall enough for the report below the phone frame.
+    xdotool windowsize "$window" 1360 1000 || true
+    xdotool mousemove --window "$window" 600 400 || true
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /download.html || true) -gt 0 ]] && break
+      sleep 0.1
+    done
+    if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+      failure="the phone frame did not show the page"
+    else
+      read -r x y x0 y0 x1 y1 < <(echo "$button")
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      for _ in $(seq 100); do
+        [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "download.html?file" || true) -gt 0 ]] && break
+        sleep 0.1
+      done
+      # The report's Dismiss button is accent-filled, below the frame; the
+      # selected card's one-pixel border has the same color.
+      if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "download.html?file" || true) -eq 0 ]]; then
+        failure="the browser did not request the file within 10 s"
+      elif ! button=$(find_color "$window" 262 $((y1 + 1)) 206 $((960 - y1 - 1)) 7ce29b 6 10 filled); then
+        failure="the card did not report the refused download"
+      elif ! find_color "$window" 250 60 230 760 3b82f6 40 3 >/dev/null; then
+        failure="the phone left its page"
+      else
+        read -r x y _ < <(echo "$button")
+        xdotool mousemove --window "$window" "$x" "$y" click 1
+        if ! find_color "$window" 262 $((y1 + 1)) 206 $((960 - y1 - 1)) 7ce29b 6 5 absent,filled; then
+          failure="the report stayed after Dismiss"
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  # No file may appear anywhere the browser could write.
+  local saved
+  saved=$(find "$TMPDIR" "$HOME/Downloads" -name 'notes.txt*' 2>/dev/null | wc -l)
+  [[ $saved -eq 0 ]] || failure=${failure:-"$saved file(s) named notes.txt saved"}
+  echo "$label: ${failure:-refused and reported, nothing saved}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -555,4 +621,5 @@ restart_run "live Restart clicked twice, then Ctrl+Q" quit
 typing_run "typing while pages animate" animation.html
 dialog_run "dialog answered on the card"
 popup_run "popup closed and opened on the card"
+download_run "download refused on the card"
 echo "desktop smoke passed"

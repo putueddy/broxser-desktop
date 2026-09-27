@@ -39,6 +39,9 @@ const MAX_LINK_INTENT_BYTES: usize = 8192;
 const LINK_INTENT_WINDOW: Duration = Duration::from_secs(1);
 /// Longest dialog message, prompt default or prompt answer, in characters.
 pub const MAX_DIALOG_CHARS: usize = 2048;
+/// Subframes remembered per device, so that downloads they start are
+/// attributed to it (ADR 0016).
+const MAX_TRACKED_FRAMES: usize = 256;
 /// Device status while it has an open dialog and Broxser was asked to navigate it.
 pub(crate) const DIALOG_OPEN: &str =
     "The page is waiting for an answer to its dialog; navigation was not sent.";
@@ -218,6 +221,13 @@ pub struct DeviceStatus {
     /// The latest of them, until the user opens it in the device or the page
     /// opens another.
     pub popup: Option<PopupState>,
+    /// Downloads the page started, all refused by the browser (ADR 0016).
+    pub downloads: u32,
+    /// The latest of them.
+    pub download: Option<DownloadState>,
+    /// File choosers the page opened. Each was answered as cancelled; pages
+    /// get no files (ADR 0016).
+    pub file_choosers: u32,
     /// Current main-frame editable caret. Cleared whenever its target is unsafe.
     pub text_input: Option<TextInputState>,
     /// A JavaScript dialog the page is waiting on. The page, its frames and
@@ -235,6 +245,15 @@ pub struct PopupState {
     pub openable: bool,
     /// Engine-assigned identity; opening an older report does nothing.
     pub token: u64,
+}
+
+/// A download the page started and the browser refused. Both fields are
+/// untrusted page text on one line, bounded for display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadState {
+    /// The file name the browser derived for it.
+    pub filename: String,
+    pub url: String,
 }
 
 /// An open JavaScript dialog, as the page requested it. `message` and
@@ -820,6 +839,9 @@ struct LiveDevice {
     window_open: Option<String>,
     /// The closed popup the user may load here: its token and complete URL.
     popup: Option<(u64, String)>,
+    /// Subframes of the current document, including frames that another
+    /// renderer process now runs, so their downloads are attributed here.
+    frames: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -839,9 +861,17 @@ struct OpenDialog {
 /// Page text for display: control characters other than line breaks and tabs
 /// are dropped, and text beyond [`MAX_DIALOG_CHARS`] is cut and marked.
 fn dialog_text(text: &str) -> String {
-    let mut kept = text
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'));
+    shown_text(text, |c| matches!(c, '\n' | '\t'))
+}
+
+/// Page text for display on one line: every control character is dropped,
+/// and text beyond [`MAX_DIALOG_CHARS`] is cut and marked.
+fn display_line(text: &str) -> String {
+    shown_text(text, |_| false)
+}
+
+fn shown_text(text: &str, keep_control: fn(char) -> bool) -> String {
+    let mut kept = text.chars().filter(|&c| !c.is_control() || keep_control(c));
     let mut shown: String = kept.by_ref().take(MAX_DIALOG_CHARS).collect();
     if kept.next().is_some() {
         shown.push('…');
@@ -1033,6 +1063,13 @@ impl<'a> Controller<'a> {
                     "browser runtime not qualified: extension {extension} runs inside a Broxser session context (ADR 0004)"
                 );
             }
+            // Broxser saves no download, whatever the browser's default, and
+            // reports each refused one on its device (ADR 0016).
+            self.command(
+                "Browser.setDownloadBehavior",
+                json!({"behavior": "deny", "browserContextId": context, "eventsEnabled": true}),
+                None,
+            )?;
             contexts.insert(session.id.as_str(), context);
         }
         for device in &workspace.devices {
@@ -1051,6 +1088,13 @@ impl<'a> Controller<'a> {
             self.command(
                 "Emulation.setFocusEmulationEnabled",
                 json!({"enabled": true}),
+                Some(&session),
+            )?;
+            // A file chooser is reported, then cancelled for the page as the
+            // headless browser does without interception. No file is given.
+            self.command(
+                "Page.setInterceptFileChooserDialog",
+                json!({"enabled": true, "cancel": true}),
                 Some(&session),
             )?;
             let physical = |css: u32| {
@@ -1090,6 +1134,7 @@ impl<'a> Controller<'a> {
                 dialog: None,
                 window_open: None,
                 popup: None,
+                frames: HashSet::new(),
             });
             self.command(
                 "Runtime.enable",
@@ -2094,6 +2139,14 @@ impl<'a> Controller<'a> {
             match self.pending.remove(&id) {
                 Some(Pending::Navigate { device }) => {
                     let mut error = match parse_response(response, "Page.navigate") {
+                        // The address is a download. The browser refused it and
+                        // the device reports it instead of an error (ADR 0016).
+                        Ok(result)
+                            if result.get("isDownload").and_then(Value::as_bool) == Some(true) =>
+                        {
+                            self.shared.device(device, |status| status.loading = false);
+                            None
+                        }
                         Ok(result) => result
                             .get("errorText")
                             .and_then(Value::as_str)
@@ -2238,6 +2291,25 @@ impl<'a> Controller<'a> {
                         } else {
                             "The page target was detached.".into()
                         });
+                    });
+                }
+                return Ok(());
+            }
+            // Every session context denies downloads, so the browser refuses
+            // this one; the device whose frame started it reports it (ADR 0016).
+            "Browser.downloadWillBegin" => {
+                if let Some(frame) = text("frameId")
+                    && let Some(index) = self.devices.iter().position(|device| {
+                        device.target_id == frame || device.frames.contains(frame)
+                    })
+                {
+                    let download = DownloadState {
+                        filename: display_line(text("suggestedFilename").unwrap_or_default()),
+                        url: display_line(text("url").unwrap_or_default()),
+                    };
+                    self.shared.device(index, |device| {
+                        device.downloads = device.downloads.saturating_add(1);
+                        device.download = Some(download);
                     });
                 }
                 return Ok(());
@@ -2544,10 +2616,11 @@ impl<'a> Controller<'a> {
                     field("urlFragment").unwrap_or_default()
                 );
                 // A new document answers input again; the old one's is moot,
-                // and so is a dialog of the old one.
+                // and so is a dialog of the old one. Its frames went with it.
                 self.forget_input(index);
                 self.invalidate_ime(index);
                 self.devices[index].dialog = None;
+                self.devices[index].frames.clear();
                 let matches_reload =
                     self.devices[index]
                         .navigation
@@ -2663,6 +2736,28 @@ impl<'a> Controller<'a> {
             }
             "Page.windowOpen" => {
                 self.devices[index].window_open = text("url").map(str::to_owned);
+            }
+            "Page.frameAttached" => {
+                let frames = &mut self.devices[index].frames;
+                if let Some(frame) = text("frameId")
+                    && frame.len() <= 128
+                    && frames.len() < MAX_TRACKED_FRAMES
+                {
+                    frames.insert(frame.to_owned());
+                }
+            }
+            // A frame that another renderer process takes over ("swap") stays
+            // part of this page; its downloads still name it.
+            "Page.frameDetached" if text("reason") == Some("remove") => {
+                if let Some(frame) = text("frameId") {
+                    self.devices[index].frames.remove(frame);
+                }
+            }
+            // Interception cancels the chooser for the page (ADR 0016).
+            "Page.fileChooserOpened" => {
+                self.shared.device(index, |device| {
+                    device.file_choosers = device.file_choosers.saturating_add(1);
+                });
             }
             _ => {}
         }
