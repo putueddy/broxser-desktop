@@ -43,6 +43,38 @@ pub(crate) trait Commands {
     fn command(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<Value>;
 }
 
+/// Permissions whose request would wait for a prompt Broxser never shows.
+/// Each is denied per session context, so a page gets its answer at once and
+/// `permissions.query` reports it (ADR 0017). Permission descriptor names, as
+/// the web API spells them.
+pub(crate) const DENIED_PERMISSIONS: [&str; 4] =
+    ["notifications", "idle-detection", "camera", "microphone"];
+
+/// Denies [`DENIED_PERMISSIONS`] and the camera PTZ descriptor for every origin
+/// in `context`.
+pub(crate) fn deny_permission_prompts(commands: &mut impl Commands, context: &str) -> Result<()> {
+    for name in DENIED_PERMISSIONS {
+        commands.command(
+            "Browser.setPermission",
+            json!({"permission": {"name": name}, "setting": "denied", "browserContextId": context}),
+            None,
+        )?;
+    }
+    // Helium treats PTZ as a separate permission: denying base camera access
+    // still leaves `permissions.query({name: "camera", panTiltZoom: true})`
+    // reporting `prompt` unless this descriptor is denied explicitly.
+    commands.command(
+        "Browser.setPermission",
+        json!({
+            "permission": {"name": "camera", "panTiltZoom": true},
+            "setting": "denied",
+            "browserContextId": context,
+        }),
+        None,
+    )?;
+    Ok(())
+}
+
 /// Creates the page target for `device` inside `context`, attaches a flat CDP
 /// session and applies viewport, scale and touch emulation. Returns the target
 /// ID (also the main frame ID) and the session ID.

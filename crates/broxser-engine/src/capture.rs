@@ -4,7 +4,9 @@
 use crate::Limits;
 use crate::browser::{BrowserOptions, BrowserProcess, ProcessIdentity};
 use crate::cdp::{Cdp, Event, parse_response, required_str};
-use crate::device::{Commands, ExtensionObservations, extension_in_context, setup_target};
+use crate::device::{
+    Commands, ExtensionObservations, deny_permission_prompts, extension_in_context, setup_target,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use broxser_core::Workspace;
@@ -225,6 +227,7 @@ impl Capture<'_> {
                 json!({"behavior": "deny", "browserContextId": context}),
                 None,
             )?;
+            deny_permission_prompts(&mut self, &context)?;
             contexts.insert(session.id.as_str(), context);
         }
         for device in &workspace.devices {

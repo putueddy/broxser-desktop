@@ -236,11 +236,92 @@ Review evidence is retained locally in the ignored `artifacts/pr16-review/`
 directory; correction logs and screenshots are in `artifacts/pr16-fixes/`.
 The native checks use Xvfb and Mesa Lavapipe with the browser sandbox enabled.
 
+### Permissions ([ADR 0017](adr/0017-permission-prompts-denied.md))
+
+A fourth scratch Node script, not committed, requested every permission-gated
+API from one page target after a click and again without a gesture, timing each
+answer, and read `navigator.permissions.query()` for eighteen names; then the
+same with `Browser.setPermission` `denied` for the context.
+
+| Request | Headless default | Denied per context |
+| --- | --- | --- |
+| `Notification.requestPermission()` | Resolves `denied` after 1.2–1.8 s, with or without a gesture; `query` says `prompt` | `denied` in 5–17 ms; `query` says `denied` |
+| `IdleDetector.requestPermission()` | `denied` after 2.6–3.8 s (gesture); `NotAllowedError` at once without one; `query` says `prompt` | `denied` in 16 ms |
+| `getUserMedia` (no devices here) | `NotFoundError` in 50–90 ms; `query` says `prompt` for camera and microphone | The same here; `query` says `denied` |
+| `getDisplayMedia` | Never resolves (8 s) | Never resolves, even with `display-capture` denied |
+| Geolocation, MIDI, clipboard read, pointer lock, window management, push subscription, local fonts | Denied or thrown at once | Same |
+| Clipboard write, wake lock, fullscreen, persistent storage | Answered at once | Same, unless those permissions are denied too: then copy buttons and wake locks fail and `queryLocalFonts()` resolves |
+
+`Browser.setPermission` takes web descriptor names (`notifications`,
+`idle-detection`, `camera`, …); the `PermissionType` names of
+`Browser.grantPermissions` are rejected as invalid descriptors. CDP sends no
+event for a permission request.
+
+A live Helium test at `43cb397`, with a page that asks for the notification
+permission on load without a gesture:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Three devices load the page | `query` reported `prompt` on all three; two were answered `denied` after 1551 and 1812 ms and one was not answered within 10 s | All three answered `denied` within 500 ms (the test's bound; the probe measured under 20 ms) and `query` reports `denied` |
+
+| Check | Result |
+| --- | --- |
+| `permission_prompts_are_denied_in_every_session_context` (fake CDP) | Passed |
+| `live_permission_requests_are_denied_at_once` (Helium) | Failed before the change as above; passed after |
+| `bash scripts/check.sh` with permissions | Passed: 1 CLI, 8 core, 69 engine and 25 desktop tests; 39 live tests ignored by default; fmt and strict Clippy clean |
+| Live Helium suite with permissions (`--ignored`, 4 threads) | 39 of 39 passed in 75.0 s |
+
+No desktop change, so no window check was run for this capability.
+
+### PR #17 camera PTZ correction, 27 September 2026 (local Linux)
+
+Review of `b62bc05` found that denying `{"name":"camera"}` left
+`permissions.query({name: "camera", panTiltZoom: true})` at `prompt`. Chromium
+uses a separate permission for camera movement controls. The pinned Helium
+probe reproduced that state on both `127.0.0.1` and `localhost`, while ordinary
+camera queries reported `denied` and media requests using simulated devices
+rejected with `NotAllowedError`. Explicitly denying the PTZ descriptor changed
+its query to `denied`; unrelated permission queries and a separate control
+context were unchanged.
+
+The shared setup helper now sends a fifth `Browser.setPermission` denial for
+`{"name":"camera","panTiltZoom":true}` in each session context. Both live and
+capture use that helper before creating device targets. The four existing
+denials remain in place.
+
+The fake-CDP regression independently lists all five expected descriptors for
+each context. The new live test
+`live_camera_permission_queries_deny_ptz_across_origins` collects 24 query
+reports across three device widths, two session contexts and two origins.
+Ordinary camera and PTZ must both be `denied`; clipboard-write and
+screen-wake-lock must remain `granted`. It requests no media device access.
+
+Before the patch, the focused permission run passed the existing notification
+timing test and failed the two regression checks: the fifth descriptor was
+missing and PTZ remained `prompt` in all six device/origin combinations. After
+the patch, all three focused tests passed (0.89 s). Baseline and passing logs are
+retained locally in the ignored `artifacts/pr17-fixes/` directory; the original
+review probes are in `artifacts/pr17-review/`.
+
+| Final check | Result |
+| --- | --- |
+| `CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 94 engine + 36 desktop tests (139 total) |
+| Full live Helium suite (`--ignored --test-threads=2 --nocapture`) | Passed: 43 of 43, 146.73 s, including the PTZ regression and existing notification timing test |
+| `git diff --check` | Passed |
+
+Validation used Helium 0.18.1.1 (`Chrome/154.0.8037.57`), sandbox enabled and
+application-owned private profiles. No GUI code changed, so no additional
+window check was required. The PTZ regression queries permission state without
+accessing camera hardware. Existing vendored GPUI and `proc-macro-error2`
+future-compatibility warnings remain non-failing.
+
 ### Limits
 
-- Permissions, touch input and hover media, drag and drop and accessibility keep
-  today's behavior; each is a separate decision. The audit above is their
-  evidence.
+- Touch input and hover media, drag and drop and accessibility keep today's
+  behavior; each is a separate decision. The audit above is their evidence.
+- `getDisplayMedia()` never resolves in the headless browser, denied or not.
+  Camera and microphone are denied on the probe's evidence about prompt-type
+  permissions; no device here could exercise them.
 - A refused download's document request still reaches the server; export and
   attachment flows produce no file in Broxser, and upload flows see a cancelled
   chooser. The suggested file name is the browser's, sanitized as a path, shown

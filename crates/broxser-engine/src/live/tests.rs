@@ -2116,6 +2116,32 @@ fn popups_are_closed_at_once_and_reported_for_their_device() {
 }
 
 #[test]
+fn permission_prompts_are_denied_in_every_session_context() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    // Keep the expected descriptors independent of the production helper: a
+    // base camera denial does not cover the PTZ query in pinned Helium.
+    let permissions = [
+        json!({"name": "notifications"}),
+        json!({"name": "idle-detection"}),
+        json!({"name": "camera"}),
+        json!({"name": "microphone"}),
+        json!({"name": "camera", "panTiltZoom": true}),
+    ];
+    let expected: Vec<Value> = ["CTX1", "CTX2"]
+        .iter()
+        .flat_map(|context| {
+            permissions.iter().map(move |permission| {
+                json!({"permission": permission, "setting": "denied", "browserContextId": context})
+            })
+        })
+        .collect();
+    assert_eq!(peer.browser_requests("Browser.setPermission"), expected);
+    drop(live);
+}
+
+#[test]
 fn downloads_and_file_choosers_are_refused_and_reported_for_their_device() {
     let root = profile_root();
     let peer = FakePeer::start(root.path(), |_, _| false);
@@ -2610,6 +2636,29 @@ frame.src = 'http://localhost:' + location.port + '/frame-download';
 
 const FRAME_DOWNLOAD_PAGE: &str = r#"<!doctype html><body style="margin:0" onload="fetch('/event?kind=frame')"><a href="/download?name=frame.pdf" style="display:block;width:300px;height:120px;background:#c63">frame download</a></body>"#;
 
+/// Asks for the notification permission without a gesture as soon as it
+/// loads, and reports the answer, its delay and what `permissions.query` says.
+const PERMISSION_PAGE: &str = r#"<!doctype html><script>
+const ping = (name, value, ms) => fetch('/event?' + new URLSearchParams({kind: 'permission', name, value, ms: String(Math.round(ms))}));
+const t0 = performance.now();
+Notification.requestPermission().then(v => ping('notifications', v, performance.now() - t0), e => ping('notifications', 'error:' + e.name, performance.now() - t0));
+navigator.permissions.query({name: 'notifications'}).then(s => ping('query', s.state, 0), e => ping('query', 'error:' + e.name, 0));
+</script>"#;
+
+/// Queries camera descriptors and unaffected controls without requesting a
+/// camera, so the PTZ regression needs no physical or simulated media devices.
+const CAMERA_PERMISSION_PAGE: &str = r#"<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><script>
+for (const [name, descriptor] of [
+  ['camera', {name: 'camera'}],
+  ['camera-ptz', {name: 'camera', panTiltZoom: true}],
+  ['clipboard-write', {name: 'clipboard-write'}],
+  ['screen-wake-lock', {name: 'screen-wake-lock'}],
+]) {
+  const ping = value => fetch('/event?' + new URLSearchParams({kind: 'camera-permission', origin: location.origin, w: String(innerWidth), name, value}));
+  navigator.permissions.query(descriptor).then(s => ping(s.state), e => ping('error:' + e.name));
+}
+</script>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -2756,6 +2805,8 @@ fn fixture() -> Fixture {
             "/popup-page" => POPUP_PAGE.into(),
             "/downloads" => DOWNLOAD_PAGE.into(),
             "/frame-download" => FRAME_DOWNLOAD_PAGE.into(),
+            "/permissions" => PERMISSION_PAGE.into(),
+            "/camera-permissions" => CAMERA_PERMISSION_PAGE.into(),
             "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
@@ -6570,5 +6621,101 @@ fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recover
     assert_eq!(count(&fixture, "/busy-iframe-first"), 1);
     assert_eq!(count(&fixture, "/busy-iframe-second"), 1);
     assert_eq!(count(&fixture, "/download?healthy"), 1);
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_camera_permission_queries_deny_ptz_across_origins() {
+    let fixture = fixture();
+    let first_url = fixture.url("/camera-permissions");
+    let second_url = first_url.replacen("127.0.0.1", "localhost", 1);
+    // Phone and tablet share guest; desktop has its own admin context.
+    let live = Live::start(workspace(first_url.clone()));
+    let mut expected = Vec::new();
+    for (index, url) in [first_url, second_url].iter().enumerate() {
+        if index > 0 {
+            live.send(Command::NavigateAll { url: url.clone() });
+        }
+        live.wait("camera permission pages", Duration::from_secs(30), |s| {
+            running(s)
+                && s.devices
+                    .iter()
+                    .all(|d| d.url == *url && !d.loading && d.frames > 0)
+        });
+        let origin = url.strip_suffix("/camera-permissions").unwrap();
+        assert!(
+            fixture.wait_for(Duration::from_secs(10), |f| {
+                events(f, "camera-permission")
+                    .iter()
+                    .filter(|report| report["origin"] == origin)
+                    .count()
+                    >= 12
+            }),
+            "{:?}",
+            events(&fixture, "camera-permission")
+        );
+        for width in ["360", "600", "1000"] {
+            for (name, state) in [
+                ("camera", "denied"),
+                ("camera-ptz", "denied"),
+                ("clipboard-write", "granted"),
+                ("screen-wake-lock", "granted"),
+            ] {
+                expected.push((
+                    origin.to_owned(),
+                    width.to_owned(),
+                    name.to_owned(),
+                    state.to_owned(),
+                ));
+            }
+        }
+    }
+    let mut observed: Vec<_> = events(&fixture, "camera-permission")
+        .into_iter()
+        .map(|report| {
+            (
+                report["origin"].clone(),
+                report["w"].clone(),
+                report["name"].clone(),
+                report["value"].clone(),
+            )
+        })
+        .collect();
+    observed.sort();
+    expected.sort();
+    println!("Camera permission queries: {observed:?}");
+    live.close();
+    assert_eq!(observed, expected);
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_permission_requests_are_denied_at_once() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/permissions")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/permissions")
+    });
+    // Three devices, two reports each.
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| events(f, "permission").len()
+            >= 6),
+        "{:?}",
+        events(&fixture, "permission")
+    );
+    for report in events(&fixture, "permission") {
+        match report["name"].as_str() {
+            // The page is answered, not left waiting for a prompt nobody
+            // can see, and the answer is the one `query` reports.
+            "notifications" => {
+                assert_eq!(report["value"], "denied", "{report:?}");
+                let ms: u64 = report["ms"].parse().unwrap();
+                assert!(ms < 500, "answered after {ms} ms");
+            }
+            "query" => assert_eq!(report["value"], "denied", "{report:?}"),
+            other => panic!("unexpected report {other}"),
+        }
+    }
     live.close();
 }
