@@ -5,6 +5,7 @@
 
 use crate::ime::{ImeBuffer, Origin};
 use crate::lifecycle::{AfterStop, CloseRequest, Lifecycle};
+use crate::report;
 use crate::url_input::{UrlEvent, UrlInput};
 use crate::{
     ACCENT, BG, BORDER, DANGER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT,
@@ -16,8 +17,8 @@ use broxser_engine::{
     BrowserOptions, Cancellation, Command, ConsoleEntry, ConsoleKind, ConsoleLevel, ConsoleScope,
     DeviceStatus, DialogKind, DialogState, DownloadState, Frame, ImeAction, KeyInput, LiveSession,
     MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent,
-    PointerKind, PopupState, RuntimeState, Status, SyncSettings, is_paste_key, paste_text,
-    to_viewport,
+    PointerKind, PopupState, RuntimeState, Screenshot, Status, SyncSettings, is_paste_key,
+    paste_text, to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
@@ -34,6 +35,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 /// UI pixels per wheel line when the platform reports lines instead of pixels.
 const WHEEL_LINE: f32 = 40.0;
@@ -60,6 +62,13 @@ pub(crate) struct LiveView {
     /// with the device and revision it belongs to (ADR 0023).
     console: Vec<ConsoleEntry>,
     console_read: Option<(usize, u64)>,
+    /// Where Save report writes (ADR 0024); `None` without a home directory.
+    reports: Option<PathBuf>,
+    /// The report waiting for its screenshot.
+    report: Option<PendingReport>,
+    next_report: u64,
+    /// The outcome of the last Save report, and whether it failed.
+    report_notice: Option<(String, bool)>,
     browser: Option<PathBuf>,
     session: Option<LiveSession>,
     status: Status,
@@ -182,6 +191,18 @@ struct DeviceView {
     /// The device's download count when the user dismissed its report; the
     /// next refused download shows again.
     dismissed_download: Option<u32>,
+}
+
+/// A report as it was when the user asked for it; its screenshot follows.
+struct PendingReport {
+    device: usize,
+    token: u64,
+    console: Vec<ConsoleEntry>,
+    errors: u32,
+    warnings: u32,
+    url: String,
+    browser: Option<(String, String)>,
+    saved: SystemTime,
 }
 
 /// The panel beside the device list; one at a time.
@@ -312,6 +333,10 @@ impl LiveView {
             saving_workspace: false,
             console: Vec::new(),
             console_read: None,
+            reports: report::reports_dir(|name| std::env::var_os(name)),
+            report: None,
+            next_report: 0,
+            report_notice: None,
             browser,
             session: None,
             status: Status::default(),
@@ -367,6 +392,7 @@ impl LiveView {
                 self.session = Some(session);
                 self.status = Status::default();
                 self.read_console();
+                self.forget_report();
                 self.notice = None;
                 // A new runtime streams every visible device; the next paint
                 // pauses those still off screen.
@@ -424,6 +450,25 @@ impl LiveView {
             .filter(|&index| self.devices[index].decoding.is_none() && !self.devices[index].hidden)
             .filter_map(|index| Some((index, session.take_frame(index)?)))
             .collect();
+        let screenshot = self
+            .report
+            .as_ref()
+            .and_then(|report| session.take_screenshot(report.device))
+            .filter(|(token, _)| {
+                self.report
+                    .as_ref()
+                    .is_some_and(|report| report.token == *token)
+            });
+        if let Some((_, result)) = screenshot {
+            let report = self.report.take().unwrap();
+            match result {
+                Ok(screenshot) => self.write_report(report, screenshot, window, cx),
+                Err(reason) => {
+                    self.report_notice = Some((format!("Not saved: {reason}"), true));
+                    cx.notify();
+                }
+            }
+        }
         if status != self.status {
             let former_caret = self
                 .selected
@@ -995,6 +1040,7 @@ impl LiveView {
         // Nothing of the previous runtime is shown while it stops.
         self.status = Status::default();
         self.read_console();
+        self.forget_report();
         self.clear_prompts(window);
         self.notice = None;
         // The panel's draft becomes the workspace of the next runtime. Its
@@ -1103,6 +1149,115 @@ impl LiveView {
         if let Some(device) = self.selected {
             self.send(Command::ClearConsole { device });
             cx.notify();
+        }
+    }
+
+    /// Asks the runtime for the selected device's screenshot; the report is
+    /// written when it arrives, with the console and page as they are now
+    /// (ADR 0024).
+    fn save_report(&mut self, cx: &mut Context<Self>) {
+        let Some(device) = self.selected else {
+            return;
+        };
+        if self.report.is_some() {
+            return;
+        }
+        if self.reports.is_none() {
+            self.report_notice = Some((
+                "Not saved: no reports directory; set BROXSER_REPORT_DIR to an absolute path."
+                    .into(),
+                true,
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(status) = self.status.devices.get(device) else {
+            return;
+        };
+        self.next_report += 1;
+        let report = PendingReport {
+            device,
+            token: self.next_report,
+            console: self.console.clone(),
+            errors: status.console_errors,
+            warnings: status.console_warnings,
+            url: status.url.clone(),
+            browser: match &self.status.runtime {
+                RuntimeState::Running { product, protocol } => {
+                    Some((product.clone(), protocol.clone()))
+                }
+                _ => None,
+            },
+            saved: SystemTime::now(),
+        };
+        let token = report.token;
+        if self.send(Command::Screenshot { device, token }) {
+            self.report = Some(report);
+            self.report_notice = Some(("Taking the screenshot…".into(), false));
+        } else {
+            self.report_notice = Some(("Not saved: the runtime is not running.".into(), true));
+        }
+        cx.notify();
+    }
+
+    /// Writes a report off the UI thread and shows where it went.
+    fn write_report(
+        &mut self,
+        pending: PendingReport,
+        screenshot: Screenshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(root), Some(device)) = (
+            self.reports.clone(),
+            self.workspace.devices.get(pending.device).cloned(),
+        ) else {
+            return;
+        };
+        let session = self
+            .workspace
+            .sessions
+            .iter()
+            .find(|session| session.id == device.session)
+            .map_or_else(|| device.session.clone(), |session| session.name.clone());
+        let text = report::report_text(&report::Report {
+            device: &device,
+            session: &session,
+            url: &pending.url,
+            browser: pending
+                .browser
+                .as_ref()
+                .map(|(product, protocol)| (product.as_str(), protocol.as_str())),
+            console: &pending.console,
+            errors: pending.errors,
+            warnings: pending.warnings,
+            saved: pending.saved,
+            screenshot: (screenshot.width, screenshot.height),
+        });
+        self.report_notice = Some(("Saving the report…".into(), false));
+        let saved = pending.saved;
+        let written = cx.background_executor().spawn(async move {
+            report::write_report(&root, &device.id, saved, &screenshot.png, &text)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let written = written.await;
+            this.update(cx, |view, cx| {
+                view.report_notice = Some(match written {
+                    Ok(folder) => (format!("Saved to {}", folder.display()), false),
+                    Err(error) => (format!("Not saved: {error}"), true),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A new or stopped runtime answers no earlier screenshot request.
+    fn forget_report(&mut self) {
+        if self.report.take().is_some() {
+            self.report_notice = None;
         }
     }
 
@@ -2390,21 +2545,58 @@ impl LiveView {
                                     .child(console_counts(status)),
                             ),
                     )
-                    // Filled in the accent color, so a real-window check can
-                    // find it by its color alone.
+                    // Filled, Save report in the accent and Clear in the
+                    // danger color, so a real-window check can find each by
+                    // its color alone.
                     .child(
                         div()
-                            .id("console-clear")
-                            .cursor_pointer()
-                            .rounded_md()
-                            .bg(rgb(ACCENT))
-                            .text_color(rgb(BG))
-                            .px_3()
-                            .py_1()
-                            .text_sm()
-                            .child("Clear")
-                            .on_click(cx.listener(|view, _, _, cx| view.clear_console(cx))),
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("console-save-report")
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(BG))
+                                    .px_2()
+                                    .py_1()
+                                    .text_sm()
+                                    .child("Save report")
+                                    .on_click(cx.listener(|view, _, _, cx| view.save_report(cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("console-clear")
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .bg(rgb(DANGER))
+                                    .text_color(rgb(BG))
+                                    .px_2()
+                                    .py_1()
+                                    .text_sm()
+                                    .child("Clear")
+                                    .on_click(cx.listener(|view, _, _, cx| view.clear_console(cx))),
+                            ),
                     ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(match &self.report_notice {
+                        Some((_, true)) => WARN,
+                        _ => MUTED,
+                    }))
+                    .child(match (&self.report_notice, &self.reports) {
+                        (Some((notice, _)), _) => notice.clone(),
+                        (None, Some(dir)) => format!(
+                            "Save report writes a screenshot and a redacted report to {}.",
+                            dir.display()
+                        ),
+                        (None, None) => {
+                            "Save report needs BROXSER_REPORT_DIR or a home directory.".into()
+                        }
+                    }),
             )
             .child(
                 div()

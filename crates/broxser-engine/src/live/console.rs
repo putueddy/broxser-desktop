@@ -229,15 +229,9 @@ pub(crate) fn navigation(url: &str) -> ConsoleEntry {
 /// addresses (`data:`, `blob:`, `about:`) keep only their scheme. Lines and
 /// columns arrive zero-based and are shown one-based.
 pub(crate) fn location(url: &str, line: Option<u64>, column: Option<u64>) -> String {
-    let Some((scheme, rest)) = url.split_once(':') else {
-        return String::new();
-    };
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        return String::new();
+    let address = broxser_core::redact_url(url);
+    if address.is_empty() {
+        return address;
     }
     let mut suffix = String::new();
     if let Some(line) = line {
@@ -248,19 +242,7 @@ pub(crate) fn location(url: &str, line: Option<u64>, column: Option<u64>) -> Str
     }
     // The line and column are part of the location's total bound too.
     let mut text = Text::with_limit(MAX_LOCATION.saturating_sub(suffix.chars().count()));
-    text.push(scheme);
-    text.push(":");
-    if let Some(rest) = rest.strip_prefix("//") {
-        let end = rest.find(['?', '#']).unwrap_or(rest.len());
-        let rest = &rest[..end];
-        let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-        let host = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host);
-        text.push("//");
-        text.push(host);
-        text.push(path);
-    }
+    text.push(&address);
     let mut shown = text.finish();
     shown.push_str(&suffix);
     shown
@@ -690,23 +672,16 @@ mod tests {
     }
 
     #[test]
-    fn locations_keep_only_scheme_host_and_path() {
-        for (url, shown) in [
-            ("https://u:p@host:8443/a/b?c=d#e", "https://host:8443/a/b"),
-            ("http://host", "http://host"),
-            (
-                "file:///home/me/site/index.html?x",
-                "file:///home/me/site/index.html",
-            ),
-            ("data:text/html,<script>secret</script>", "data:"),
-            ("blob:http://host/1234-5678", "blob:"),
-            ("about:srcdoc", "about:"),
-            ("", ""),
-            ("no scheme here", ""),
-            ("://host/x", ""),
-        ] {
-            assert_eq!(location(url, None, None), shown, "{url}");
-        }
+    fn locations_are_redacted_bounded_and_one_based() {
+        assert_eq!(
+            location("https://u:p@host:8443/a/b?c=d#e", Some(0), Some(4)),
+            "https://host:8443/a/b:1:5"
+        );
+        assert_eq!(
+            location("data:text/html,<b>x</b>", Some(2), None),
+            "data::3"
+        );
+        assert_eq!(location("", None, None), "");
         let long = location(
             &format!("https://host/{}", "p".repeat(1000)),
             Some(0),

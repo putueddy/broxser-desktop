@@ -530,6 +530,14 @@ impl FakePeer {
                         result
                     }
                     "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
+                    // A 2 × 3 PNG header for every device but the tablet,
+                    // whose reply is no PNG.
+                    "Page.captureScreenshot" if session.as_deref() == Some("S1") => {
+                        json!({"data": "bm90IGEgcG5n"})
+                    }
+                    "Page.captureScreenshot" => {
+                        json!({"data": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAAAAAAA"})
+                    }
                     _ => json!({}),
                 };
                 let reply = |result: Value| {
@@ -7659,6 +7667,7 @@ fn concurrent_console_clear_and_push_publish_consistent_snapshots() {
                 ..Status::default()
             }),
             console: Mutex::new(vec![ConsoleLog::default(), ConsoleLog::default()]),
+            screenshots: Mutex::new(vec![None, None]),
             notify: Box::new(move || {
                 let shared = weak.upgrade().unwrap();
                 // Callbacks can read both snapshots without deadlocking. The
@@ -8025,5 +8034,166 @@ console.log('probe-done');
             .any(|entry| entry.text == "probe-done"),
         "cleanup preserves displayed history"
     );
+    live.close();
+}
+
+/// Waits for the screenshot result of `device`.
+fn screenshot_of(live: &LiveSession, device: usize) -> (u64, ScreenshotResult) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = live.take_screenshot(device) {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no screenshot result for device {device}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// ADR 0024: a screenshot is taken on request as a checked PNG, with its
+/// token; a reply that is no PNG, no reply within the command limit, a second
+/// request while one is in flight, a hidden device and a page frozen by its
+/// dialog each end with a reason, and none of them counts as unanswered input.
+#[test]
+fn screenshots_are_taken_on_request_checked_and_bounded() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.captureScreenshot" && session == Some("S2")
+    });
+    let live = fake_live(
+        root.path(),
+        Limits {
+            command: Duration::from_secs(1),
+            ..Limits::default()
+        },
+    );
+    assert!(live.send(Command::Screenshot {
+        device: 0,
+        token: 7
+    }));
+    let (token, result) = screenshot_of(&live, 0);
+    let screenshot = result.unwrap();
+    assert_eq!((token, screenshot.width, screenshot.height), (7, 2, 3));
+    assert!(screenshot.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        peer.last_params("Page.captureScreenshot", "S0"),
+        json!({"format": "png", "fromSurface": true, "captureBeyondViewport": false})
+    );
+
+    assert!(live.send(Command::Screenshot {
+        device: 1,
+        token: 8
+    }));
+    assert_eq!(
+        screenshot_of(&live, 1),
+        (8, Err("The browser's screenshot was not a PNG.".into()))
+    );
+
+    // The desktop's reply is held: a second request is refused at once, the
+    // first ends at the command limit, and the page is not "not responding".
+    assert!(live.send(Command::Screenshot {
+        device: 2,
+        token: 9
+    }));
+    wait_for_requests(&peer, "Page.captureScreenshot", "S2", 1);
+    assert!(live.send(Command::Screenshot {
+        device: 2,
+        token: 10
+    }));
+    assert_eq!(
+        screenshot_of(&live, 2),
+        (
+            10,
+            Err("A screenshot of this device is already being taken.".into())
+        )
+    );
+    assert_eq!(
+        screenshot_of(&live, 2),
+        (
+            9,
+            Err("The browser returned no screenshot within 1 seconds.".into())
+        )
+    );
+    assert_eq!(live.status().devices[2].error, None);
+    assert_eq!(peer.count("Page.captureScreenshot", "S2"), 1);
+
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: false
+    }));
+    assert!(live.send(Command::Screenshot {
+        device: 0,
+        token: 11
+    }));
+    assert_eq!(
+        screenshot_of(&live, 0),
+        (11, Err("Show the device to take its screenshot.".into()))
+    );
+
+    peer.event(tablet(
+        "Page.javascriptDialogOpening",
+        json!({"type": "alert", "message": "hi", "url": "http://127.0.0.1:4173/"}),
+    ));
+    wait_for(
+        &live,
+        "the tablet's dialog",
+        Duration::from_secs(2),
+        |status| status.devices[1].dialog.is_some(),
+    );
+    assert!(live.send(Command::Screenshot {
+        device: 1,
+        token: 12
+    }));
+    assert_eq!(
+        screenshot_of(&live, 1),
+        (
+            12,
+            Err("Answer the page's dialog first; the page is frozen until then.".into())
+        )
+    );
+    assert_eq!(peer.count("Page.captureScreenshot", "S0"), 1);
+    assert_eq!(peer.count("Page.captureScreenshot", "S1"), 1);
+    drop(live);
+}
+
+/// ADR 0024 with Helium: each device's screenshot is its CSS viewport at its
+/// device scale, a PNG that decodes.
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_screenshots_show_each_viewport_at_its_scale() {
+    let server = fixture();
+    let live = Live::start(workspace(server.url("/")));
+    live.wait(
+        "frames on every device",
+        Duration::from_secs(30),
+        |status| {
+            status
+                .devices
+                .iter()
+                .all(|device| device.frames > 0 && !device.loading)
+        },
+    );
+    for (device, token) in [(0, 21), (1, 22), (2, 23)] {
+        assert!(live.session().send(Command::Screenshot { device, token }));
+    }
+    for (device, token, size) in [
+        (0, 21, (720, 1280)),
+        (1, 22, (600, 800)),
+        (2, 23, (1000, 700)),
+    ] {
+        let (got, result) = screenshot_of(live.session(), device);
+        assert_eq!(got, token);
+        let screenshot = result.unwrap();
+        assert_eq!(
+            (screenshot.width, screenshot.height),
+            size,
+            "device {device}"
+        );
+        let decoder = png::Decoder::new(std::io::Cursor::new(&screenshot.png));
+        let reader = decoder.read_info().expect("a PNG that decodes");
+        assert_eq!((reader.info().width, reader.info().height), size);
+    }
     live.close();
 }

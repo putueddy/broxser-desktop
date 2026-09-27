@@ -107,7 +107,7 @@ target, recursive iframe auto-attach) measured what the browser reports:
 - A page that floods the console still slows the runtime while its events
   arrive (existing cost, measured above); keeping entries adds no events.
 - Exporting a report (screenshot, device and browser details, console) with
-  redaction and a retention rule is the next part of P2.3.
+  redaction and a retention rule is ADR 0024.
 
 ## Validation
 

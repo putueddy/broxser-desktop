@@ -33,9 +33,10 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Input events, including the coalesced move and wheel in flight, that one
 /// page may leave unanswered before Broxser reports it as not responding.
 const MAX_UNANSWERED_INPUT: usize = 32;
-/// One navigation and one dialog answer plus the unanswered input of every
-/// device, so one stuck device can never exhaust the commands of the others.
-const MAX_PENDING: usize = MAX_DEVICES * (MAX_UNANSWERED_INPUT + 2);
+/// One navigation, one dialog answer and one screenshot plus the unanswered
+/// input of every device, so one stuck device can never exhaust the commands
+/// of the others.
+const MAX_PENDING: usize = MAX_DEVICES * (MAX_UNANSWERED_INPUT + 3);
 /// Device status while its page leaves input unanswered.
 pub(crate) const NOT_RESPONDING: &str =
     "The page is not responding to input. New input is dropped, not sent later.";
@@ -147,6 +148,7 @@ impl LiveSession {
                     .map(|_| ConsoleLog::default())
                     .collect(),
             ),
+            screenshots: Mutex::new(vec![None; workspace.devices.len()]),
             notify: Box::new(notify),
         });
         let cancel = options.cancel.clone();
@@ -181,6 +183,12 @@ impl LiveSession {
 
     pub fn status(&self) -> Status {
         lock(&self.shared.status).clone()
+    }
+
+    /// Takes the result of the latest [`Command::Screenshot`] for `device`,
+    /// with its token, once.
+    pub fn take_screenshot(&self, device: usize) -> Option<(u64, ScreenshotResult)> {
+        lock(&self.shared.screenshots).get_mut(device)?.take()
     }
 
     /// The console entries of `device`, oldest first (ADR 0023). Read it when
@@ -296,6 +304,37 @@ pub struct DownloadState {
     /// The file name the browser derived for it.
     pub filename: String,
     pub url: String,
+}
+
+/// A PNG of one device's viewport at its device scale (ADR 0024).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Screenshot {
+    pub png: Vec<u8>,
+    /// Pixel size of the PNG.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A screenshot, or why there is none, as a sentence for the user.
+pub type ScreenshotResult = std::result::Result<Screenshot, String>;
+
+/// A `Page.captureScreenshot` reply as a checked PNG.
+fn parse_screenshot(response: Value) -> ScreenshotResult {
+    let result =
+        parse_response(response, "Page.captureScreenshot").map_err(|error| format!("{error:#}"))?;
+    let data = result
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or("The browser's screenshot reply had no image.")?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "The browser's screenshot was not valid base64.".to_owned())?;
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("The browser's screenshot was not a PNG.".into());
+    }
+    let (width, height) =
+        crate::capture::png_dimensions(&png).map_err(|error| format!("{error:#}"))?;
+    Ok(Screenshot { png, width, height })
 }
 
 /// An open JavaScript dialog, as the page requested it. `message` and
@@ -440,6 +479,13 @@ pub enum Command {
     /// the runtime stops. Sends nothing to the browser (ADR 0023).
     ClearConsole {
         device: usize,
+    },
+    /// Takes a PNG of the device's viewport at its scale for a bug report
+    /// (ADR 0024); [`LiveSession::take_screenshot`] returns it or the reason
+    /// there is none, with `token`.
+    Screenshot {
+        device: usize,
+        token: u64,
     },
     /// Crashes a renderer so tests can check crash reporting and recovery.
     #[cfg(test)]
@@ -727,6 +773,8 @@ struct Shared {
     /// Per device; kept apart from the status so that status snapshots stay
     /// small (ADR 0023).
     console: Mutex<Vec<ConsoleLog>>,
+    /// Per device: the latest screenshot result and its token (ADR 0024).
+    screenshots: Mutex<Vec<Option<(u64, ScreenshotResult)>>>,
     notify: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -742,6 +790,14 @@ impl Shared {
                 change(device);
             }
         });
+    }
+
+    /// Publishes a screenshot result for the UI to take.
+    fn screenshot(&self, index: usize, token: u64, result: ScreenshotResult) {
+        if let Some(slot) = lock(&self.screenshots).get_mut(index) {
+            *slot = Some((token, result));
+        }
+        (self.notify)();
     }
 
     /// Changes the console of `device` and publishes its counts.
@@ -911,6 +967,8 @@ struct LiveDevice {
     /// A detached/crashed page session accepts no late console objects until
     /// a new main-frame Runtime context proves the renderer is active again.
     console_active: bool,
+    /// The screenshot command in flight, its token and deadline (ADR 0024).
+    screenshot: Option<(u64, u64, Instant)>,
     ime_anchor: Option<u64>,
     ime_blocked_anchor: Option<u64>,
     ime_target: Option<u64>,
@@ -1146,6 +1204,11 @@ enum Pending {
         device: usize,
         token: u64,
     },
+    /// A screenshot the user asked for; its deadline is on the device.
+    Screenshot {
+        device: usize,
+        token: u64,
+    },
 }
 
 impl Pending {
@@ -1156,7 +1219,8 @@ impl Pending {
             | Self::Move { device }
             | Self::Input { device }
             | Self::ImeRead { device }
-            | Self::DialogAnswer { device, .. } => device,
+            | Self::DialogAnswer { device, .. }
+            | Self::Screenshot { device, .. } => device,
         }
     }
 }
@@ -1319,6 +1383,7 @@ impl<'a> Controller<'a> {
                 link_context: None,
                 ime_context: None,
                 main_context: None,
+                screenshot: None,
                 ime_anchor: None,
                 ime_blocked_anchor: None,
                 ime_target: None,
@@ -1533,6 +1598,9 @@ impl<'a> Controller<'a> {
                 }
             }
             Command::SetSync(settings) => self.set_sync(settings)?,
+            Command::Screenshot { device, token } if device < count => {
+                self.screenshot(device, token)?;
+            }
             #[cfg(test)]
             Command::CrashForTest { device } if device < count => {
                 // The crashing renderer may never answer.
@@ -1615,13 +1683,48 @@ impl<'a> Controller<'a> {
         Ok(true)
     }
 
+    /// Asks for a PNG of device `index` for a bug report (ADR 0024). A hidden
+    /// device, a page frozen by its dialog and a second request while one is
+    /// in flight are answered at once with the reason.
+    fn screenshot(&mut self, index: usize, token: u64) -> Result<()> {
+        let device = &self.devices[index];
+        let refused = if !device.visible {
+            Some("Show the device to take its screenshot.")
+        } else if device.dialog.is_some() {
+            Some("Answer the page's dialog first; the page is frozen until then.")
+        } else if device.screenshot.is_some() {
+            Some("A screenshot of this device is already being taken.")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.shared.screenshot(index, token, Err(reason.into()));
+            return Ok(());
+        }
+        let session = device.session.clone();
+        let id = self.cdp.send(
+            "Page.captureScreenshot",
+            json!({"format": "png", "fromSurface": true, "captureBeyondViewport": false}),
+            Some(&session),
+        )?;
+        self.track(
+            id,
+            Pending::Screenshot {
+                device: index,
+                token,
+            },
+        )?;
+        self.devices[index].screenshot = Some((id, token, Instant::now() + self.limits.command));
+        Ok(())
+    }
+
     fn track(&mut self, id: u64, pending: Pending) -> Result<()> {
         if self.pending.len() >= MAX_PENDING {
             bail!("too many unanswered live commands");
         }
         if !matches!(
             pending,
-            Pending::Navigate { .. } | Pending::DialogAnswer { .. }
+            Pending::Navigate { .. } | Pending::DialogAnswer { .. } | Pending::Screenshot { .. }
         ) {
             let device = &mut self.devices[pending.device()];
             device.unanswered += 1;
@@ -1652,7 +1755,11 @@ impl<'a> Controller<'a> {
             .pending
             .iter()
             .filter(|(_, pending)| {
-                pending.device() == index && !matches!(pending, Pending::Navigate { .. })
+                pending.device() == index
+                    && !matches!(
+                        pending,
+                        Pending::Navigate { .. } | Pending::Screenshot { .. }
+                    )
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1870,6 +1977,20 @@ impl<'a> Controller<'a> {
                 "the browser did not answer {method} within {} seconds",
                 self.limits.command.as_secs_f32()
             );
+        }
+        for index in 0..self.devices.len() {
+            if let Some((id, token, deadline)) = self.devices[index].screenshot
+                && now >= deadline
+            {
+                self.devices[index].screenshot = None;
+                self.pending.remove(&id);
+                self.cdp.abandon(id);
+                let error = format!(
+                    "The browser returned no screenshot within {} seconds.",
+                    self.limits.command.as_secs_f32()
+                );
+                self.shared.screenshot(index, token, Err(error));
+            }
         }
         for index in 0..self.devices.len() {
             if self.devices[index].dialog.is_some() {
@@ -2612,6 +2733,11 @@ impl<'a> Controller<'a> {
                 Some(Pending::ImeRead { device }) => {
                     self.answered(device);
                     self.ime_target_read(device, id, response)?;
+                }
+                Some(Pending::Screenshot { device, token }) => {
+                    self.devices[device].screenshot = None;
+                    let screenshot = parse_screenshot(response);
+                    self.shared.screenshot(device, token, screenshot);
                 }
                 Some(Pending::DialogAnswer { device, token }) => {
                     // A dialog that closed meanwhile is no error. One still

@@ -12,7 +12,8 @@
 # atlas race of ADR 0012. Every run must leave no browser process or profile
 # behind, and the window must be gone. The console run clicks a device's error
 # count, clears that device's console in the panel and closes the panel with
-# Ctrl+Shift+J (ADR 0023).
+# Ctrl+Shift+J (ADR 0023); the report run saves a report and checks it
+# (ADR 0024).
 # Needs an X11 display (a desktop session or Xvfb), xdotool, python3,
 # BROXSER_HELIUM_BIN and a built desktop binary. It does not check rendering
 # quality, Wayland, IME, accessibility or a physical GPU.
@@ -1123,7 +1124,7 @@ PY
 # where Clear empties the phone's console only; Ctrl+Shift+J closes the panel.
 # Regions at 50%: the phone card spans x 254-474 without the panel and moves
 # 340 px right with it; the panel's Clear sits at its top right (x 480-570),
-# where nothing else is filled in the accent color.
+# where nothing else is filled in the danger color.
 console_run() {
   local label=$1
   local before app window= failure= found x0 y0 x y code=0 left_processes left_profiles
@@ -1147,7 +1148,7 @@ console_run() {
     else
       read -r _ _ x0 y0 _ _ <<< "$found"
       xdotool mousemove --window "$window" $((x0 + 10)) $((y0 + 5)) click 1
-      if ! found=$(find_color "$window" 480 60 90 80 7ce29b 8 10 filled); then
+      if ! found=$(find_color "$window" 480 60 90 80 e07a7a 8 10 filled); then
         failure="the count did not open the Console panel"
       else
         read -r x y _ <<< "$found"
@@ -1158,7 +1159,7 @@ console_run() {
           failure="Clear removed the tablet's count too"
         else
           xdotool mousemove --window "$window" 900 400 key ctrl+shift+j
-          if ! find_color "$window" 480 60 90 80 7ce29b 8 10 absent,filled >/dev/null; then
+          if ! find_color "$window" 480 60 90 80 e07a7a 8 10 absent,filled >/dev/null; then
             failure="Ctrl+Shift+J did not close the panel"
           elif ! find_color "$window" 250 60 230 760 3b82f6 40 10 >/dev/null; then
             failure="the phone frame did not return after the panel closed"
@@ -1194,6 +1195,10 @@ console_run() {
 # paused and hiding it need not publish any changed status. The panel must
 # still switch from its error to the tablet's warning. After browser exit,
 # Clear must work locally while the desktop's retained console stays readable.
+# The level labels are small anti-aliased text: on Xvfb with Lavapipe the
+# phone's "Error" had 19 pixels within 8 of its color, one short of
+# find_color's 20, and 39 within 32. Presence and absence use the same wider
+# tolerance, so a stale label still counts as present.
 console_selection_run() {
   local label=$1 before app window= failure= browser code=0 left_processes left_profiles
   before=$(wc -l < "$work/requests")
@@ -1210,16 +1215,16 @@ console_selection_run() {
       sleep 0.1
     done
     xdotool key ctrl+shift+j
-    if ! find_color "$window" 240 180 310 280 e07a7a 8 10 >/dev/null; then
+    if ! find_color "$window" 240 180 310 280 e07a7a 32 10 >/dev/null; then
       failure="phone error did not appear in its console"
     else
       # Wheel over the gap between cards scrolls the host canvas, not a page.
       xdotool mousemove --window "$window" 824 500 click --repeat 20 --delay 30 5
       sleep 0.5
       xdotool mousemove --window "$window" 195 261 click 1
-      if ! find_color "$window" 240 180 310 280 e07a7a 8 5 absent >/dev/null; then
+      if ! find_color "$window" 240 180 310 280 e07a7a 32 5 absent >/dev/null; then
         failure="Hide changed the selection but kept the phone's console"
-      elif ! find_color "$window" 240 180 310 280 f2b872 8 5 >/dev/null; then
+      elif ! find_color "$window" 240 180 310 280 f2b872 32 5 >/dev/null; then
         failure="Hide did not show the tablet's warning"
       else
         browser=$(pgrep -P "$app" -f -- "--user-data-dir=$TMPDIR/broxser-cdp-" || true)
@@ -1236,12 +1241,12 @@ console_selection_run() {
             failure="browser did not finish cleanup"
           else
             xdotool mousemove --window "$window" 525 122 click 1
-            if ! find_color "$window" 240 180 310 280 f2b872 8 5 absent >/dev/null; then
+            if ! find_color "$window" 240 180 310 280 f2b872 32 5 absent >/dev/null; then
               failure="Clear left retained messages after the browser exited"
             else
               # The desktop is still inspectable, and another device is intact.
               xdotool mousemove --window "$window" 60 385 click 1
-              if ! find_color "$window" 240 180 310 280 f2b872 8 5 >/dev/null; then
+              if ! find_color "$window" 240 180 310 280 f2b872 32 5 >/dev/null; then
                 failure="Clear removed the other device's retained messages"
               fi
             fi
@@ -1273,6 +1278,98 @@ console_selection_run() {
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Save report in the Console panel (ADR 0024) writes the phone's screenshot
+# and report into a new folder of BROXSER_REPORT_DIR. The page's address and
+# a console message carry a token in their query and fragment; neither may
+# reach the report. Save report is the panel's one accent-filled button,
+# left of the danger-filled Clear.
+report_run() {
+  local label=$1
+  local before app window= failure= found x y code=0 left_processes left_profiles
+  local reports=$work/reports folder=
+  before=$(wc -l < "$work/requests")
+  BROXSER_REPORT_DIR=$reports "$binary" --workspace examples/workspace.json \
+    --url "http://127.0.0.1:$port/console.html?token=smoke-secret#smoke-fragment" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    size_window "$window"
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'console.html?logged' || true) -ge 3 ]] && break
+      sleep 0.1
+    done
+    xdotool mousemove --window "$window" 900 400 key ctrl+shift+j
+    # The panel is open once its Clear shows; only then does the region of
+    # Save report hold no accent card border.
+    if ! find_color "$window" 480 60 90 80 e07a7a 8 10 filled >/dev/null; then
+      failure="Ctrl+Shift+J did not open the Console panel"
+    elif ! found=$(find_color "$window" 380 90 115 60 7ce29b 8 5 filled); then
+      failure="the Console panel showed no Save report"
+    else
+      read -r x y _ <<< "$found"
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      for _ in $(seq 100); do
+        folder=$(find "$reports" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1 || true)
+        [[ -n $folder && -f $folder/report.md && -f $folder/screenshot.png ]] && break
+        sleep 0.1
+      done
+      if [[ -z $folder || ! -f $folder/report.md || ! -f $folder/screenshot.png ]]; then
+        failure="no report was written within 10 s"
+      elif ! failure=$(python3 - "$folder" <<'PY'
+import os, stat, sys
+folder = sys.argv[1]
+png = open(os.path.join(folder, "screenshot.png"), "rb").read()
+report = open(os.path.join(folder, "report.md")).read()
+problems = []
+if png[:8] != b"\x89PNG\r\n\x1a\n" or png[12:16] != b"IHDR":
+    problems.append("the screenshot is no PNG")
+elif (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")) != (390, 844):
+    problems.append("the screenshot is not 390 x 844")
+for wanted in ["- Device: Phone (390 × 844 CSS px at 1×, mobile, touch)", "smoke error on 390",
+               "/console.html\n", "failed at http://127.0.0.1:"]:
+    if wanted not in report:
+        problems.append(f"the report lacks {wanted!r}")
+for secret in ["smoke-secret", "smoke-fragment"]:
+    if secret in report:
+        problems.append(f"the report holds {secret!r}")
+for path, mode in [(folder, 0o700), (os.path.join(folder, "report.md"), 0o600)]:
+    if stat.S_IMODE(os.stat(path).st_mode) != mode:
+        problems.append(f"{os.path.basename(path)} is not mode {mode:o}")
+print("; ".join(problems))
+sys.exit(1 if problems else 0)
+PY
+); then
+        :
+      else
+        failure=
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 900 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-saved a 390 x 844 screenshot and a report without the token}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -1290,4 +1387,5 @@ workspace_run "workspace panel edits a draft and saves it"
 apply_input_run "input right after Apply removed a device"
 console_run "console panel counts and clears one device"
 console_selection_run "console follows selection and clears after browser exit"
+report_run "console panel saves a redacted report"
 echo "desktop smoke passed"
