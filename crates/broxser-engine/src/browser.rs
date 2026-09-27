@@ -108,8 +108,17 @@ impl BrowserProcess {
         if seed {
             seed_profile(profile.path())?;
         }
+        let user_agent = if options.headless {
+            headed_user_agent(&options.executable)
+        } else {
+            None
+        };
         let child = Command::new(&options.executable)
-            .args(launch_args(profile.path(), options.headless))
+            .args(launch_args(
+                profile.path(),
+                options.headless,
+                user_agent.as_deref(),
+            ))
             // Chromium keeps its crash database under the default user data
             // directory (for Helium ~/.config/net.imput.helium), shared with a
             // personal installation. Keep crash data in the private profile.
@@ -239,7 +248,16 @@ impl Drop for BrowserProcess {
     }
 }
 
-fn launch_args(profile: &Path, headless: bool) -> Vec<OsString> {
+/// Headless Chromium detects no pointing device, so every page would see
+/// `(hover: none)` and `(pointer: none)`. These Blink settings restore a mouse
+/// (fine pointer, hover); touch emulation still overrides them on touch
+/// devices (ADR 0019).
+const POINTER_SETTINGS: &str = "--blink-settings=availablePointerTypes=4,primaryPointerType=4,\
+availableHoverTypes=2,primaryHoverType=2";
+/// How long the browser gets to print its version before launch.
+const VERSION_PROBE: Duration = Duration::from_secs(3);
+
+fn launch_args(profile: &Path, headless: bool, user_agent: Option<&str>) -> Vec<OsString> {
     let mut user_data_dir = OsString::from("--user-data-dir=");
     user_data_dir.push(profile);
     let mut args: Vec<OsString> = vec![
@@ -252,8 +270,63 @@ fn launch_args(profile: &Path, headless: bool) -> Vec<OsString> {
     ];
     if headless {
         args.push("--headless=new".into());
+        args.push(POINTER_SETTINGS.into());
+        if let Some(user_agent) = user_agent {
+            args.push(format!("--user-agent={user_agent}").into());
+        }
     }
     args
+}
+
+/// The user agent the same browser sends when a user runs it: headless
+/// Chromium writes `HeadlessChrome/` instead of `Chrome/`, which tells pages
+/// that no user is there (ADR 0019). Asks the executable for its version, with
+/// a bound; `None` when it does not answer, and the browser keeps its own.
+fn headed_user_agent(executable: &Path) -> Option<String> {
+    let mut child = Command::new(executable)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut output).ok();
+        output
+    });
+    let deadline = Instant::now() + VERSION_PROBE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = reader.join().ok()?;
+    let major = major_version(&String::from_utf8_lossy(&output))?;
+    Some(format!(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ))
+}
+
+/// The major version of the last `A.B.C.D` version in a `--version` line: the
+/// Chromium version, which follows the product's own in
+/// `Helium 0.18.1.1 (Chromium 154.0.8037.57)`, or `Chromium 141.0.7390.37`.
+fn major_version(output: &str) -> Option<u32> {
+    output
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .rfind(|part| part.matches('.').count() == 3)?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Keeps browser memory out of kernel core dumps. Renderer memory holds cookies
@@ -691,14 +764,42 @@ mod tests {
     }
 
     #[test]
+    fn headed_user_agent_comes_from_the_browsers_version() {
+        assert_eq!(
+            major_version("Helium 0.18.1.1 (Chromium 154.0.8037.57)"),
+            Some(154)
+        );
+        assert_eq!(major_version("Chromium 141.0.7390.37 \n"), Some(141));
+        assert_eq!(major_version("Google Chrome 140.0.7339.207"), Some(140));
+        assert_eq!(major_version("no version here 1.2"), None);
+        let fake = crate::test_support::fake_browser(crate::test_support::FakeBrowser::NeverReady);
+        assert_eq!(
+            headed_user_agent(&fake).as_deref(),
+            Some(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+            )
+        );
+        assert_eq!(headed_user_agent(Path::new("/nonexistent/browser")), None);
+    }
+
+    #[test]
     fn launch_keeps_sandbox_loopback_and_private_state() {
         let profile = Path::new("/tmp/broxser-cdp-test");
-        let args: Vec<String> = launch_args(profile, true)
+        let args: Vec<String> = launch_args(profile, true, Some("UA"))
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect();
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
         assert!(args.contains(&"--user-data-dir=/tmp/broxser-cdp-test".to_owned()));
+        assert!(args.contains(&"--user-agent=UA".to_owned()));
+        assert!(args.contains(&POINTER_SETTINGS.to_owned()));
+        let headed: Vec<String> = launch_args(profile, false, None)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        assert!(!headed.iter().any(|arg| arg.starts_with("--headless")
+            || arg.starts_with("--user-agent")
+            || arg.starts_with("--blink-settings")));
         assert!(
             !args
                 .iter()

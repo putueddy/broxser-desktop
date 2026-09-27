@@ -255,6 +255,9 @@ otoritatif berikut validasinya berada di
 DPR 0.5–4 yang finite, maksimal 8 device, total maksimum 24 juta piksel fisik.
 Ukuran PNG berbeda dari CSS pixel ketika DPR bukan 1. User agent tidak otomatis
 diubah menjadi iPhone: mobile emulation bukan simulasi Safari maupun hardware.
+Launch headless memakai user agent headed browser yang sama (tanpa penanda
+`HeadlessChrome`) dan pengaturan pointer/hover Blink; device non-mobile mendapat
+layar seukuran viewport (ADR 0019).
 
 Konfigurasi tidak memuat cookies, headers rahasia, token atau profil browser.
 Writer memakai file sementara di direktori yang sama dan rename; import versi baru
@@ -318,9 +321,11 @@ runtime dan `.env`. Tidak ada endpoint analytics aplikasi.
 
 Helium memiliki privacy/filter defaults yang dapat memengaruhi aplikasi uji.
 Blocker bawaannya me-reload tab di context baru sehingga dimatikan di session
-Broxser (ADR 0004); halaman session tidak memakai content blocking. Default lain,
-seperti fingerprint noise, masih perlu dievaluasi sebelum dipakai sebagai browser QA
-utama; headless tidak boleh diasumsikan identik dengan mode interaktif/extension.
+Broxser (ADR 0004); halaman session tidak memakai content blocking. Default lain
+sudah diukur (ADR 0019): canvas dan audio membawa noise per session, WebGL memakai
+SwiftShader tanpa GPU, `deviceMemory` dan kuota storage berbeda dari Chromium;
+hasil mewakili pengguna Helium dengan blocker mati, bukan pengguna Chrome, dan
+headless tidak identik dengan mode interaktif/extension.
 Review lisensi dilakukan sebelum packaging; [NOTICE.md](../NOTICE.md) merangkum
 status tanpa menganggap pemisahan proses menghapus kewajiban distribusi.
 
@@ -388,7 +393,8 @@ yang dihemat dan beban maintenance.
 - Distro, GPU, fractional scaling, accessibility dan aplikasi perusahaan apa yang wajib lulus?
 - Apakah kebutuhan utama preview responsif atau interaksi web lengkap? Gate ini
   menentukan apakah CDP cukup atau perlu investasi embedding terpisah.
-- Apakah Helium filtering/fingerprinting behavior dapat dikonfigurasi agar hasil QA representatif?
+- Helium filtering/fingerprinting behavior: diukur dan sebagian disamakan di ADR 0019; noise
+  canvas/audio per session tetap milik Helium dan blocker tetap mati di session.
 - Bagaimana secret store, persistent session, signed package dan distribusi internal akan dikelola?
 
 ## 12. Decision and next steps

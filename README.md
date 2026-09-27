@@ -119,8 +119,11 @@ prompt yang tidak pernah muncul
 (ADR 0017). Device dengan `touch: true` menerima tekan, seret dan lepas sebagai
 satu titik sentuh (`pointerType` `touch`, `touchstart`, `touchmove`, `touchend`;
 seret menggulir seperti swipe), tanpa hover dan klik kanan; gestur multi-jari
-belum dimodelkan (ADR 0018). Status audit kapabilitas lain ada di
-`docs/validation.md`.
+belum dimodelkan (ADR 0018). Halaman melihat user agent headed browser yang sama,
+device mouse dengan hover dan pointer halus, dan layar seukuran viewport; noise
+canvas/audio Helium, WebGL software tanpa GPU dan blocker yang mati di session
+tetap berbeda dari browser pengguna dan tercatat di ADR 0019. Status audit
+kapabilitas lain ada di `docs/validation.md`.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable
