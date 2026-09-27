@@ -29,14 +29,25 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Input events, including the coalesced move and wheel in flight, that one
 /// page may leave unanswered before Broxser reports it as not responding.
 const MAX_UNANSWERED_INPUT: usize = 32;
-/// One navigation plus the unanswered input of every device, so one stuck
-/// device can never exhaust the commands of the others.
-const MAX_PENDING: usize = MAX_DEVICES * (MAX_UNANSWERED_INPUT + 1);
+/// One navigation and one dialog answer plus the unanswered input of every
+/// device, so one stuck device can never exhaust the commands of the others.
+const MAX_PENDING: usize = MAX_DEVICES * (MAX_UNANSWERED_INPUT + 2);
 /// Device status while its page leaves input unanswered.
 pub(crate) const NOT_RESPONDING: &str =
     "The page is not responding to input. New input is dropped, not sent later.";
 const MAX_LINK_INTENT_BYTES: usize = 8192;
 const LINK_INTENT_WINDOW: Duration = Duration::from_secs(1);
+/// Longest dialog message, prompt default or prompt answer, in characters.
+pub const MAX_DIALOG_CHARS: usize = 2048;
+/// Device status while it has an open dialog and Broxser was asked to navigate it.
+pub(crate) const DIALOG_OPEN: &str =
+    "The page is waiting for an answer to its dialog; navigation was not sent.";
+/// Device status after a prompt answer that Broxser did not send; the dialog
+/// stays open for another answer.
+pub(crate) const PROMPT_REJECTED: &str = "The prompt answer was not sent: it must be at most 2048 characters with no control characters.";
+/// Device status while the page shows a dialog of a kind Broxser cannot show.
+pub(crate) const UNKNOWN_DIALOG: &str =
+    "The page opened a JavaScript dialog Broxser cannot show; reload the device.";
 const LINK_WORLD: &str = "broxser_link_observer";
 const LINK_BINDING: &str = "__broxserTrustedLink";
 const LINK_OBSERVER: &str = r#"(() => {
@@ -206,6 +217,34 @@ pub struct DeviceStatus {
     pub popups: u32,
     /// Current main-frame editable caret. Cleared whenever its target is unsafe.
     pub text_input: Option<TextInputState>,
+    /// A JavaScript dialog the page is waiting on. The page, its frames and
+    /// its input stay blocked until the user answers it (ADR 0014).
+    pub dialog: Option<DialogState>,
+}
+
+/// An open JavaScript dialog, as the page requested it. `message` and
+/// `default_text` are untrusted page text, bounded and shown only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogState {
+    pub kind: DialogKind,
+    pub message: String,
+    /// The prompt's proposed answer, bounded so that it can be sent back
+    /// unchanged: one line (line breaks and tabs become spaces), no other
+    /// control characters, at most [`MAX_DIALOG_CHARS`], cut without a marker.
+    /// Empty for other kinds.
+    pub default_text: String,
+    /// Engine-assigned identity: an answer to a dialog that already closed
+    /// cannot answer the next one.
+    pub token: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogKind {
+    Alert,
+    Confirm,
+    Prompt,
+    /// The page asks whether to leave; accepting continues the navigation.
+    BeforeUnload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -283,6 +322,14 @@ pub enum Command {
         device: usize,
         target: u64,
         action: ImeAction,
+    },
+    /// The user's explicit answer to the device's open dialog. `text` is the
+    /// prompt's answer when accepted. Nothing else ever answers a dialog.
+    AnswerDialog {
+        device: usize,
+        token: u64,
+        accept: bool,
+        text: Option<String>,
     },
     /// Hidden devices stop their screencast and keep no frame.
     SetVisible {
@@ -630,6 +677,9 @@ fn run_worker(
         for device in &mut status.devices {
             device.loading = false;
             device.streaming = false;
+            // No browser is left to show a dialog or take its answer.
+            device.dialog = None;
+            clear_dialog_error(device);
         }
     });
 }
@@ -670,6 +720,7 @@ struct Controller<'a> {
     sync: SyncSettings,
     pending: HashMap<u64, Pending>,
     next_ime_target: u64,
+    next_dialog: u64,
 }
 
 struct LinkIntent {
@@ -739,6 +790,61 @@ struct LiveDevice {
     unresponsive: bool,
     /// The navigation Broxser started that has not committed, failed or stopped.
     navigation: Option<Navigation>,
+    /// The open JavaScript dialog. Input and navigation wait for the user's
+    /// answer; nothing answers it for them (ADR 0014).
+    dialog: Option<OpenDialog>,
+}
+
+#[derive(Clone, Copy)]
+struct OpenDialog {
+    token: u64,
+    kind: DialogKind,
+    /// The user's answer, once sent and unless the browser refuses it.
+    /// `Page.handleJavaScriptDialog` answers whichever dialog the page shows,
+    /// so a second answer could reach the next dialog before this one's
+    /// closing is read.
+    answer: Option<bool>,
+    /// A `beforeunload` question about the navigation Broxser follows rather
+    /// than one the page started.
+    for_navigation: bool,
+}
+
+/// Page text for display: control characters other than line breaks and tabs
+/// are dropped, and text beyond [`MAX_DIALOG_CHARS`] is cut and marked.
+fn dialog_text(text: &str) -> String {
+    let mut kept = text
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'));
+    let mut shown: String = kept.by_ref().take(MAX_DIALOG_CHARS).collect();
+    if kept.next().is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// A prompt's default as an answer the user can send unchanged: line breaks
+/// and tabs become spaces, other control characters are dropped, and it is
+/// cut at [`MAX_DIALOG_CHARS`] without a marker.
+fn prompt_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .take(MAX_DIALOG_CHARS)
+        .collect()
+}
+
+/// Clears a device error that describes a dialog; it ends with the dialog.
+fn clear_dialog_error(status: &mut DeviceStatus) {
+    if status
+        .error
+        .as_deref()
+        .is_some_and(|error| [DIALOG_OPEN, PROMPT_REJECTED, UNKNOWN_DIALOG].contains(&error))
+    {
+        status.error = None;
+    }
 }
 
 /// A navigation Broxser started. It is stopped and reported, never retried,
@@ -756,6 +862,10 @@ struct Navigation {
     /// Its document committed, loading stopped or another loader started before the reply.
     /// A later reload start can still identify this command's own loader.
     settled_before_reply: bool,
+    /// The page asked for a main-frame navigation of its own in the current
+    /// tab since this one was sent; a `beforeunload` question that follows is
+    /// about the page's.
+    page_requested: bool,
     deadline: Instant,
 }
 
@@ -798,6 +908,12 @@ enum Pending {
     ImeRead {
         device: usize,
     },
+    /// The user's answer to dialog `token` of a device. The browser process
+    /// answers it at once; it is no page input and has no deadline.
+    DialogAnswer {
+        device: usize,
+        token: u64,
+    },
 }
 
 impl Pending {
@@ -807,7 +923,8 @@ impl Pending {
             | Self::Wheel { device }
             | Self::Move { device }
             | Self::Input { device }
-            | Self::ImeRead { device } => device,
+            | Self::ImeRead { device }
+            | Self::DialogAnswer { device, .. } => device,
         }
     }
 }
@@ -842,6 +959,7 @@ impl<'a> Controller<'a> {
             sync: SyncSettings::default(),
             pending: HashMap::new(),
             next_ime_target: 0,
+            next_dialog: 0,
         })
     }
 
@@ -941,6 +1059,7 @@ impl<'a> Controller<'a> {
                 waiting_since: None,
                 unresponsive: false,
                 navigation: None,
+                dialog: None,
             });
             self.command(
                 "Runtime.enable",
@@ -976,7 +1095,7 @@ impl<'a> Controller<'a> {
         }
         // Opening the workspace loads its URL once. Restarting is a new explicit action.
         for index in 0..self.devices.len() {
-            self.navigate(index, &workspace.url)?;
+            self.navigate(index, &workspace.url, true)?;
         }
         Ok(())
     }
@@ -1007,7 +1126,7 @@ impl<'a> Controller<'a> {
                     return Ok(());
                 }
                 for index in 0..count {
-                    self.navigate(index, &url)?;
+                    self.navigate(index, &url, true)?;
                 }
             }
             Command::Reload { device } if device < count && self.devices[device].visible => {
@@ -1032,6 +1151,14 @@ impl<'a> Controller<'a> {
             } if device < count => {
                 self.ime(device, target, action)?;
             }
+            Command::AnswerDialog {
+                device,
+                token,
+                accept,
+                text,
+            } if device < count => {
+                self.answer_dialog(device, token, accept, text)?;
+            }
             Command::SetVisible { device, visible } if device < count => {
                 if visible {
                     self.devices[device].visible = true;
@@ -1041,13 +1168,7 @@ impl<'a> Controller<'a> {
                         Some(&self.devices[device].session.clone()),
                     )?;
                     self.start_stream(device)?;
-                    if let Some(context) = self.devices[device].ime_context {
-                        self.cdp.send_detached(
-                            "Runtime.evaluate",
-                            json!({"expression":"globalThis.__broxserImeRefresh?.()", "contextId":context, "silent":true}),
-                            Some(&self.devices[device].session.clone()),
-                        )?;
-                    }
+                    self.refresh_ime(device)?;
                 } else {
                     self.clear_ime(device, true)?;
                     self.devices[device].visible = false;
@@ -1104,20 +1225,35 @@ impl<'a> Controller<'a> {
         Ok(())
     }
 
-    fn navigate(&mut self, index: usize, url: &str) -> Result<()> {
-        let device = &mut self.devices[index];
-        device.wheel = None;
-        device.pointer_move = None;
-        device.link_intent = None;
-        device.requested_link = None;
-        device.link_navigation = None;
-        self.start_navigation(index, "Page.navigate", json!({"url": url}))
+    /// Navigates device `index` for Go, workspace open or link sync. A sent
+    /// navigation supersedes the link the device follows, and so does an
+    /// explicit one that an open dialog refuses (ADR 0013); a refused synced
+    /// link leaves the device's own link to commit and sync.
+    fn navigate(&mut self, index: usize, url: &str, explicit: bool) -> Result<()> {
+        let sent = self.start_navigation(index, "Page.navigate", json!({"url": url}))?;
+        if sent || explicit {
+            let device = &mut self.devices[index];
+            device.wheel = None;
+            device.pointer_move = None;
+            device.link_intent = None;
+            device.requested_link = None;
+            device.link_navigation = None;
+        }
+        Ok(())
     }
 
     /// Sends a navigation of `index` and replaces the one it may still follow:
     /// the browser cancels that navigation, and its late answer must not
-    /// describe this one.
-    fn start_navigation(&mut self, index: usize, method: &str, params: Value) -> Result<()> {
+    /// describe this one. Returns whether it was sent; a device with an open
+    /// dialog keeps its state.
+    fn start_navigation(&mut self, index: usize, method: &str, params: Value) -> Result<bool> {
+        if self.devices[index].dialog.is_some() {
+            // Navigating would answer the dialog for the user: Chromium
+            // cancels an alert, confirm or prompt when a navigation starts.
+            self.shared
+                .device(index, |device| device.error = Some(DIALOG_OPEN.to_owned()));
+            return Ok(false);
+        }
         self.clear_ime(index, true)?;
         // Input held for the current document never reaches the next one.
         self.devices[index].held_input.clear();
@@ -1130,6 +1266,7 @@ impl<'a> Controller<'a> {
             reload: method == "Page.reload",
             reload_loader: None,
             settled_before_reply: false,
+            page_requested: false,
             deadline: Instant::now() + self.limits.load,
         });
         let unresponsive = self.devices[index].unresponsive;
@@ -1137,14 +1274,17 @@ impl<'a> Controller<'a> {
             device.loading = true;
             device.error = unresponsive.then(|| NOT_RESPONDING.to_owned());
         });
-        Ok(())
+        Ok(true)
     }
 
     fn track(&mut self, id: u64, pending: Pending) -> Result<()> {
         if self.pending.len() >= MAX_PENDING {
             bail!("too many unanswered live commands");
         }
-        if !matches!(pending, Pending::Navigate { .. }) {
+        if !matches!(
+            pending,
+            Pending::Navigate { .. } | Pending::DialogAnswer { .. }
+        ) {
             let device = &mut self.devices[pending.device()];
             device.unanswered += 1;
             device.waiting_since.get_or_insert_with(Instant::now);
@@ -1165,8 +1305,9 @@ impl<'a> Controller<'a> {
         }
     }
 
-    /// Stops waiting for the input that device `index` has not answered; late
-    /// answers are discarded. Nothing is sent again.
+    /// Stops waiting for the input that device `index` has not answered and
+    /// for the reply to its dialog answer; late answers are discarded. Nothing
+    /// is sent again.
     fn forget_input(&mut self, index: usize) {
         let forgotten: Vec<u64> = self
             .pending
@@ -1207,7 +1348,9 @@ impl<'a> Controller<'a> {
     /// dropped, never queued or sent later.
     fn input_allowed(&mut self, index: usize) -> bool {
         let device = &self.devices[index];
-        if !device.visible || device.unresponsive {
+        // Chromium holds pointer input while a dialog is open and delivers it
+        // when the dialog closes, out of context; keys it drops (ADR 0014).
+        if !device.visible || device.unresponsive || device.dialog.is_some() {
             return false;
         }
         if device.unanswered >= MAX_UNANSWERED_INPUT {
@@ -1219,8 +1362,9 @@ impl<'a> Controller<'a> {
 
     /// Reports that the page of device `index` leaves input unanswered, and
     /// drops its coalesced move and wheel and the input held behind an IME
-    /// action. An error already shown, such as an open dialog or a crash,
-    /// explains more and stays.
+    /// action. An error already shown, such as a failed navigation, explains
+    /// more and stays. An open dialog is no sign of a page that stopped
+    /// responding; it pauses this check instead (ADR 0014).
     fn set_unresponsive(&mut self, index: usize) {
         self.invalidate_ime(index);
         let device = &mut self.devices[index];
@@ -1233,6 +1377,96 @@ impl<'a> Controller<'a> {
                 .error
                 .get_or_insert_with(|| NOT_RESPONDING.to_owned());
         });
+    }
+
+    /// Sends the user's answer to the open dialog of device `index`, if `token`
+    /// still names it and it has no answer yet. The dialog stays until the
+    /// browser reports it closed. A prompt answer that is too long or holds
+    /// control characters is not sent, and the dialog waits for another, as
+    /// it does after an answer that the browser refuses.
+    fn answer_dialog(
+        &mut self,
+        index: usize,
+        token: u64,
+        accept: bool,
+        text: Option<String>,
+    ) -> Result<()> {
+        let Some(dialog) = self.devices[index]
+            .dialog
+            .filter(|dialog| dialog.token == token && dialog.answer.is_none())
+        else {
+            return Ok(());
+        };
+        let mut params = json!({"accept": accept});
+        if accept
+            && dialog.kind == DialogKind::Prompt
+            && let Some(text) = text
+        {
+            if text.chars().count() > MAX_DIALOG_CHARS || text.chars().any(char::is_control) {
+                self.shared.device(index, |device| {
+                    device.error = Some(PROMPT_REJECTED.to_owned());
+                });
+                return Ok(());
+            }
+            params["promptText"] = json!(text);
+        }
+        let session = self.devices[index].session.clone();
+        // The browser process answers at once; `Page.javascriptDialogClosed`
+        // is the confirmation.
+        let id = self
+            .cdp
+            .send("Page.handleJavaScriptDialog", params, Some(&session))?;
+        self.track(
+            id,
+            Pending::DialogAnswer {
+                device: index,
+                token,
+            },
+        )?;
+        if let Some(dialog) = &mut self.devices[index].dialog {
+            dialog.answer = Some(accept);
+        }
+        self.shared.device(index, |device| {
+            if device.error.as_deref() == Some(PROMPT_REJECTED) {
+                device.error = None;
+            }
+        });
+        Ok(())
+    }
+
+    /// A dialog of device `index` closed, through the user's answer or the
+    /// page itself. Input is accepted again and the paused deadlines resume.
+    fn dialog_closed(&mut self, index: usize, accepted: bool) -> Result<()> {
+        let dialog = self.devices[index].dialog.take();
+        // Staying ends the navigation that Broxser asked about: its
+        // net::ERR_ABORTED is the user's choice, not a failure. A question
+        // about the page's own navigation leaves Broxser's navigation running.
+        let stayed = dialog.is_some_and(|dialog| {
+            dialog.kind == DialogKind::BeforeUnload && dialog.for_navigation && !accepted
+        });
+        if dialog.is_some() {
+            let now = Instant::now();
+            let device = &mut self.devices[index];
+            device.waiting_since = (device.unanswered > 0).then_some(now);
+            if let Some(navigation) = &mut device.navigation {
+                navigation.deadline = now + self.limits.load;
+            }
+        }
+        if stayed {
+            self.forget_navigation(index);
+        }
+        self.shared.device(index, |status| {
+            status.dialog = None;
+            clear_dialog_error(status);
+            if stayed {
+                status.loading = false;
+            }
+        });
+        if dialog.is_some() {
+            // The dialog dropped the caret; the observer reports it again.
+            self.refresh_ime(index)?;
+        }
+        Ok(())
     }
 
     /// The page of device `index` answered an input event, so it responds.
@@ -1264,6 +1498,11 @@ impl<'a> Controller<'a> {
             );
         }
         for index in 0..self.devices.len() {
+            if self.devices[index].dialog.is_some() {
+                // The page waits for the user, not for the network or a
+                // script; its deadlines resume when the dialog closes.
+                continue;
+            }
             if self.devices[index]
                 .navigation
                 .as_ref()
@@ -1620,6 +1859,27 @@ impl<'a> Controller<'a> {
         }
     }
 
+    /// Asks the IME observer of visible device `index` to report its caret
+    /// again. The page's renderer answers `Runtime.evaluate` and holds it
+    /// while a dialog is open, a script runs or a navigation waits for its
+    /// server, so it has no answer deadline: ADR 0008 keeps those for commands
+    /// that the browser process answers. A late report is checked as usual.
+    fn refresh_ime(&mut self, index: usize) -> Result<()> {
+        let device = &self.devices[index];
+        if let Some(context) = device.ime_context
+            && device.visible
+            && device.dialog.is_none()
+        {
+            let session = device.session.clone();
+            self.cdp.send_ignored(
+                "Runtime.evaluate",
+                json!({"expression":"globalThis.__broxserImeRefresh?.()", "contextId":context, "silent":true}),
+                Some(&session),
+            )?;
+        }
+        Ok(())
+    }
+
     fn clear_ime(&mut self, index: usize, cancel: bool) -> Result<()> {
         if cancel && self.devices[index].composing && self.input_allowed(index) {
             let session = self.devices[index].session.clone();
@@ -1770,13 +2030,27 @@ impl<'a> Controller<'a> {
             };
             match self.pending.remove(&id) {
                 Some(Pending::Navigate { device }) => {
-                    let error = match parse_response(response, "Page.navigate") {
+                    let mut error = match parse_response(response, "Page.navigate") {
                         Ok(result) => result
                             .get("errorText")
                             .and_then(Value::as_str)
                             .map(|error| format!("Navigation failed: {error}; not retried")),
                         Err(error) => Some(format!("{error:#}")),
                     };
+                    if self.devices[device].dialog.is_some_and(|dialog| {
+                        dialog.kind == DialogKind::BeforeUnload
+                            && dialog.for_navigation
+                            && dialog.answer == Some(false)
+                    }) && error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("ERR_ABORTED"))
+                    {
+                        // The page asked whether to leave for this navigation and
+                        // the user stayed; the browser can report that before the
+                        // dialog's closing.
+                        error = None;
+                        self.shared.device(device, |status| status.loading = false);
+                    }
                     let navigation = &mut self.devices[device].navigation;
                     let settled_before_reply = navigation
                         .as_ref()
@@ -1813,6 +2087,20 @@ impl<'a> Controller<'a> {
                 Some(Pending::ImeRead { device }) => {
                     self.answered(device);
                     self.ime_target_read(device, id, response)?;
+                }
+                Some(Pending::DialogAnswer { device, token }) => {
+                    // A dialog that closed meanwhile is no error. One still
+                    // open was not answered and waits for another answer.
+                    if response.get("error").is_some()
+                        && let Some(dialog) = &mut self.devices[device].dialog
+                        && dialog.token == token
+                    {
+                        dialog.answer = None;
+                        if let Some(error) = error_message(&response) {
+                            self.shared
+                                .update(|status| status.protocol_error = Some(error));
+                        }
+                    }
                 }
                 None => {}
             }
@@ -1860,9 +2148,11 @@ impl<'a> Controller<'a> {
                     self.forget_navigation(index);
                     self.invalidate_ime(index);
                     self.devices[index].streaming = false;
+                    self.devices[index].dialog = None;
                     self.shared.device(index, |device| {
                         device.loading = false;
                         device.streaming = false;
+                        device.dialog = None;
                         device.error = Some(if crashed {
                             "The page crashed. Reload the device to start a new renderer.".into()
                         } else {
@@ -2039,13 +2329,18 @@ impl<'a> Controller<'a> {
             {
                 self.clear_ime(index, true)?;
                 let sync_navigation = self.sync.navigation;
+                // A new tab, a new window or a download leaves the page as it is.
+                let current_tab = text("disposition").is_none_or(|value| value == "currentTab");
                 let device = &mut self.devices[index];
+                if current_tab && let Some(navigation) = &mut device.navigation {
+                    navigation.page_requested = true;
+                }
                 let url = text("url");
                 device.requested_link = device.link_intent.as_ref().and_then(|intent| {
                     (sync_navigation
                         && device.visible
                         && text("reason") == Some("anchorClick")
-                        && text("disposition").is_none_or(|value| value == "currentTab")
+                        && current_tab
                         && url == Some(intent.url.as_str())
                         && intent.generation == device.generation
                         && intent.at.elapsed() <= LINK_INTENT_WINDOW)
@@ -2168,9 +2463,11 @@ impl<'a> Controller<'a> {
                     field("url").unwrap_or_default(),
                     field("urlFragment").unwrap_or_default()
                 );
-                // A new document answers input again; the old one's is moot.
+                // A new document answers input again; the old one's is moot,
+                // and so is a dialog of the old one.
                 self.forget_input(index);
                 self.invalidate_ime(index);
+                self.devices[index].dialog = None;
                 let matches_reload =
                     self.devices[index]
                         .navigation
@@ -2211,6 +2508,7 @@ impl<'a> Controller<'a> {
                 self.shared.device(index, |device| {
                     device.url = url;
                     device.error = None;
+                    device.dialog = None;
                 });
                 if self.sync.navigation
                     && self.devices[index].visible
@@ -2220,12 +2518,68 @@ impl<'a> Controller<'a> {
                 }
             }
             "Page.javascriptDialogOpening" => {
-                self.shared.device(index, |device| {
-                    device.error = Some(
-                        "The page opened a JavaScript dialog, which Broxser cannot show yet."
-                            .into(),
-                    )
+                let kind = match text("type") {
+                    Some("alert") => DialogKind::Alert,
+                    Some("confirm") => DialogKind::Confirm,
+                    Some("prompt") => DialogKind::Prompt,
+                    Some("beforeunload") => DialogKind::BeforeUnload,
+                    _ => {
+                        // Broxser has no answer to offer. It does not block
+                        // input or navigation; Reload cancels the dialog.
+                        self.shared.device(index, |device| {
+                            device.error = Some(UNKNOWN_DIALOG.to_owned());
+                        });
+                        return Ok(());
+                    }
+                };
+                self.next_dialog = self
+                    .next_dialog
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("dialog token exhausted"))?;
+                let token = self.next_dialog;
+                let state = DialogState {
+                    kind,
+                    message: dialog_text(text("message").unwrap_or_default()),
+                    default_text: if kind == DialogKind::Prompt {
+                        prompt_text(text("defaultPrompt").unwrap_or_default())
+                    } else {
+                        String::new()
+                    },
+                    token,
+                };
+                // Helium reports the page's own navigation request (a link, a
+                // script, location.reload()) before that navigation asks, and a
+                // history navigation of the page cancels Broxser's navigation
+                // before it asks. A page navigation reported neither way, or
+                // requested just before Broxser's was sent, is taken for Broxser's.
+                let for_navigation = kind == DialogKind::BeforeUnload
+                    && self.devices[index]
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|navigation| !navigation.page_requested);
+                let device = &mut self.devices[index];
+                device.dialog = Some(OpenDialog {
+                    token,
+                    kind,
+                    answer: None,
+                    for_navigation,
                 });
+                // The page stops until the user answers: input held for it
+                // would arrive out of context.
+                device.pointer_move = None;
+                device.wheel = None;
+                device.held_input.clear();
+                device.waiting_since = None;
+                // So would a composition cancel, which the page would hold as
+                // well; it deletes the selection if no composition is left by
+                // then. The composition and the caret are dropped unsent.
+                self.invalidate_ime(index);
+                self.shared
+                    .device(index, |device| device.dialog = Some(state));
+            }
+            "Page.javascriptDialogClosed" => {
+                let accepted = params.get("result").and_then(Value::as_bool) == Some(true);
+                self.dialog_closed(index, accepted)?;
             }
             _ => {}
         }
@@ -2300,7 +2654,7 @@ impl<'a> Controller<'a> {
                 &delivery.event.action,
             ) && self.devices[target].visible
             {
-                self.navigate(target, url)?;
+                self.navigate(target, url, false)?;
             }
         }
         Ok(())

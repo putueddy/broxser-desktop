@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broxser dialog fixture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #ffffff; font: 16px sans-serif; }
+  /* One button fills the viewport, so a click anywhere in the frame opens the dialog. */
+  #ask { position: absolute; inset: 0; border: 0; background: #3b82f6; color: #fff; font: inherit; }
+  #result { position: absolute; left: 8px; bottom: 8px; color: #fff; }
+</style>
+</head>
+<body>
+<button id="ask">Ask</button>
+<div id="result"></div>
+<script>
+  // The smoke check reads the outcome from the fixture server's request log.
+  document.getElementById('ask').addEventListener('click', () => {
+    const answer = window.confirm('Continue with the smoke check?');
+    document.getElementById('result').textContent = 'confirm=' + answer;
+    fetch('/event?dialog=' + answer);
+  });
+</script>
+</body>
+</html>

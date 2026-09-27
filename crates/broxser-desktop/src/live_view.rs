@@ -10,17 +10,18 @@ use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE,
 use anyhow::{Context as _, Result};
 use broxser_core::{Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, Frame, ImeAction, KeyInput, LiveSession,
-    MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent, PointerKind,
-    RuntimeState, Status, SyncSettings, is_paste_key, paste_text, to_viewport,
+    BrowserOptions, Cancellation, Command, DialogKind, DialogState, Frame, ImeAction, KeyInput,
+    LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton,
+    PointerEvent, PointerKind, RuntimeState, Status, SyncSettings, is_paste_key, paste_text,
+    to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, Bounds, Context, Corners, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString, Subscription,
-    UTF16Selection, Window, canvas, div, prelude::*, px, rgb,
+    FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString,
+    Subscription, UTF16Selection, Window, canvas, div, prelude::*, px, rgb,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// UI pixels per wheel line when the platform reports lines instead of pixels.
 const WHEEL_LINE: f32 = 40.0;
+/// Widest dialog panel, in UI pixels. It starts at the frame's left edge and
+/// the canvas does not scroll sideways, so the panel of a wide device stays
+/// readable in a half-width window.
+const DIALOG_WIDTH: f32 = 360.0;
 
 pub(crate) struct LiveView {
     workspace: Workspace,
@@ -111,6 +116,13 @@ impl PressedKeys {
             .any(|down| down.identity == identity && down.repeating)
     }
 
+    /// Whether the latest key-down in the window was an auto-repeat.
+    fn latest_repeats(&self) -> bool {
+        self.latest
+            .as_deref()
+            .is_some_and(|identity| self.repeating(identity))
+    }
+
     /// Removes and returns the press a key-up ends: the key down under the
     /// same name, or else the most recently pressed key that can be released
     /// under another name, such as `/` released as `7` on a German layout
@@ -143,6 +155,32 @@ struct DeviceView {
     /// Held buttons as a CDP bitmask, and the last mapped pointer position.
     buttons: u8,
     last_point: Option<(f64, f64)>,
+    /// Text field of the open prompt dialog; it lives while that dialog does.
+    prompt: Option<PromptField>,
+}
+
+struct PromptField {
+    token: u64,
+    input: Entity<UrlInput>,
+    focus: FocusHandle,
+    /// Invalidates a stale canvas IME mark when this field takes focus, by
+    /// the auto-focus after it is created or by a later click: the field is
+    /// a descendant of the canvas's own focus handle, so neither counts as
+    /// leaving it and the usual focus-out handling never sees the change.
+    _focus_in: Subscription,
+    /// Enter in the field accepts the prompt with its text, Escape cancels it.
+    _events: Subscription,
+}
+
+/// Where keyboard focus is, as far as the device canvas is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyFocus {
+    /// The canvas itself: keys go to the selected page.
+    Canvas,
+    /// The text field of device `index`'s prompt dialog, inside the canvas.
+    Prompt(usize),
+    /// The URL bar, or nothing.
+    Elsewhere,
 }
 
 /// Whether the last paint showed part of a device frame in the scrolled canvas,
@@ -185,9 +223,10 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let url = cx.new(|cx| UrlInput::new(workspace.url.clone(), cx));
+        let url = cx.new(|cx| UrlInput::new(workspace.url.clone(), None, cx));
         let url_events = cx.subscribe_in(&url, window, |view, _, event, window, cx| match event {
-            UrlEvent::Submit(text) => view.navigate(text, window, cx),
+            UrlEvent::Submit(text) => view.navigate(text.trim(), window, cx),
+            UrlEvent::Cancel => window.blur(),
         });
         let focus = cx.focus_handle();
         focus.focus(window);
@@ -361,6 +400,7 @@ impl LiveView {
                     .update(cx, |input, cx| input.show(&url, window, cx));
             }
             self.status = status;
+            self.sync_prompts(window, cx);
             if former_caret != next_caret {
                 window.invalidate_character_coordinates();
             }
@@ -428,6 +468,215 @@ impl LiveView {
         accepted
     }
 
+    /// Gives each open prompt dialog a text field prefilled with the page's
+    /// proposal, and drops the field once its dialog is gone or the runtime no
+    /// longer runs. Focus moves as [`focus_after_prompt_change`] decides.
+    fn sync_prompts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let held = self.session.is_some();
+        for index in 0..self.devices.len() {
+            let dialog = open_dialog(&self.status, held, index)
+                .filter(|dialog| dialog.kind == DialogKind::Prompt);
+            let current = self.devices[index].prompt.as_ref().map(|field| field.token);
+            if dialog.map(|dialog| dialog.token) == current {
+                continue;
+            }
+            // Only a token actually changing is worth building the default
+            // text for: up to MAX_DIALOG_CHARS, redone on every status change
+            // otherwise, though the dialog usually just stays open unchanged.
+            let prompt = dialog.map(|dialog| (dialog.token, prompt_default(&dialog.default_text)));
+            let focus = self.key_focus(window);
+            let field =
+                prompt.map(|(token, text)| Self::prompt_field(index, token, text, window, cx));
+            let next = focus_after_prompt_change(index, self.selected, focus, field.is_some());
+            self.devices[index].prompt = field;
+            match next {
+                Some(KeyFocus::Canvas) => self.focus.focus(window),
+                Some(KeyFocus::Prompt(_)) => {
+                    if let Some(field) = &self.devices[index].prompt {
+                        // As a click into it would: typing replaces the proposal.
+                        field
+                            .input
+                            .update(cx, |input, cx| input.focus_all(window, cx));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The text field of prompt `token` of device `index`. Enter answers with
+    /// its text and Escape cancels; either returns keys to the canvas.
+    fn prompt_field(
+        index: usize,
+        token: u64,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PromptField {
+        let input = cx.new(|cx| UrlInput::new(text, Some(MAX_DIALOG_CHARS), cx));
+        let focus = input.focus_handle(cx);
+        let focus_in = cx.on_focus_in(&focus, window, |view, _, _| view.invalidate_ime());
+        let events = cx.subscribe_in(&input, window, move |view, field, event, window, cx| {
+            // The auto-repeat of a key pressed elsewhere, such as the Enter
+            // that answered the previous prompt, answers nothing; LineEdit::key
+            // already cleared select-all as if this key would submit the
+            // field, so put it back rather than leave typing append instead
+            // of replace.
+            if view.pressed.latest_repeats() {
+                field.update(cx, |input, cx| input.restore_select_all(cx));
+                return;
+            }
+            view.answer(field_answer(index, token, event), cx);
+            // The field stays until the browser reports the dialog closed;
+            // shortcuts and key releases must not wait for that.
+            view.focus.focus(window);
+        });
+        PromptField {
+            token,
+            input,
+            focus,
+            _focus_in: focus_in,
+            _events: events,
+        }
+    }
+
+    /// Drops every prompt field; focus in one returns to the canvas.
+    fn clear_prompts(&mut self, window: &mut Window) {
+        if matches!(self.key_focus(window), KeyFocus::Prompt(_)) {
+            self.focus.focus(window);
+        }
+        for device in &mut self.devices {
+            device.prompt = None;
+        }
+    }
+
+    fn key_focus(&self, window: &Window) -> KeyFocus {
+        if self.focus.is_focused(window) {
+            return KeyFocus::Canvas;
+        }
+        self.devices
+            .iter()
+            .position(|device| {
+                device
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|field| field.focus.is_focused(window))
+            })
+            .map_or(KeyFocus::Elsewhere, KeyFocus::Prompt)
+    }
+
+    /// A dialog button's answer to the dialog `token` of device `index`. An
+    /// accepted prompt takes its field's text exactly as typed.
+    fn answer_dialog(&mut self, index: usize, token: u64, accept: bool, cx: &mut Context<Self>) {
+        let text = self
+            .devices
+            .get(index)
+            .and_then(|device| device.prompt.as_ref())
+            .filter(|field| accept && field.token == token)
+            .map(|field| field.input.read(cx).text().to_owned());
+        self.answer(
+            Command::AnswerDialog {
+                device: index,
+                token,
+                accept,
+                text,
+            },
+            cx,
+        );
+    }
+
+    /// Sends the user's answer to a dialog; nothing else answers one.
+    fn answer(&mut self, command: Command, cx: &mut Context<Self>) {
+        self.notice = None;
+        self.send(command);
+        cx.notify();
+    }
+
+    /// The device's open dialog. Only these buttons, or Enter and Escape in the
+    /// prompt's field, answer it (ADR 0014).
+    fn dialog_panel(
+        &self,
+        index: usize,
+        dialog: &DialogState,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let token = dialog.token;
+        let (title, message): (&str, SharedString) = match dialog.kind {
+            DialogKind::Alert => ("The page says", dialog.message.clone().into()),
+            DialogKind::Confirm => ("The page asks", dialog.message.clone().into()),
+            DialogKind::Prompt => ("The page asks for text", dialog.message.clone().into()),
+            DialogKind::BeforeUnload => (
+                "Leave this page?",
+                "The page may have changes you have not saved.".into(),
+            ),
+        };
+        let button = |id: &'static str, label: &'static str, accept: bool, primary: bool| {
+            div()
+                .id((id, index))
+                .cursor_pointer()
+                .rounded_md()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .bg(rgb(if primary { ACCENT } else { RAISED }))
+                .text_color(rgb(if primary { BG } else { TEXT }))
+                .child(label)
+                .on_click(
+                    cx.listener(move |view, _, _, cx| view.answer_dialog(index, token, accept, cx)),
+                )
+        };
+        let buttons = match dialog.kind {
+            DialogKind::Alert => vec![button("dialog-ok", "OK", true, true)],
+            DialogKind::Confirm | DialogKind::Prompt => vec![
+                button("dialog-cancel", "Cancel", false, false),
+                button("dialog-ok", "OK", true, true),
+            ],
+            DialogKind::BeforeUnload => vec![
+                button("dialog-stay", "Stay", false, true),
+                button("dialog-leave", "Leave", true, false),
+            ],
+        };
+        let field = self.devices[index]
+            .prompt
+            .as_ref()
+            .filter(|field| field.token == token)
+            .map(|field| field.input.clone());
+        div()
+            .w(px(width))
+            .mb_3()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(WARN))
+            .bg(rgb(SURFACE))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(WARN))
+                    .child(title),
+            )
+            .child(
+                // Scrolls: a long message, and the cut mark of one the engine
+                // shortened, stay readable.
+                div()
+                    .id(("dialog-message", token))
+                    .text_sm()
+                    .max_h(px(120.))
+                    .overflow_y_scroll()
+                    .child(message),
+            )
+            .when_some(field, |this, field| this.child(field))
+            // At the panel's left edge the answers stay in the canvas, which
+            // does not scroll sideways, whatever the window width.
+            .child(div().flex().gap_2().children(buttons))
+            .into_any_element()
+    }
+
     fn navigate(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let url = if text.contains("://") {
             text.to_owned()
@@ -491,6 +740,11 @@ impl LiveView {
             visible,
         }) {
             return;
+        }
+        // A hidden card's prompt field is not drawn; focus in it would leave
+        // shortcuts and key releases without a receiver.
+        if !visible && self.key_focus(window) == KeyFocus::Prompt(index) {
+            self.focus.focus(window);
         }
         let device = &mut self.devices[index];
         device.hidden = !visible;
@@ -668,6 +922,7 @@ impl LiveView {
         }
         // Nothing of the previous runtime is shown while it stops.
         self.status = Status::default();
+        self.clear_prompts(window);
         self.notice = None;
         match self.session.take() {
             Some(previous) => self.stop_then_continue(previous, window, cx),
@@ -718,6 +973,7 @@ impl LiveView {
         if request == CloseRequest::Stop
             && let Some(session) = self.session.take()
         {
+            self.clear_prompts(window);
             self.stop_then_continue(session, window, cx);
         }
         false
@@ -904,11 +1160,14 @@ impl LiveView {
     /// Every key-down in the window, before shortcuts and elements see it.
     fn record_press(&mut self, keystroke: &Keystroke) {
         if let Some((key, identity)) = key_input(keystroke, true) {
+            // Its release ends the press, unless the IME composition takes
+            // the key-down in the canvas; key_down forgets the press then.
+            self.ignored_ime_keys.remove(&identity);
             self.pressed.press(identity, &key);
         }
     }
 
-    /// A key-down in the device canvas.
+    /// A key-down in the device canvas, or one that a field inside it left.
     fn key_down(
         &mut self,
         keystroke: &Keystroke,
@@ -919,47 +1178,49 @@ impl LiveView {
         let Some((key, identity)) = key_input(keystroke, true) else {
             return;
         };
-        if self.ime.has_mark()
+        let composing = self.ime.has_mark()
             && !keystroke.modifiers.control
             && !keystroke.modifiers.alt
-            && !keystroke.modifiers.platform
-        {
-            self.pressed.forget(&identity);
-            self.ignored_ime_keys.insert(identity);
-            // GPUI/XKB can report the composed character as a key-down after
-            // invoking preedit. It belongs to the composition, not raw CDP keys.
-            if let Some(text) = keystroke.key_char.as_deref() {
-                self.commit_ime(text, window);
-            }
-            return;
-        }
-        self.ignored_ime_keys.remove(&identity);
+            && !keystroke.modifiers.platform;
         let repeat = is_held || self.pressed.repeating(&identity);
-        if is_paste_key(&key) {
-            if !repeat {
-                self.paste(cx);
-            }
-            return;
-        }
-        let Some(device) = key_down_target(
-            self.selected,
-            |index| self.devices.get(index).is_some_and(|device| !device.hidden),
+        let target = self
+            .selected
+            .filter(|&index| self.devices.get(index).is_some_and(|device| !device.hidden));
+        match canvas_key(
+            self.key_focus(window),
+            composing,
+            &key,
             &identity,
             repeat,
+            target,
             &self.held_keys,
-        ) else {
-            return;
-        };
-        if self.send(Command::Key {
-            device,
-            key: key.clone(),
-        }) {
-            self.held_keys.insert(identity, (device, key));
+        ) {
+            CanvasKey::Drop => {}
+            CanvasKey::Compose => {
+                self.pressed.forget(&identity);
+                self.ignored_ime_keys.insert(identity);
+                // GPUI/XKB can report the composed character as a key-down after
+                // invoking preedit. It belongs to the composition, not raw CDP keys.
+                if let Some(text) = keystroke.key_char.as_deref() {
+                    self.commit_ime(text, window);
+                }
+            }
+            CanvasKey::Paste => self.paste(cx),
+            CanvasKey::Send(device) => {
+                if self.send(Command::Key {
+                    device,
+                    key: key.clone(),
+                }) {
+                    self.held_keys.insert(identity, (device, key));
+                }
+            }
         }
     }
 
     /// A key-up anywhere in the window: it is observed on the window root,
-    /// even if focus moved to the URL bar after the press.
+    /// even if focus moved to the URL bar or a prompt field after the press.
+    /// Every release ends its press, and a page gets a key-up only for a key
+    /// whose key-down it received.
     fn key_up(&mut self, keystroke: &Keystroke) {
         let Some((_, identity)) = key_input(keystroke, false) else {
             return;
@@ -1086,6 +1347,13 @@ impl LiveView {
                             .text_color(rgb(if status.error.is_some() { WARN } else { MUTED }))
                             .child(state),
                     ),
+            )
+            .when_some(
+                open_dialog(&self.status, self.session.is_some(), index).cloned(),
+                |this, dialog| {
+                    let panel = width.clamp(180., DIALOG_WIDTH);
+                    this.child(self.dialog_panel(index, &dialog, panel, cx))
+                },
             )
             .child(
                 div()
@@ -1721,6 +1989,113 @@ fn key_down_target(
     }
 }
 
+/// What a key-down that reached the canvas does.
+#[derive(Debug, PartialEq, Eq)]
+enum CanvasKey {
+    /// No page gets the key.
+    Drop,
+    /// The key belongs to the open IME composition.
+    Compose,
+    /// Pastes the system clipboard's text into the selected page.
+    Paste,
+    /// The key goes to the page of this device.
+    Send(usize),
+}
+
+/// The canvas also receives the keys that a field inside it, such as a
+/// prompt's text field, leaves unhandled; they belong to no page. A key goes to
+/// the selected page (`target`, if shown) only while the canvas itself holds
+/// focus, and a repeat only to the page that received its press.
+fn canvas_key(
+    focus: KeyFocus,
+    composing: bool,
+    key: &KeyInput,
+    identity: &str,
+    repeat: bool,
+    target: Option<usize>,
+    held: &HashMap<String, (usize, KeyInput)>,
+) -> CanvasKey {
+    if focus != KeyFocus::Canvas {
+        CanvasKey::Drop
+    } else if composing {
+        CanvasKey::Compose
+    } else if is_paste_key(key) {
+        if repeat {
+            CanvasKey::Drop
+        } else {
+            CanvasKey::Paste
+        }
+    } else {
+        key_down_target(target, |_| true, identity, repeat, held)
+            .map_or(CanvasKey::Drop, CanvasKey::Send)
+    }
+}
+
+/// A prompt's proposed answer as its field's first text. The engine takes an
+/// answer only as one line of at most [`MAX_DIALOG_CHARS`] characters without
+/// control characters, so line breaks and tabs become spaces.
+fn prompt_default(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .take(MAX_DIALOG_CHARS)
+        .collect()
+}
+
+/// The dialog device `index` waits on, while the held runtime runs. A status
+/// from before a stop, restart or close can still name a dialog that nothing
+/// can answer any more.
+fn open_dialog(status: &Status, held: bool, index: usize) -> Option<&DialogState> {
+    let running = held && matches!(status.runtime, RuntimeState::Running { .. });
+    status
+        .devices
+        .get(index)?
+        .dialog
+        .as_ref()
+        .filter(|_| running)
+}
+
+/// Where keyboard focus goes when device `index` gets a field for a new prompt
+/// (`created`) or loses its field. A new prompt of the selected device takes
+/// focus from the canvas or from that device's previous field, never from the
+/// URL bar or another device's field. Focus in a field that goes away returns
+/// to the canvas, so shortcuts and key releases keep a receiver. `None` leaves
+/// focus where it is.
+fn focus_after_prompt_change(
+    index: usize,
+    selected: Option<usize>,
+    focus: KeyFocus,
+    created: bool,
+) -> Option<KeyFocus> {
+    let in_own_field = focus == KeyFocus::Prompt(index);
+    if created && selected == Some(index) && (focus == KeyFocus::Canvas || in_own_field) {
+        Some(KeyFocus::Prompt(index))
+    } else if in_own_field {
+        Some(KeyFocus::Canvas)
+    } else {
+        None
+    }
+}
+
+/// The answer that Enter or Escape in the prompt field of dialog `token` of
+/// `device` sends: Enter accepts with the field's text exactly as typed, and
+/// Escape cancels, as the Cancel button does.
+fn field_answer(device: usize, token: u64, event: &UrlEvent) -> Command {
+    let (accept, text) = match event {
+        UrlEvent::Submit(text) => (true, Some(text.clone())),
+        UrlEvent::Cancel => (false, None),
+    };
+    Command::AnswerDialog {
+        device,
+        token,
+        accept,
+        text,
+    }
+}
+
 /// Keep the current visible device, otherwise move forward through the sidebar
 /// order with wraparound. No visible device means no page input target.
 fn selected_after_visibility_change(selected: Option<usize>, hidden: &[bool]) -> Option<usize> {
@@ -1747,12 +2122,17 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceView, PressedKeys, key_down_target, key_input, map_caret,
-        selected_after_visibility_change,
+        CanvasKey, DeviceView, KeyFocus, PressedKeys, canvas_key, field_answer,
+        focus_after_prompt_change, key_down_target, key_input, map_caret, open_dialog,
+        prompt_default, selected_after_visibility_change,
     };
     use crate::ime::{ImeBuffer, Origin};
-    use broxser_engine::{CaretRect, DeviceStatus, ImeAction, TextInputState};
-    use gpui::{Bounds, Keystroke, point, px, size};
+    use crate::url_input::{KeyOutcome, LineEdit, UrlEvent};
+    use broxser_engine::{
+        CaretRect, Command, DeviceStatus, DialogKind, DialogState, ImeAction, MAX_DIALOG_CHARS,
+        RuntimeState, Status, TextInputState,
+    };
+    use gpui::{Bounds, Keystroke, Modifiers, point, px, size};
     use std::collections::HashMap;
 
     /// A keystroke as GPUI reports it on X11: key name and typed character.
@@ -1766,6 +2146,43 @@ mod tests {
 
     fn identity(name: &str) -> String {
         key_input(&stroke(name, Some(name)), true).unwrap().1
+    }
+
+    /// A keystroke without text, such as a shortcut, as GPUI reports it on X11.
+    fn chord(modifiers: Modifiers, key: &str) -> Keystroke {
+        Keystroke {
+            key: key.into(),
+            modifiers,
+            ..Keystroke::default()
+        }
+    }
+
+    const NO_MODIFIERS: Modifiers = Modifiers {
+        control: false,
+        alt: false,
+        shift: false,
+        platform: false,
+        function: false,
+    };
+    const SHIFT: Modifiers = Modifiers {
+        shift: true,
+        ..NO_MODIFIERS
+    };
+    const CONTROL: Modifiers = Modifiers {
+        control: true,
+        ..NO_MODIFIERS
+    };
+
+    fn answer_of(command: Command) -> (usize, u64, bool, Option<String>) {
+        match command {
+            Command::AnswerDialog {
+                device,
+                token,
+                accept,
+                text,
+            } => (device, token, accept, text),
+            other => panic!("not a dialog answer: {other:?}"),
+        }
     }
 
     #[test]
@@ -2000,6 +2417,258 @@ mod tests {
     fn common_shifted_punctuation_matches_the_same_release() {
         for (plain, shifted) in [("1", "!"), ("/", "?"), ("[", "{"), ("'", "\"")] {
             assert_eq!(identity(plain), identity(shifted));
+        }
+    }
+
+    #[test]
+    fn keys_a_prompt_field_leaves_unhandled_reach_no_page() {
+        let mut field = LineEdit::new("Ada".into(), Some(MAX_DIALOG_CHARS));
+        let held = HashMap::new();
+        for keystroke in [
+            stroke("tab", None),
+            chord(SHIFT, "insert"),
+            chord(CONTROL, "x"),
+            stroke("up", None),
+        ] {
+            // The field does not handle them, so GPUI hands them on to the
+            // canvas that contains it.
+            assert_eq!(
+                field.key(&keystroke, || Some("clipboard".into())),
+                KeyOutcome::Unhandled
+            );
+            let (key, identity) = key_input(&keystroke, true).unwrap();
+            // With device 1's prompt field focused, no page gets a key, a
+            // paste or text: not the selected device 0, nor device 1 when it
+            // is the selected one, and not as part of a composition either.
+            for target in [Some(0), Some(1)] {
+                for composing in [false, true] {
+                    assert_eq!(
+                        canvas_key(
+                            KeyFocus::Prompt(1),
+                            composing,
+                            &key,
+                            &identity,
+                            false,
+                            target,
+                            &held
+                        ),
+                        CanvasKey::Drop,
+                        "{}",
+                        keystroke.key
+                    );
+                }
+            }
+            // Only while the canvas itself holds focus are they the page's.
+            let page = if keystroke.key == "insert" {
+                CanvasKey::Paste
+            } else {
+                CanvasKey::Send(0)
+            };
+            assert_eq!(
+                canvas_key(
+                    KeyFocus::Canvas,
+                    false,
+                    &key,
+                    &identity,
+                    false,
+                    Some(0),
+                    &held
+                ),
+                page
+            );
+        }
+        assert_eq!(field.text(), "Ada");
+    }
+
+    #[test]
+    fn a_prompt_default_becomes_one_bounded_line() {
+        let proposal = format!("two\nlines\tand a bell\u{7}\r\n{}", "x".repeat(3000));
+        let text = prompt_default(&proposal);
+        assert!(text.starts_with("two lines and a bell x"), "{text:.30}");
+        assert_eq!(text.chars().count(), MAX_DIALOG_CHARS);
+        assert!(!text.chars().any(char::is_control));
+        // The prompt field starts with it and has no room for typing or paste.
+        let mut field = LineEdit::new(text.clone(), Some(MAX_DIALOG_CHARS));
+        assert_eq!(
+            field.key(&stroke("y", Some("y")), || None),
+            KeyOutcome::Edited
+        );
+        field.key(&chord(CONTROL, "v"), || Some("pasted".into()));
+        assert_eq!(field.text(), text);
+    }
+
+    #[test]
+    fn enter_answers_with_the_exact_field_text_and_escape_cancels() {
+        let mut field = LineEdit::new(prompt_default("  padded  "), Some(MAX_DIALOG_CHARS));
+        let KeyOutcome::Event(enter) = field.key(&stroke("enter", None), || None) else {
+            panic!("Enter belongs to the field");
+        };
+        assert_eq!(
+            answer_of(field_answer(1, 7, &enter)),
+            (1, 7, true, Some("  padded  ".into()))
+        );
+        let KeyOutcome::Event(escape) = field.key(&stroke("escape", None), || None) else {
+            panic!("Escape belongs to the field");
+        };
+        assert_eq!(answer_of(field_answer(1, 7, &escape)), (1, 7, false, None));
+    }
+
+    #[test]
+    fn an_ignored_repeat_restores_select_all_so_typing_still_replaces() {
+        let (key, identity) = key_input(&stroke("enter", None), true).unwrap();
+        let mut pressed = PressedKeys::default();
+        // The held Enter that answered the previous prompt.
+        pressed.press(identity.clone(), &key);
+        assert!(!pressed.latest_repeats());
+        // The new prompt's field, as a fresh auto-focus or click leaves it.
+        let mut field = LineEdit::new(prompt_default("old proposal"), Some(MAX_DIALOG_CHARS));
+        field.restore_select_all();
+        // The still-held key repeats into it. LineEdit::key runs before any
+        // guard can reject the repeat, and clears select-all as if this
+        // Enter would submit the field.
+        pressed.press(identity.clone(), &key);
+        assert!(pressed.latest_repeats());
+        assert_eq!(
+            field.key(&stroke("enter", None), || None),
+            KeyOutcome::Event(UrlEvent::Submit("old proposal".into()))
+        );
+        // A caller that checks latest_repeats(), as the prompt field's
+        // subscriber does, ignores this Enter and must restore select-all;
+        // otherwise the next key would append to the stale proposal instead
+        // of replacing it.
+        assert!(pressed.latest_repeats());
+        field.restore_select_all();
+        assert_eq!(
+            field.key(&stroke("x", Some("x")), || None),
+            KeyOutcome::Edited
+        );
+        assert_eq!(field.text(), "x");
+    }
+
+    #[test]
+    fn a_new_prompt_takes_focus_only_from_the_canvas_for_the_selected_device() {
+        let created =
+            |index, selected, focus| focus_after_prompt_change(index, selected, focus, true);
+        assert_eq!(
+            created(0, Some(0), KeyFocus::Canvas),
+            Some(KeyFocus::Prompt(0))
+        );
+        // A prompt on another device, or with every device hidden, leaves
+        // focus in the canvas.
+        assert_eq!(created(1, Some(0), KeyFocus::Canvas), None);
+        assert_eq!(created(0, None, KeyFocus::Canvas), None);
+        // The URL bar, or nothing focused, keeps focus; so does another
+        // device's prompt field the user is typing in.
+        assert_eq!(created(0, Some(0), KeyFocus::Elsewhere), None);
+        assert_eq!(created(0, Some(0), KeyFocus::Prompt(1)), None);
+        // The next prompt of a device follows focus out of its previous
+        // field, which goes; on a device that is not selected, focus returns
+        // to the canvas instead.
+        assert_eq!(
+            created(0, Some(0), KeyFocus::Prompt(0)),
+            Some(KeyFocus::Prompt(0))
+        );
+        assert_eq!(
+            created(1, Some(0), KeyFocus::Prompt(1)),
+            Some(KeyFocus::Canvas)
+        );
+        // A focused field that goes away hands focus back to the canvas;
+        // dropping a field without focus moves nothing.
+        let dropped = |focus| focus_after_prompt_change(0, Some(0), focus, false);
+        assert_eq!(dropped(KeyFocus::Prompt(0)), Some(KeyFocus::Canvas));
+        assert_eq!(dropped(KeyFocus::Canvas), None);
+        assert_eq!(dropped(KeyFocus::Elsewhere), None);
+        assert_eq!(dropped(KeyFocus::Prompt(1)), None);
+    }
+
+    #[test]
+    fn a_dialog_is_shown_only_while_the_held_runtime_runs() {
+        let dialog = DialogState {
+            kind: DialogKind::Prompt,
+            message: "Name?".into(),
+            default_text: "Ada".into(),
+            token: 3,
+        };
+        let mut status = Status {
+            runtime: RuntimeState::Running {
+                product: "Helium".into(),
+                protocol: "1.3".into(),
+            },
+            devices: vec![
+                DeviceStatus::default(),
+                DeviceStatus {
+                    dialog: Some(dialog.clone()),
+                    ..DeviceStatus::default()
+                },
+            ],
+            ..Status::default()
+        };
+        assert_eq!(open_dialog(&status, true, 1), Some(&dialog));
+        assert_eq!(open_dialog(&status, true, 0), None);
+        assert_eq!(open_dialog(&status, true, 2), None);
+        // A runtime taken for a restart or close answers nothing any more.
+        assert_eq!(open_dialog(&status, false, 1), None);
+        // Nor does a stopped runtime whose last status still names the dialog.
+        status.runtime = RuntimeState::Stopped {
+            error: Some("The browser exited".into()),
+        };
+        assert_eq!(open_dialog(&status, true, 1), None);
+        status.runtime = RuntimeState::Starting;
+        assert_eq!(open_dialog(&status, true, 1), None);
+    }
+
+    #[test]
+    fn the_enter_after_a_prompt_answer_reaches_the_page() {
+        let (key, identity) = key_input(&stroke("enter", None), true).unwrap();
+        let held = HashMap::new();
+        // Enter moves focus to the canvas at once and the field goes when the
+        // dialog closes; answered with a button instead, the field can go
+        // while it still holds focus.
+        for field_focused_when_dropped in [false, true] {
+            let mut pressed = PressedKeys::default();
+            // Enter in the prompt field of device 0: recorded before any
+            // element sees it, answered by the field, sent to no page.
+            pressed.press(identity.clone(), &key);
+            assert!(!pressed.latest_repeats());
+            assert_eq!(
+                canvas_key(
+                    KeyFocus::Prompt(0),
+                    false,
+                    &key,
+                    &identity,
+                    false,
+                    Some(0),
+                    &held
+                ),
+                CanvasKey::Drop
+            );
+            let before = if field_focused_when_dropped {
+                KeyFocus::Prompt(0)
+            } else {
+                KeyFocus::Canvas
+            };
+            // Either way the canvas holds focus once the field is gone, so the
+            // release still reaches the window root.
+            let focus = focus_after_prompt_change(0, Some(0), before, false).unwrap_or(before);
+            assert_eq!(focus, KeyFocus::Canvas);
+            // Repeats of the held Enter reach no page and answer no prompt.
+            pressed.press(identity.clone(), &key);
+            assert!(pressed.latest_repeats());
+            assert_eq!(
+                canvas_key(focus, false, &key, &identity, true, Some(0), &held),
+                CanvasKey::Drop
+            );
+            // The release ends the press, so it no longer repeats either.
+            assert_eq!(pressed.release(&identity), Some(identity.clone()));
+            assert!(!pressed.latest_repeats());
+            // The next Enter is a new press for the selected page.
+            pressed.press(identity.clone(), &key);
+            let repeat = pressed.repeating(&identity);
+            assert!(!repeat && !pressed.latest_repeats());
+            assert_eq!(
+                canvas_key(focus, false, &key, &identity, repeat, Some(0), &held),
+                CanvasKey::Send(0)
+            );
         }
     }
 }

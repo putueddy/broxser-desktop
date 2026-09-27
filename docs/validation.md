@@ -3,6 +3,231 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.6 unsupported browser interactions, 26 September 2026 (cloud container)
+
+Same container as P1.5: Helium 0.18.1.1 (Chrome/154.0.8037.57), headless, run by
+the unprivileged user `broxsertest` with the sandbox enabled and the profile seeded
+as in ADR 0004. P1.6 is split per capability; this section records the audit of all
+of them and the first change, JavaScript dialogs
+([ADR 0014](adr/0014-javascript-dialogs.md)).
+
+### Audit: what happens today
+
+A scratch Node script, not committed, drove one page target with Broxser's setup
+(device metrics, focus emulation, screencast) and clicked fixture pages through
+`Input.dispatchMouseEvent`. `main` at `6495c2b` handled only
+`Page.javascriptDialogOpening` (an error text) and counted popups.
+
+| Capability | Helium 0.18.1.1 | Broxser on `main` |
+| --- | --- | --- |
+| `alert`, `confirm`, `prompt` | The page stops. The click that opened the dialog stays unanswered, later pointer input and `Input.insertText` are held until the dialog closes, keys are answered and dropped, `Runtime.evaluate` blocks, no screencast frames. No key event variant, mouse event or 8 s of waiting closes it. `Page.navigate` closes it (result false) and navigates | "The page opened a JavaScript dialog, which Broxser cannot show yet"; frozen frame; Go, Reload and link sync cancelled the dialog silently; the held click counted toward "not responding" |
+| `beforeunload` (page with user interaction) | A link click or `Page.navigate` opens it; navigate waits for the answer, accept continues it, decline answers `net::ERR_ABORTED`; `Page.stopLoading` aborts the navigation and leaves the dialog open | Go on a dirty page: after the 30 s deadline "Navigation got no response…; loading stopped, not retried" with the page still frozen behind the question |
+| `window.open`, `target=_blank`, named popup | `Page.windowOpen` and `Target.targetCreated` (type page, `openerId` = the device, same browser context); the popup loads and keeps running unseen; `Target.closeTarget` closes it and the opener sees `closed` | Counts "N popup(s) not shown"; never closes them |
+| Download link, `download` attribute | `Page.downloadWillBegin` then `downloadProgress canceled` at once; no file anywhere; with `Browser.setDownloadBehavior deny` the same plus `Browser.downloadWillBegin` | Nothing shown; no download behavior set, so the outcome is headless Chromium's default |
+| `<input type=file>` click, scripted `.click()` | Nothing happens; with `Page.setInterceptFileChooserDialog`, `Page.fileChooserOpened` and still nothing | Nothing shown |
+| Geolocation; `Notification.requestPermission()`; `getUserMedia`; clipboard read; fullscreen; `print()` | Denied at once; never resolves (resolves "denied" after `Browser.setPermission denied`); `NotFoundError` (no devices here); `NotAllowedError`; `TypeError`; returns at once | Nothing shown; the page sees the browser's answers |
+| Touch device (`mobile`, touch emulation) | Mouse events arrive as `pointerType=mouse`, no `touchstart`; media `(pointer: coarse)`, `(hover: none)`. `Input.dispatchTouchEvent` gives `pointerType=touch`, `touchstart`/`touchend`, a swipe scrolls; `Input.emulateTouchFromMouseEvent` taps produced nothing | Pointer input is mouse input on every device |
+| Mouse device | `(hover: none)` and `(pointer: none)`: headless has no pointer device; `Emulation.setEmulatedMedia` accepts hover/pointer features without effect | Pages see no hover capability (QA fidelity, P1.7) |
+| HTML5 drag and drop; text selection by drag | `dragstart`, `dragenter`, `drop` with data, `dragend` through mouse events; selection works on the mouse device, not on the touch device | Works as the browser does |
+| Accessibility | — | GPUI 0.2.2 exposes no accessibility tree on Linux; the page's tree is not read |
+
+The first probe run without the ADR 0004 preference again showed the bundled
+blocker reloading a page.
+
+### JavaScript dialogs: before the change
+
+A temporary test through the live runtime on `main` at `6495c2b`, with the new
+fixture pages:
+
+| Step | Result |
+| --- | --- |
+| Click the alert button | Error text shown; 0 frames in the next second |
+| Type `a` into the device | The dialog stays (typing never answers a dialog) |
+| Click the confirm button, then Go | The phone navigated with the others; the page reported `alert closed` (the navigation cancelled the dialog) and never saw its confirm |
+| Type into a page that asks before leaving, then Go with a 3 s load limit | After 4.5 s: "Navigation got no response within 3 seconds; loading stopped, not retried", URL unchanged, 0 frames in the next second, typing changed nothing: the question stayed open behind a frozen frame |
+
+### JavaScript dialogs: after the change
+
+| Check | Result |
+| --- | --- |
+| `dialog_blocks_input_and_navigation_until_the_user_answers` (fake CDP) | Passed: kind, bounded message (`MAX_DIALOG_CHARS` + `…`), no "not responding" past the command limit, keys and text dropped, Go refused for the device with the report and sent to the others, stale token ignored, `Page.handleJavaScriptDialog {accept:false}`, close clears the report, prompt default and `promptText` |
+| `live_dialogs_wait_for_an_explicit_answer` (Helium) | Passed: alert freezes frames; typing and Go leave it open (peers navigate, the phone reports the refusal); a stale token answers nothing; OK resumes the page and its frames and typing reaches the field; confirm false and true, prompt "Broxser" and null, each reported by the page |
+| `live_beforeunload_dialog_needs_an_explicit_leave_or_stay` (Helium, 3 s load limit) | Passed: Go on a dirty page asks and waits 4 s past the limit without an error; Stay keeps the page without an error; Leave navigates; the page's own link asks the same question, Stay and Leave |
+| Both live tests in parallel, 2 threads | 3 of 3 runs passed after the fix below; before it, 1 of 4 and 2 of 2 runs failed |
+| `bash scripts/check.sh` | Passed: 1 CLI, 8 core, 66 engine and 24 desktop tests; fmt and strict Clippy; 36 live tests ignored by default |
+| Live Helium suite (`--ignored`, 4 threads) | 36 of 36 passed in 59.0 s. A first run passed 35 and failed `hidden_devices_reject_input_and_sync_without_replay` at its cleanup check, "browser processes still running": two crash handler processes, a renderer and a zombie of one browser stayed until the handlers were killed by hand, the cleanup deadlock recorded under P1.4; the test passed alone |
+| `scripts/desktop-smoke.sh` (debug build, Xvfb, no window manager) | 9 of 9 runs passed, including the new "dialog answered on the card": the check is by pixel color (XGetImage), not by reading on-screen text — it finds the page's blue button, then the panel's orange border and the OK/Cancel button colors inside it; clicking them makes the page report `confirm=true` and `confirm=false` over HTTP, and the border color is gone once the card repaints; no browser process, profile or window left |
+
+The parallel failures were a test problem worth recording: the test clicked a
+field and typed at once, and under load the key was processed before the click.
+Chromium routes pointer events through its compositor thread and key events to
+the renderer's main thread directly, so a key sent right after a click can overtake
+it. The tests now wait for the field's caret report (ADR 0011) before typing.
+
+The smoke run finds the page's blue button and the panel's orange border in the
+window with XGetImage, clicks them, and reads the page's answers from the fixture
+log. A first version checked that the panel was gone by looking for its border
+once, right after the page's report, before the card had repainted; it now waits
+for the border to be absent.
+
+### Limits
+
+- Popups, downloads, uploads, permissions, touch input and hover media, drag and
+  drop and accessibility keep today's behavior; each is a separate decision. The
+  audit above is their evidence.
+- A prompt's text field is the URL bar's single-line field: no IME composition,
+  partial selection or copy.
+- Dialogs opened by a subframe are reported for the device like the main frame's;
+  the panel does not say which frame asked.
+- A dialog on a hidden device is answered only after showing the device; hiding
+  does not answer it.
+
+### Review fixes, 27 September 2026
+
+PR #14 review found gaps in the change above. Engine
+(`crates/broxser-engine/src/live.rs`):
+
+1. A prompt's default is now bounded as an answer Broxser can send back
+   unchanged (`prompt_text`): line breaks and tabs become a space, other
+   control characters are dropped, cut at `MAX_DIALOG_CHARS` with no cut mark.
+   The message keeps `dialog_text`'s rule (control characters dropped except
+   line breaks and tabs, cut and marked with `…`).
+2. A prompt answer over 2048 characters or holding a control character is not
+   sent; the dialog stays open and the device reports `PROMPT_REJECTED`,
+   clearing on the next sent answer or when the dialog closes.
+3. Only one answer per dialog is outstanding at a time: once
+   `Page.handleJavaScriptDialog` is sent, a further answer under the same
+   token is ignored until `Page.javascriptDialogClosed`, or the dialog is
+   cleared by a new document, a crash, a detach or a runtime stop. The reply to
+   that command is now tracked (`Pending::DialogAnswer`): if it is itself an
+   error and the same dialog is still open, the answer is taken back so the
+   dialog can be answered again, and the browser's message is shown as a
+   protocol error ("Input error" in the desktop), not a dialog-specific one.
+4. An unknown or missing dialog type reports `UNKNOWN_DIALOG` without blocking
+   input or navigation for that device; it clears once the browser reports the
+   dialog closed.
+5. Staying on a `beforeunload` ends only the Broxser navigation the question
+   belongs to: a tracked navigate or reload with no page-initiated main-frame
+   `Page.frameRequestedNavigation` in the current tab (no `disposition`, or
+   `disposition: "currentTab"`) since it was sent — a link or script that opens
+   a new tab, window or download no longer counts. A `beforeunload` the page's
+   own link raises while a Broxser navigation is pending leaves that navigation
+   tracked, running under its own deadline.
+6. The IME refresh sent when a hidden device is shown (`Runtime.evaluate`) is
+   renderer-answered and held while a dialog is open; it is now sent without a
+   deadline (`send_ignored`), skipped while a dialog is open and re-sent when
+   the dialog closes. Before this fix, showing a hidden device during its own
+   dialog stopped the whole runtime once the 15 s command limit passed.
+7. Opening a dialog invalidates IME state locally without sending a
+   composition cancel to the page, and the not-responding check pauses
+   instead of tripping while the dialog is open.
+8. A refused Go or workspace open (open dialog) now retires the device's
+   pending link, the same as a sent one would (ADR 0013); a refused synced link
+   is different and leaves the device's link-sync tracking untouched, so a
+   link that commits later still syncs.
+9. Stopping the runtime clears every device's dialog and dialog-related status
+   text.
+
+Desktop (`crates/broxser-desktop/src/live_view.rs`,
+`crates/broxser-desktop/src/url_input.rs`):
+
+11. Keys a prompt field does not consume never reach a page: the canvas
+    forwards input to the selected page only while the canvas itself holds
+    focus.
+12. The prompt field holds one line of at most 2048 characters (typing and
+    paste capped). OK and Enter send the field's text unchanged, without
+    trimming; Escape cancels like the Cancel button; either returns keyboard
+    focus to the canvas.
+13. A new prompt on the selected device takes focus only from the canvas or
+    that device's own previous field, never from the URL bar or another
+    device's field; a held or auto-repeating Enter does not answer a newly
+    focused prompt.
+14. The panel is shown only while the runtime is running, is at most 360 px
+    wide, anchored at the frame's left edge with its buttons on the left, and
+    its message box is limited to 120 px high and scrolls.
+15. Prompt fields are cleared on restart and close; focus returns to the
+    canvas when a focused field disappears.
+16. An auto-repeated Enter or Escape that the prompt guard ignores no longer
+    spoils the field's select-all-to-replace state: `LineEdit::key` clears
+    select-all unconditionally for Enter and Escape, so the field puts it back
+    (`restore_select_all`) when the repeat is the one the guard drops.
+17. Focus moving into a prompt field — by auto-focus or a later click — also
+    invalidates the desktop's own IME mark (`cx.on_focus_in`); nothing reaches
+    the page, since the engine already cleared that device's IME state when
+    the dialog opened.
+
+Helium 0.18.1.1 probe, same container as the audit above: while a dialog is
+open, `Page.startScreencast`, `Page.stopScreencast`,
+`Input.setIgnoreInputEvents` and `Page.screencastFrameAck` are answered in
+0-1 ms; `Runtime.evaluate` and `Emulation.setFocusEmulationEnabled` are held
+until it closes. A Go on a dirty page, then Stay, answers `net::ERR_ABORTED`
+before `Page.javascriptDialogClosed`. A Reload replies before the dialog
+opens. A page link, `location.href` or `location.reload()` during a pending
+slow Go emits `Page.frameRequestedNavigation` right before its own
+`beforeunload`, and the Go continues after Stay. A page `history.back()`
+cancels the Go with `net::ERR_ABORTED` before asking.
+
+New tests: fake CDP `dialog_text_and_prompt_defaults_are_bounded`,
+`showing_a_device_during_its_dialog_waits_for_nothing_the_page_answers`,
+`prompt_default_can_be_sent_back_and_rejected_answers_are_reported`,
+`a_dialog_takes_one_answer_and_never_the_previous_dialogs`,
+`a_dialog_answer_the_browser_refuses_can_be_sent_again`,
+`staying_ends_the_broxser_navigation_that_asked_in_either_reply_order`,
+`staying_ends_a_reload_that_asked`,
+`leaving_continues_the_navigation_under_a_fresh_deadline`,
+`staying_on_the_pages_own_link_keeps_the_broxser_navigation`,
+`staying_ends_the_broxser_navigation_after_a_page_request_outside_its_tab`,
+`a_dialog_drops_the_composition_without_a_cancel_or_a_not_responding_report`,
+`a_dialog_broxser_cannot_show_is_reported_and_blocks_nothing`,
+`a_refused_go_retires_the_devices_link_and_a_refused_synced_link_keeps_it`,
+`a_stopped_runtime_leaves_no_dialog_shown`,
+`a_dialog_refuses_reload_and_synced_links_and_drops_pointer_input` and
+`a_new_document_a_crash_or_a_detach_ends_the_dialog_and_its_token`; live
+Helium `live_dialog_survives_hide_show_scroll_and_zoom`, and
+`live_dialogs_wait_for_an_explicit_answer` revised to wait for settled frames
+and for the previous dialog to close.
+
+Verification actually run: the fake CDP engine suite, now 82 tests, passed.
+Live Helium: the three ignored dialog tests
+(`live_dialogs_wait_for_an_explicit_answer`,
+`live_dialog_survives_hide_show_scroll_and_zoom`,
+`live_beforeunload_dialog_needs_an_explicit_leave_or_stay`) were re-run after
+the link-retiring and dialog-answer-retry fixes and again passed 3 of 3 runs
+each, and the full ignored suite (`--ignored`, 4 threads) was re-run and
+passed 37 of 37. Desktop: 35 unit tests passed and strict Clippy is clean.
+
+Real X11 window check of the revised panel, 27 September 2026: the same
+container after a restart (Xvfb 1600 × 1000 without a window manager, xdotool,
+debug build of `0fe8b01`, Helium 0.18.1.1 as the unprivileged user with the
+sandbox enabled). A scratch page, not committed, offered a prompt with a
+default, a 40-line alert, a confirm, a button that focuses a text field and
+opens a prompt 3 s later, and reported every `keydown` it saw with its
+`innerWidth` to the fixture log. Every step clicked and typed into the actual
+GPUI window; results were read from the page's reports and from XGetImage
+screenshots of the window.
+
+| Check | Result |
+| --- | --- |
+| Prompt on the selected phone | The field took focus by itself with the default selected; typing `Grace` replaced it and Enter answered `Grace`; the panel closed; no page saw a key |
+| Escape | Typing, then Escape answered `null` (cancelled); the panel closed |
+| Prompt on the phone while the tablet is selected | No auto-focus: a typed `k` reached the tablet's page. A click into the field focused it; Tab, Left, Right, Shift+Insert, Ctrl+X and `q` then reached no page; Enter answered `late defaultq`; a typed `m` afterwards reached the tablet's page, so focus had returned to the canvas and the keyboard was not dead |
+| 40-line alert | The message box stopped at 120 px and scrolled with the wheel; OK closed it. Wheel clicks over the message box also scrolled the canvas behind it (cosmetic; the page got nothing) |
+| Confirm | Cancel answered `false`; the panel closed |
+| Desktop device (1440 CSS px, a 720 px frame at 50 %) in a 700 px wide window, the other devices hidden | Panel 359 px wide at the frame's left edge, Cancel and OK at x 275–405 inside the window although the frame ran past its right edge; the field took focus and Enter answered `Fable`. At 560 px the window edge cut the panel with both buttons still visible; Escape cancelled |
+| `scripts/desktop-smoke.sh` | 9 of 9 runs passed on the second attempt, including "dialog answered on the card", with no browser process or profile left. The first attempt after the container restart failed in its first case ("live close: browser did not start"): Helium's cold start did not publish its CDP endpoint within the 15 s startup limit and the desktop showed "Stopped: browser did not publish a CDP endpoint within 15 seconds"; the script exits on that failure without stopping the desktop it started, which is a gap in the script, not in this PR |
+
+Not run: composing with an IME, then a prompt taking focus, then returning to
+the canvas. The Fcitx5 runtime of P1.3 lived under `/tmp`, which the container
+restart cleared, and this container's proxy now refuses the Arch package
+mirrors (403), so it could not be rebuilt here; that check stays pending for a
+machine with the runtime (`scripts/ime-smoke.py --manual-seconds 120`).
+
+Flake note, kept honest: the frames check in
+`live_dialogs_wait_for_an_explicit_answer` failed once under load — a frame
+already in flight when the page stopped could still land after a fixed
+300 ms sleep. The test now waits, via a `settled_frames` helper, until no
+frame has arrived for 700 ms before reading the count.
+
 ## P1.5 modern application navigation, 26 September 2026 (cloud container)
 
 Same container as P1.4: Helium 0.18.1.1 (Chrome/154.0.8037.57, protocol 1.3),

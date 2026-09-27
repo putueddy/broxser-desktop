@@ -194,7 +194,12 @@ dibuang, tidak diantrekan atau dikirim belakangan, sampai halaman menjawab lagi.
 Batas per device menjumlah ke tabel runtime, sehingga device lain tetap berjalan.
 Command yang dijawab proses browser sendiri harus terjawab dalam 15 detik; bila
 tidak, runtime berhenti dengan error eksplisit. Jawaban command yang tidak lagi
-ditunggu dibuang saat tiba.
+ditunggu dibuang saat tiba. Dialog JavaScript membuat halaman menunggu pengguna,
+bukan jaringan: engine melaporkan jenis, pesan (dibatasi, hanya ditampilkan) dan
+token dialog; desktop menampilkannya di kartu device dengan jawaban yang dimiliki
+dialog itu, dan hanya `Command::AnswerDialog` dengan token yang cocok yang
+menjawabnya. Selama dialog terbuka, input ke device itu dibuang, navigasi Broxser
+untuknya ditolak dengan pesan, dan kedua deadline dijeda (ADR 0014).
 
 ## 6. API and data contracts
 

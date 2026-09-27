@@ -563,6 +563,18 @@ impl FakePeer {
             .2
     }
 
+    /// Parameters of the latest `method` sent to `session`.
+    fn last_params(&self, method: &str, session: &str) -> Value {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(m, s, _, _)| m == method && s.as_deref() == Some(session))
+            .map(|(_, _, _, params)| params.clone())
+            .unwrap_or(Value::Null)
+    }
+
     /// The `url` parameter of every `Page.navigate` sent to `session`.
     fn navigations(&self, session: &str) -> Vec<String> {
         self.received
@@ -637,6 +649,15 @@ fn wait_for_requests(peer: &FakePeer, method: &str, session: &str, count: usize)
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Waits until the runtime has handled the events sent so far and the replies,
+/// not held, to requests `peer` received: the peer sends them before this
+/// phone frame, and the runtime handles messages in order.
+fn wait_until_read(peer: &FakePeer) {
+    let acks = peer.count("Page.screencastFrameAck", "S0");
+    peer.event(phone("Page.screencastFrame", json!({"sessionId": 1})));
+    wait_for_requests(peer, "Page.screencastFrameAck", "S0", acks + 1);
 }
 
 fn fake_live(root: &Path, limits: Limits) -> LiveSession {
@@ -758,6 +779,12 @@ fn ime_bindings_require_the_main_frame_isolated_context_and_live_token() {
 /// An event of the phone: session `S0`, main frame `T0`.
 fn phone(method: &str, params: Value) -> Value {
     json!({"method": method, "sessionId": "S0", "params": params})
+}
+
+/// An event of the tablet, which shares the phone's session: session `S1`,
+/// main frame `T1`.
+fn tablet(method: &str, params: Value) -> Value {
+    json!({"method": method, "sessionId": "S1", "params": params})
 }
 
 /// A report of the phone's link observer, registered by [`link_observer`].
@@ -969,6 +996,971 @@ fn same_document_link_navigation_follows_only_a_live_activation() {
     wait_for_requests(&peer, "Page.navigate", "S1", 3);
     assert_eq!(peer.navigations("S1")[2], format!("{origin}/other#part"));
     assert_eq!(peer.navigations("S2").len(), 1, "sync left its session");
+    drop(live);
+}
+
+#[test]
+fn dialog_blocks_input_and_navigation_until_the_user_answers() {
+    let root = profile_root();
+    // The phone's page never answers pointer input, like the click that
+    // opened its dialog and the input Chromium holds behind the dialog.
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Input.dispatchMouseEvent" && session == Some("S0")
+    });
+    let live = fake_live(
+        root.path(),
+        Limits {
+            command: Duration::from_secs(1),
+            ..Limits::default()
+        },
+    );
+    let opening = |kind: &str, message: &str, default: &str| {
+        phone(
+            "Page.javascriptDialogOpening",
+            json!({"url": "http://127.0.0.1:4173/", "message": message, "type": kind,
+                "hasBrowserHandler": true, "defaultPrompt": default}),
+        )
+    };
+    let closed = |accepted: bool| {
+        phone(
+            "Page.javascriptDialogClosed",
+            json!({"result": accepted, "userInput": ""}),
+        )
+    };
+    for (kind, buttons) in [(PointerKind::Down, 1), (PointerKind::Up, 0)] {
+        assert!(live.send(Command::Pointer {
+            device: 0,
+            event: PointerEvent {
+                kind,
+                x: 10.0,
+                y: 10.0,
+                button: PointerButton::Left,
+                buttons,
+                click_count: 1,
+                modifiers: Modifiers::default(),
+            },
+        }));
+    }
+    wait_for_requests(&peer, "Input.dispatchMouseEvent", "S0", 2);
+    let long = "m".repeat(MAX_DIALOG_CHARS + 10);
+    peer.event(opening("confirm", &format!("Continue?\u{7}\n{long}"), ""));
+    let dialog = wait_for(&live, "the dialog", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_some()
+    })
+    .devices[0]
+        .dialog
+        .clone()
+        .unwrap();
+    assert_eq!(dialog.kind, DialogKind::Confirm);
+    assert!(
+        dialog.message.starts_with("Continue?\nmmm"),
+        "{}",
+        dialog.message
+    );
+    assert_eq!(dialog.message.chars().count(), MAX_DIALOG_CHARS + 1);
+    assert!(dialog.message.ends_with('…'));
+    assert_eq!(dialog.default_text, "");
+
+    // The unanswered click is the dialog's, not a page that stopped responding.
+    thread::sleep(Duration::from_millis(1400));
+    assert_eq!(live.status().devices[0].error, None);
+    // Keys and text are dropped, not held for the page behind the dialog.
+    send_keys(&live, 0, 2);
+    assert!(live.send(Command::InsertText {
+        device: 0,
+        text: "x".into(),
+    }));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Input.dispatchKeyEvent", "S0"), 0);
+    assert_eq!(peer.count("Input.insertText", "S0"), 0);
+    // Go reaches the other devices; navigating this one would cancel the dialog.
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into(),
+    }));
+    wait_for_requests(&peer, "Page.navigate", "S1", 2);
+    wait_for_requests(&peer, "Page.navigate", "S2", 2);
+    let status = wait_for(&live, "the refusal", Duration::from_secs(2), |s| {
+        s.devices[0].error.is_some()
+    });
+    assert_eq!(status.devices[0].error.as_deref(), Some(DIALOG_OPEN));
+    assert_eq!(peer.count("Page.navigate", "S0"), 1);
+    assert!(status.devices[0].dialog.is_some());
+
+    // Only the current dialog's token answers it.
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token: dialog.token + 1,
+        accept: true,
+        text: None,
+    }));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 0);
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token: dialog.token,
+        accept: false,
+        text: Some("ignored for a confirm".into()),
+    }));
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": false})
+    );
+    // The browser's report closes it, and the refusal with it.
+    peer.event(closed(false));
+    wait_for(&live, "the dialog to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none() && s.devices[0].error.is_none()
+    });
+    peer.release();
+    send_keys(&live, 0, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S0", 2);
+
+    // A prompt carries its default and takes the user's text only when accepted.
+    peer.event(opening("prompt", "Your name?", "guest"));
+    let prompt = wait_for(&live, "the prompt", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_some()
+    })
+    .devices[0]
+        .dialog
+        .clone()
+        .unwrap();
+    assert_eq!(prompt.kind, DialogKind::Prompt);
+    assert_eq!(prompt.default_text, "guest");
+    assert_ne!(prompt.token, dialog.token);
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token: prompt.token,
+        accept: true,
+        text: Some("Broxser".into()),
+    }));
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 2);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": true, "promptText": "Broxser"})
+    );
+    peer.event(closed(true));
+    wait_for(&live, "the prompt to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    assert_eq!(
+        peer.count("Page.navigate", "S0"),
+        1,
+        "nothing navigated for the user"
+    );
+    drop(live);
+}
+
+/// A JavaScript dialog of `kind` opening on the phone.
+fn dialog_opening(kind: &str, message: &str, default: &str) -> Value {
+    phone(
+        "Page.javascriptDialogOpening",
+        json!({"url": "http://127.0.0.1:4173/", "message": message, "type": kind,
+            "hasBrowserHandler": true, "defaultPrompt": default}),
+    )
+}
+
+fn dialog_closed(accepted: bool) -> Value {
+    phone(
+        "Page.javascriptDialogClosed",
+        json!({"result": accepted, "userInput": ""}),
+    )
+}
+
+/// Waits for a dialog on the phone, which has none open before.
+fn phone_dialog(live: &LiveSession) -> DialogState {
+    wait_for(live, "the dialog", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_some()
+    })
+    .devices[0]
+        .dialog
+        .clone()
+        .unwrap()
+}
+
+fn answer_phone(live: &LiveSession, token: u64, accept: bool, text: Option<&str>) {
+    assert!(live.send(Command::AnswerDialog {
+        device: 0,
+        token,
+        accept,
+        text: text.map(str::to_owned),
+    }));
+}
+
+/// A fake peer that holds every phone navigation after the workspace's
+/// first, like a server that has not answered yet.
+fn peer_holding_phone_navigations(root: &Path) -> FakePeer {
+    let navigations = AtomicUsize::new(0);
+    FakePeer::start(root, move |method, session| {
+        method == "Page.navigate"
+            && session == Some("S0")
+            && navigations.fetch_add(1, Ordering::SeqCst) > 0
+    })
+}
+
+/// The answer to the phone's latest `Page.navigate`, failed with `error`.
+fn failed_navigate_reply(peer: &FakePeer, error: &str) -> Value {
+    json!({"id": peer.last_request_id("Page.navigate", "S0"), "result": {
+        "frameId": "T0", "loaderId": "held", "errorText": error
+    }})
+}
+
+#[test]
+fn dialog_text_and_prompt_defaults_are_bounded() {
+    let full = "x".repeat(MAX_DIALOG_CHARS);
+    assert_eq!(dialog_text(&full), full);
+    assert_eq!(dialog_text(&format!("{full}y")), format!("{full}…"));
+    assert_eq!(dialog_text("a\u{7}\nb\tc\r"), "a\nb\tc");
+    // A prompt's default is an answer: one line, cut without a marker.
+    assert_eq!(prompt_text(&format!("{full}y")), full);
+    assert_eq!(prompt_text("a\u{7}\nb\tc\r\n"), "a b c ");
+}
+
+#[test]
+fn showing_a_device_during_its_dialog_waits_for_nothing_the_page_answers() {
+    let root = profile_root();
+    // The renderer answers Runtime.evaluate; while a dialog is open it does not.
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Runtime.evaluate" && session == Some("S0")
+    });
+    let limits = Limits {
+        command: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    peer.event(phone(
+        "Runtime.executionContextCreated",
+        json!({"context": {"id": 42, "name": IME_WORLD, "auxData": {"frameId": "T0", "type": "isolated"}}}),
+    ));
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: false
+    }));
+    wait_for(&live, "the phone hidden", Duration::from_secs(2), |s| {
+        !s.devices[0].streaming
+    });
+    peer.event(dialog_opening("alert", "hello", ""));
+    let alert = phone_dialog(&live);
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: true
+    }));
+    wait_for(&live, "the phone shown", Duration::from_secs(2), |s| {
+        s.devices[0].streaming
+    });
+    // The browser answers the stream and input commands; nothing waits for
+    // the page past the command limit.
+    thread::sleep(limits.command + Duration::from_millis(500));
+    let status = live.status();
+    assert!(running(&status), "{:?}", status.runtime);
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(alert.token)
+    );
+    assert_eq!(peer.count("Runtime.evaluate", "S0"), 0);
+    // The closed dialog's caret is asked for again, without a deadline:
+    // another dialog could hold that request too.
+    answer_phone(&live, alert.token, true, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    peer.event(dialog_closed(true));
+    wait_for_requests(&peer, "Runtime.evaluate", "S0", 1);
+    let refresh = peer.last_params("Runtime.evaluate", "S0");
+    assert_eq!(refresh["contextId"], 42);
+    assert!(
+        refresh["expression"]
+            .as_str()
+            .is_some_and(|expression| expression.contains("__broxserImeRefresh")),
+        "{refresh}"
+    );
+    thread::sleep(limits.command + Duration::from_millis(500));
+    assert!(running(&live.status()));
+    drop(live);
+}
+
+#[test]
+fn prompt_default_can_be_sent_back_and_rejected_answers_are_reported() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    let long = "d".repeat(3000);
+    peer.event(dialog_opening(
+        "prompt",
+        "Your name?",
+        &format!("first\nsecond\tthird\u{7}{long}"),
+    ));
+    let prompt = phone_dialog(&live);
+    // The page's proposal is shown as an answer Broxser can send unchanged.
+    let expected: String = format!("first second third{long}")
+        .chars()
+        .take(MAX_DIALOG_CHARS)
+        .collect();
+    assert_eq!(prompt.default_text, expected);
+    // A longer answer is not sent: the dialog stays and the device says why.
+    answer_phone(
+        &live,
+        prompt.token,
+        true,
+        Some(&"a".repeat(MAX_DIALOG_CHARS + 1)),
+    );
+    let status = wait_for(&live, "the rejection", Duration::from_secs(2), |s| {
+        s.devices[0].error.is_some()
+    });
+    assert_eq!(status.devices[0].error.as_deref(), Some(PROMPT_REJECTED));
+    assert!(PROMPT_REJECTED.contains(&MAX_DIALOG_CHARS.to_string()));
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(prompt.token)
+    );
+    // The unchanged default is sent as it is; the sent answer clears the report.
+    answer_phone(&live, prompt.token, true, Some(&prompt.default_text));
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": true, "promptText": expected})
+    );
+    wait_for(&live, "the report cleared", Duration::from_secs(2), |s| {
+        s.devices[0].error.is_none()
+    });
+    peer.event(dialog_closed(true));
+    wait_for(&live, "the prompt to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+
+    // Control characters are refused too, and the closing clears the report.
+    peer.event(dialog_opening("prompt", "Again?", ""));
+    let prompt = phone_dialog(&live);
+    assert_eq!(prompt.default_text, "");
+    answer_phone(&live, prompt.token, true, Some("two\nlines"));
+    wait_for(&live, "the rejection", Duration::from_secs(2), |s| {
+        s.devices[0].error.as_deref() == Some(PROMPT_REJECTED)
+    });
+    peer.event(dialog_closed(false));
+    let status = wait_for(&live, "the prompt to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    assert_eq!(status.devices[0].error, None);
+    assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 1);
+    drop(live);
+}
+
+#[test]
+fn a_dialog_takes_one_answer_and_never_the_previous_dialogs() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(dialog_opening("confirm", "Continue?", ""));
+    let first = phone_dialog(&live);
+    // `Page.handleJavaScriptDialog` answers whatever dialog is showing; until
+    // the closing is read, a second answer could reach the page's next one.
+    answer_phone(&live, first.token, false, None);
+    answer_phone(&live, first.token, true, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 1);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": false})
+    );
+    peer.event(dialog_closed(false));
+    wait_for(&live, "the dialog to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    peer.event(dialog_opening("confirm", "Really?", ""));
+    let second = phone_dialog(&live);
+    assert_ne!(second.token, first.token);
+    answer_phone(&live, first.token, true, None);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 1);
+    answer_phone(&live, second.token, true, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 2);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": true})
+    );
+    drop(live);
+}
+
+#[test]
+fn a_dialog_answer_the_browser_refuses_can_be_sent_again() {
+    let root = profile_root();
+    // The test gives the browser's replies to the answers.
+    let peer = FakePeer::start(root.path(), |method, _| {
+        method == "Page.handleJavaScriptDialog"
+    });
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(dialog_opening("confirm", "Continue?", ""));
+    let dialog = phone_dialog(&live);
+    answer_phone(&live, dialog.token, true, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    // An error while the dialog stays open takes the answer back.
+    peer.event(json!({
+        "id": peer.last_request_id("Page.handleJavaScriptDialog", "S0"),
+        "error": {"code": -32000, "message": "Could not handle the dialog"}
+    }));
+    let status = wait_for(&live, "the error", Duration::from_secs(2), |s| {
+        s.protocol_error.is_some()
+    });
+    assert_eq!(
+        status.protocol_error.as_deref(),
+        Some("Could not handle the dialog")
+    );
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(dialog.token)
+    );
+    answer_phone(&live, dialog.token, false, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 2);
+    assert_eq!(
+        peer.last_params("Page.handleJavaScriptDialog", "S0"),
+        json!({"accept": false})
+    );
+    // A successful answer is the dialog's only one, also before the browser
+    // reports it closed.
+    peer.event(json!({
+        "id": peer.last_request_id("Page.handleJavaScriptDialog", "S0"),
+        "result": {}
+    }));
+    wait_until_read(&peer);
+    answer_phone(&live, dialog.token, true, None);
+    // Commands run in order: once the tablet's key arrives, the answer was handled.
+    send_keys(&live, 1, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S1", 2);
+    assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 2);
+    drop(live);
+}
+
+#[test]
+fn staying_ends_the_broxser_navigation_that_asked_in_either_reply_order() {
+    for reply_first in [true, false] {
+        let root = profile_root();
+        let peer = peer_holding_phone_navigations(root.path());
+        let limits = Limits {
+            load: Duration::from_millis(600),
+            ..Limits::default()
+        };
+        let live = fake_live(root.path(), limits);
+        assert!(live.send(Command::NavigateAll {
+            url: "http://127.0.0.1:4173/next".into(),
+        }));
+        wait_for_requests(&peer, "Page.navigate", "S0", 2);
+        peer.event(dialog_opening("beforeunload", "", ""));
+        let question = phone_dialog(&live);
+        // The question pauses the navigation's deadline.
+        thread::sleep(limits.load + Duration::from_millis(200));
+        assert_eq!(peer.count("Page.stopLoading", "S0"), 0);
+        answer_phone(&live, question.token, false, None);
+        wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+        // Helium answers the navigation with net::ERR_ABORTED, before or
+        // after it reports the closing.
+        let aborted = failed_navigate_reply(&peer, "net::ERR_ABORTED");
+        if reply_first {
+            peer.event(aborted.clone());
+        }
+        peer.event(dialog_closed(false));
+        if !reply_first {
+            peer.event(aborted);
+        }
+        wait_for(&live, "stayed", Duration::from_secs(2), |s| {
+            s.devices[0].dialog.is_none() && !s.devices[0].loading
+        });
+        // No failure, then or at the deadline: the navigation is over.
+        thread::sleep(limits.load + Duration::from_millis(200));
+        let status = live.status();
+        assert!(running(&status));
+        assert_eq!(status.devices[0].error, None, "reply_first={reply_first}");
+        assert!(!status.devices[0].loading, "reply_first={reply_first}");
+        assert_eq!(
+            peer.count("Page.stopLoading", "S0"),
+            0,
+            "reply_first={reply_first}"
+        );
+        drop(live);
+    }
+}
+
+#[test]
+fn staying_ends_a_reload_that_asked() {
+    let root = profile_root();
+    // Helium answers Page.reload at once, after the reload's loader started.
+    let peer = FakePeer::start_with_events(
+        root.path(),
+        |_, _| false,
+        |method, session| {
+            if method == "Page.reload" && session == Some("S0") {
+                vec![phone(
+                    "Page.frameStartedNavigating",
+                    json!({"frameId": "T0", "loaderId": "reload", "navigationType": "reload",
+                        "url": "http://127.0.0.1:4173/"}),
+                )]
+            } else {
+                Vec::new()
+            }
+        },
+    );
+    let limits = Limits {
+        load: Duration::from_millis(600),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    assert!(live.send(Command::Reload { device: 0 }));
+    wait_for_requests(&peer, "Page.reload", "S0", 1);
+    peer.event(dialog_opening("beforeunload", "", ""));
+    let question = phone_dialog(&live);
+    answer_phone(&live, question.token, false, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    // Helium also reports that the reload's loader stopped, which ends the
+    // reload by itself; the answer alone must end it too.
+    peer.event(dialog_closed(false));
+    wait_for(&live, "stayed", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none() && !s.devices[0].loading
+    });
+    thread::sleep(limits.load + Duration::from_millis(200));
+    let status = live.status();
+    assert_eq!(status.devices[0].error, None);
+    assert!(!status.devices[0].loading);
+    assert_eq!(peer.count("Page.stopLoading", "S0"), 0);
+    assert_eq!(peer.count("Page.reload", "S0"), 1, "never retried");
+    drop(live);
+}
+
+#[test]
+fn leaving_continues_the_navigation_under_a_fresh_deadline() {
+    let root = profile_root();
+    let peer = peer_holding_phone_navigations(root.path());
+    let limits = Limits {
+        load: Duration::from_millis(800),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into(),
+    }));
+    wait_for_requests(&peer, "Page.navigate", "S0", 2);
+    peer.event(dialog_opening("beforeunload", "", ""));
+    let question = phone_dialog(&live);
+    thread::sleep(limits.load + Duration::from_millis(200));
+    answer_phone(&live, question.token, true, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    peer.event(dialog_closed(true));
+    let status = wait_for(&live, "left", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    assert!(status.devices[0].loading);
+    assert_eq!(status.devices[0].error, None);
+    // The load limit starts again when the dialog closes, and still applies.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(peer.count("Page.stopLoading", "S0"), 0);
+    wait_for_requests(&peer, "Page.stopLoading", "S0", 1);
+    let status = wait_for(&live, "the deadline", Duration::from_secs(2), |s| {
+        s.devices[0].error.is_some()
+    });
+    assert!(
+        status.devices[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("loading stopped"))
+    );
+    assert_eq!(peer.count("Page.navigate", "S0"), 2, "never retried");
+    drop(live);
+}
+
+#[test]
+fn staying_on_the_pages_own_link_keeps_the_broxser_navigation() {
+    let root = profile_root();
+    let peer = peer_holding_phone_navigations(root.path());
+    let limits = Limits {
+        load: Duration::from_millis(800),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into(),
+    }));
+    wait_for_requests(&peer, "Page.navigate", "S0", 2);
+    // Before the server answers, the page follows its own link and asks
+    // before leaving; Helium reports the request first.
+    peer.event(phone(
+        "Page.frameRequestedNavigation",
+        json!({"frameId": "T0", "reason": "anchorClick", "disposition": "currentTab",
+            "url": "http://127.0.0.1:4173/link"}),
+    ));
+    peer.event(dialog_opening("beforeunload", "", ""));
+    let question = phone_dialog(&live);
+    answer_phone(&live, question.token, false, None);
+    wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+    peer.event(dialog_closed(false));
+    let status = wait_for(&live, "stayed", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    // Chromium cancels only the link. Broxser's navigation is still loading
+    // and keeps its deadline.
+    assert!(status.devices[0].loading);
+    assert_eq!(status.devices[0].error, None);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(peer.count("Page.stopLoading", "S0"), 0);
+    wait_for_requests(&peer, "Page.stopLoading", "S0", 1);
+    drop(live);
+}
+
+#[test]
+fn staying_ends_the_broxser_navigation_after_a_page_request_outside_its_tab() {
+    let root = profile_root();
+    let peer = peer_holding_phone_navigations(root.path());
+    let limits = Limits {
+        load: Duration::from_millis(600),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    for (round, disposition) in ["newTab", "newWindow", "download"].into_iter().enumerate() {
+        assert!(live.send(Command::NavigateAll {
+            url: "http://127.0.0.1:4173/next".into(),
+        }));
+        wait_for_requests(&peer, "Page.navigate", "S0", round + 2);
+        // A navigation outside the current tab leaves the page where it is;
+        // the question that follows is about Broxser's navigation.
+        peer.event(phone(
+            "Page.frameRequestedNavigation",
+            json!({"frameId": "T0", "reason": "anchorClick", "disposition": disposition,
+                "url": "http://127.0.0.1:4173/link"}),
+        ));
+        peer.event(dialog_opening("beforeunload", "", ""));
+        let question = phone_dialog(&live);
+        answer_phone(&live, question.token, false, None);
+        wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", round + 1);
+        peer.event(dialog_closed(false));
+        wait_for(
+            &live,
+            &format!("staying after {disposition}"),
+            Duration::from_secs(2),
+            |s| s.devices[0].dialog.is_none() && !s.devices[0].loading,
+        );
+    }
+    thread::sleep(limits.load + Duration::from_millis(200));
+    let status = live.status();
+    assert_eq!(status.devices[0].error, None);
+    assert!(!status.devices[0].loading);
+    assert_eq!(peer.count("Page.stopLoading", "S0"), 0);
+    drop(live);
+}
+
+#[test]
+fn a_dialog_drops_the_composition_without_a_cancel_or_a_not_responding_report() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Input.dispatchKeyEvent" && session == Some("S0")
+    });
+    let live = fake_live(root.path(), Limits::default());
+    peer.event(phone(
+        "Runtime.executionContextCreated",
+        json!({"context": {"id": 42, "name": IME_WORLD, "auxData": {"frameId": "T0", "type": "isolated"}}}),
+    ));
+    // The fake reads the current editable as anchor 1.
+    let compose = |sent: usize| {
+        peer.event(phone(
+            "Runtime.bindingCalled",
+            json!({"name": IME_BINDING, "executionContextId": 42,
+                "payload": "{\"active\":true,\"anchor\":1,\"x\":20,\"y\":40,\"width\":1,\"height\":18}"}),
+        ));
+        let target = wait_for(&live, "the caret", Duration::from_secs(2), |s| {
+            s.devices[0].text_input.is_some()
+        })
+        .devices[0]
+            .text_input
+            .unwrap()
+            .target;
+        assert!(live.send(Command::Ime {
+            device: 0,
+            target,
+            action: ImeAction::Preedit {
+                text: "ka".into(),
+                selection: 2..2,
+            },
+        }));
+        wait_for_requests(&peer, "Input.imeSetComposition", "S0", sent);
+    };
+    // A cancel would wait behind the dialog and, if no composition is left
+    // by then, delete the page's selection.
+    compose(1);
+    peer.event(dialog_opening("alert", "hello", ""));
+    let alert = phone_dialog(&live);
+    assert_eq!(live.status().devices[0].text_input, None);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.count("Input.imeSetComposition", "S0"), 1);
+    answer_phone(&live, alert.token, true, None);
+    peer.event(dialog_closed(true));
+    wait_for(&live, "the dialog to close", Duration::from_secs(2), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    // A page at the unanswered input limit waits for its user, not for input.
+    // The composition's answer is read first, so the keys alone reach it.
+    compose(2);
+    wait_until_read(&peer);
+    send_keys(&live, 0, MAX_UNANSWERED_INPUT / 2);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S0", MAX_UNANSWERED_INPUT);
+    peer.event(dialog_opening("alert", "again", ""));
+    phone_dialog(&live);
+    thread::sleep(Duration::from_millis(200));
+    let status = live.status();
+    assert_eq!(status.devices[0].error, None);
+    assert_eq!(peer.count("Input.imeSetComposition", "S0"), 2);
+    drop(live);
+}
+
+#[test]
+fn a_dialog_broxser_cannot_show_is_reported_and_blocks_nothing() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    for opening in [
+        dialog_opening("print", "", ""),
+        phone(
+            "Page.javascriptDialogOpening",
+            json!({"url": "http://127.0.0.1:4173/", "message": "no type"}),
+        ),
+    ] {
+        peer.event(opening);
+        let status = wait_for(&live, "the report", Duration::from_secs(2), |s| {
+            s.devices[0].error.is_some()
+        });
+        assert_eq!(status.devices[0].error.as_deref(), Some(UNKNOWN_DIALOG));
+        assert_eq!(status.devices[0].dialog, None);
+        // Broxser has no answer for it, so input still goes to the page.
+        let keys = peer.count("Input.dispatchKeyEvent", "S0");
+        send_keys(&live, 0, 1);
+        wait_for_requests(&peer, "Input.dispatchKeyEvent", "S0", keys + 2);
+        peer.event(dialog_closed(false));
+        wait_for(&live, "the report cleared", Duration::from_secs(2), |s| {
+            s.devices[0].error.is_none()
+        });
+    }
+    // Reload is not refused; it cancels such a dialog.
+    peer.event(dialog_opening("print", "", ""));
+    wait_for(&live, "the report", Duration::from_secs(2), |s| {
+        s.devices[0].error.is_some()
+    });
+    assert!(live.send(Command::Reload { device: 0 }));
+    wait_for_requests(&peer, "Page.reload", "S0", 1);
+    drop(live);
+}
+
+#[test]
+fn a_refused_go_retires_the_devices_link_and_a_refused_synced_link_keeps_it() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    link_observer(&peer, &live);
+    // The tablet, in the phone's session, observes its links too.
+    let tablet_report = |phase: &str, id: u64, url: &str| {
+        tablet(
+            "Runtime.bindingCalled",
+            json!({"name": LINK_BINDING, "executionContextId": 8,
+                "payload": json!({"phase": phase, "id": id, "url": url}).to_string()}),
+        )
+    };
+    peer.event(tablet(
+        "Runtime.executionContextCreated",
+        json!({"context": {"id": 8, "name": LINK_WORLD, "auxData": {"frameId": "T1", "type": "isolated"}}}),
+    ));
+    let link = "http://127.0.0.1:4173/linked";
+    follow_link(&peer, 1, link, "LINK");
+    // The old document asks something while the link's server has not answered.
+    peer.event(dialog_opening("alert", "wait", ""));
+    phone_dialog(&live);
+    // The tablet's own link commits, and the phone refuses to follow it.
+    let tablet_link = "http://127.0.0.1:4173/tablet";
+    peer.event(tablet_report("C", 1, tablet_link));
+    peer.event(tablet(
+        "Page.frameRequestedNavigation",
+        json!({"frameId": "T1", "reason": "anchorClick", "disposition": "currentTab",
+            "url": tablet_link}),
+    ));
+    peer.event(tablet_report("Y", 1, tablet_link));
+    peer.event(tablet(
+        "Page.frameStartedNavigating",
+        json!({"frameId": "T1", "loaderId": "TABLET", "navigationType": "differentDocument",
+            "url": tablet_link}),
+    ));
+    peer.event(tablet(
+        "Page.frameNavigated",
+        json!({"frame": {"id": "T1", "loaderId": "TABLET", "url": tablet_link}}),
+    ));
+    wait_for(&live, "the refused link", Duration::from_secs(2), |s| {
+        s.devices[0].error.as_deref() == Some(DIALOG_OPEN)
+    });
+    // That left the phone as it was: its link still commits and reaches the
+    // tablet like any trusted link (ADR 0013).
+    peer.event(commit("LINK", link, json!({})));
+    wait_for_requests(&peer, "Page.navigate", "S1", 2);
+    assert_eq!(
+        peer.navigations("S1").last().map(String::as_str),
+        Some(link)
+    );
+
+    // An explicit Go supersedes the link the phone follows, also when the
+    // phone's dialog refuses it.
+    let next = "http://127.0.0.1:4173/next";
+    follow_link(&peer, 2, next, "NEXT");
+    peer.event(dialog_opening("alert", "wait", ""));
+    phone_dialog(&live);
+    let go = "http://127.0.0.1:4173/go";
+    assert!(live.send(Command::NavigateAll { url: go.into() }));
+    wait_for_requests(&peer, "Page.navigate", "S1", 3);
+    wait_for(&live, "the refused Go", Duration::from_secs(2), |s| {
+        s.devices[0].error.as_deref() == Some(DIALOG_OPEN)
+    });
+    // The link commits later and leaves the tablet on the Go's page.
+    peer.event(commit("NEXT", next, json!({})));
+    wait_until_read(&peer);
+    assert_eq!(live.status().devices[0].url, next);
+    assert_eq!(peer.navigations("S1"), ["http://127.0.0.1:4173/", link, go]);
+    assert_eq!(
+        peer.navigations("S0").len(),
+        1,
+        "the phone was not navigated"
+    );
+    drop(live);
+}
+
+#[test]
+fn a_stopped_runtime_leaves_no_dialog_shown() {
+    let root = profile_root();
+    // The browser never acknowledges a frame, so the runtime stops at the
+    // command limit, as it does when the browser goes away.
+    let peer = FakePeer::start(root.path(), |method, _| method == "Page.screencastFrameAck");
+    let limits = Limits {
+        command: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let live = fake_live(root.path(), limits);
+    peer.event(dialog_opening("confirm", "Continue?", ""));
+    phone_dialog(&live);
+    assert!(live.send(Command::NavigateAll {
+        url: "http://127.0.0.1:4173/next".into(),
+    }));
+    wait_for(&live, "the refusal", Duration::from_secs(2), |s| {
+        s.devices[0].error.as_deref() == Some(DIALOG_OPEN)
+    });
+    peer.event(phone("Page.screencastFrame", json!({"sessionId": 1})));
+    let status = wait_for(&live, "the runtime to stop", Duration::from_secs(5), |s| {
+        matches!(s.runtime, RuntimeState::Stopped { .. })
+    });
+    assert!(
+        matches!(&status.runtime, RuntimeState::Stopped { error: Some(error) }
+            if error.contains("Page.screencastFrameAck")),
+        "{:?}",
+        status.runtime
+    );
+    assert_eq!(status.devices[0].dialog, None);
+    assert_eq!(status.devices[0].error, None);
+    drop(live);
+}
+
+#[test]
+fn a_dialog_refuses_reload_and_synced_links_and_drops_pointer_input() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    link_observer(&peer, &live);
+    // The tablet shares the phone's session, so the phone's links reach it.
+    peer.event(
+        json!({"method": "Page.javascriptDialogOpening", "sessionId": "S1", "params": {
+            "url": "http://127.0.0.1:4173/", "message": "wait", "type": "alert",
+            "hasBrowserHandler": true, "defaultPrompt": ""
+        }}),
+    );
+    wait_for(&live, "the tablet's dialog", Duration::from_secs(2), |s| {
+        s.devices[1].dialog.is_some()
+    });
+    let link = "http://127.0.0.1:4173/linked";
+    follow_link(&peer, 1, link, "LINK");
+    peer.event(commit("LINK", link, json!({})));
+    let status = wait_for(&live, "the refused link", Duration::from_secs(2), |s| {
+        s.devices[1].error.is_some()
+    });
+    assert_eq!(status.devices[1].error.as_deref(), Some(DIALOG_OPEN));
+    assert!(status.devices[1].dialog.is_some());
+    assert!(live.send(Command::Reload { device: 1 }));
+    for (kind, buttons) in [
+        (PointerKind::Move, 0),
+        (PointerKind::Down, 1),
+        (PointerKind::Up, 0),
+    ] {
+        assert!(live.send(Command::Pointer {
+            device: 1,
+            event: PointerEvent {
+                kind,
+                x: 10.0,
+                y: 10.0,
+                button: PointerButton::Left,
+                buttons,
+                click_count: 1,
+                modifiers: Modifiers::default(),
+            },
+        }));
+    }
+    assert!(live.send(Command::Wheel {
+        device: 1,
+        x: 10.0,
+        y: 10.0,
+        delta_x: 0.0,
+        delta_y: 100.0,
+    }));
+    // Commands run in order: once the phone's key arrives, the tablet's
+    // commands ran and anything they queued had a turn to go out.
+    send_keys(&live, 0, 1);
+    wait_for_requests(&peer, "Input.dispatchKeyEvent", "S0", 2);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(peer.navigations("S1").len(), 1);
+    assert_eq!(peer.count("Page.reload", "S1"), 0);
+    assert_eq!(peer.count("Input.dispatchMouseEvent", "S1"), 0);
+    assert_eq!(live.status().devices[1].error.as_deref(), Some(DIALOG_OPEN));
+    drop(live);
+}
+
+#[test]
+fn a_new_document_a_crash_or_a_detach_ends_the_dialog_and_its_token() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    for (end, error) in [
+        (
+            commit("next", "http://127.0.0.1:4173/next", json!({})),
+            None,
+        ),
+        (
+            json!({"method": "Target.targetCrashed", "params": {
+                "targetId": "T0", "status": "crashed", "errorCode": 11
+            }}),
+            Some("crashed"),
+        ),
+        (
+            json!({"method": "Target.detachedFromTarget", "params": {
+                "sessionId": "S0", "targetId": "T0"
+            }}),
+            Some("detached"),
+        ),
+    ] {
+        peer.event(dialog_opening("confirm", "Continue?", ""));
+        let dialog = phone_dialog(&live);
+        peer.event(end);
+        let status = wait_for(&live, "the dialog to end", Duration::from_secs(2), |s| {
+            s.devices[0].dialog.is_none()
+        });
+        match error {
+            None => assert_eq!(status.devices[0].error, None),
+            Some(word) => assert!(
+                status.devices[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(word)),
+                "{:?}",
+                status.devices[0].error
+            ),
+        }
+        // Its token answers nothing any more.
+        answer_phone(&live, dialog.token, true, None);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(peer.count("Page.handleJavaScriptDialog", "S0"), 0);
+    }
     drop(live);
 }
 
@@ -1274,6 +2266,36 @@ addEventListener('hashchange', () => report('framehash'));
 s.addEventListener('click', e => { e.preventDefault(); history.pushState(null, '', s.href); report('framespa'); });
 </script></body></html>"##;
 
+/// Buttons that open each kind of dialog, 60 px apart, and a field below them.
+/// Every dialog's outcome is reported once the page runs again.
+const DIALOG_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;font:16px sans-serif}button{position:absolute;left:20px;width:160px;height:40px}
+#b-alert{top:100px}#b-confirm{top:160px}#b-prompt{top:220px}#field{position:absolute;left:20px;top:300px;width:160px;height:30px}</style></head><body>
+<button id=b-alert>alert</button><button id=b-confirm>confirm</button><button id=b-prompt>prompt</button><input id=field>
+<script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth, ...data}));
+const by = id => document.getElementById(id);
+by('b-alert').addEventListener('click', () => { window.alert('hello from the page'); report('dialog', {result: 'alert closed'}); });
+by('b-confirm').addEventListener('click', () => report('dialog', {result: 'confirm=' + window.confirm('Continue?')}));
+by('b-prompt').addEventListener('click', () => report('dialog', {result: 'prompt=' + window.prompt('Your name?', 'guest')}));
+by('field').addEventListener('input', () => report('input', {v: by('field').value}));
+</script></body></html>"#;
+
+/// Asks before leaving once its field holds text. Chromium shows that
+/// question only after the user interacted with the page.
+const DIRTY_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;font:16px sans-serif}#field{position:absolute;left:20px;top:100px;width:160px;height:30px}
+#link{position:absolute;left:20px;top:160px;width:160px;height:40px;background:#08f;color:#fff}</style></head><body>
+<input id=field><a id=link href="/next">next</a>
+<script>
+const report = (kind, data) => fetch('/event?' + new URLSearchParams({kind, w: innerWidth, ...data}));
+const field = document.getElementById('field');
+addEventListener('mousedown', e => report('down', {x: e.clientX, y: e.clientY, target: e.target.id}), true);
+addEventListener('keydown', e => report('keydown', {key: e.key, target: document.activeElement.id}), true);
+field.addEventListener('input', () => report('input', {v: field.value}));
+addEventListener('beforeunload', e => { if (field.value) { e.preventDefault(); e.returnValue = 'unsaved'; } });
+</script></body></html>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -1405,6 +2427,8 @@ fn fixture() -> Fixture {
             ),
             "/frame" => FRAME_PAGE.into(),
             "/frame-dest" => "<!doctype html><p>frame destination</p>".into(),
+            "/dialogs" => DIALOG_PAGE.into(),
+            "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
             "/script-pointer" => PAGE.replace("AUTO", "document.body.addEventListener('click', e => { if (!e.target.closest('a')) setTimeout(() => document.getElementById('link').click(), 100); });"),
@@ -3320,6 +4344,395 @@ fn live_cancelled_and_superseded_link_navigations_sync_at_most_the_latest() {
     assert_eq!(count(&fixture, "/slow"), 3);
     assert_eq!(count(&fixture, "/landed?go"), 3);
     assert!(loaded(&live.session().status(), &fixture, "/landed?go"));
+    live.close();
+}
+
+/// Reports of `DIALOG_PAGE` and `DIRTY_PAGE` dialogs, as `result` values.
+fn dialog_results(fixture: &Fixture) -> Vec<String> {
+    events(fixture, "dialog")
+        .into_iter()
+        .filter_map(|event| event.get("result").cloned())
+        .collect()
+}
+
+fn answer(live: &Live, device: usize, token: u64, accept: bool, text: Option<&str>) {
+    live.send(Command::AnswerDialog {
+        device,
+        token,
+        accept,
+        text: text.map(str::to_owned),
+    });
+}
+
+/// The frame count of `device` once no frame has arrived for 700 ms. A frame
+/// already in flight when the page stopped can land after it stopped.
+fn settled_frames(live: &Live, device: usize) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut frames = live.session().status().devices[device].frames;
+    let mut since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(50));
+        let now = live.session().status().devices[device].frames;
+        if now != frames {
+            (frames, since) = (now, Instant::now());
+        } else if since.elapsed() >= Duration::from_millis(700) {
+            return frames;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "frames of device {device} kept arriving: {frames}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_dialogs_wait_for_an_explicit_answer() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/dialogs")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/dialogs")
+    });
+    let open = |live: &Live, y: f64, kind: DialogKind| {
+        // A click before the previous dialog's closing is read is dropped.
+        live.wait("no dialog", Duration::from_secs(5), |s| {
+            s.devices[0].dialog.is_none()
+        });
+        click(live, 0, 100.0, y);
+        let dialog = live
+            .wait("the dialog", Duration::from_secs(10), |s| {
+                s.devices[0].dialog.is_some()
+            })
+            .devices[0]
+            .dialog
+            .clone()
+            .unwrap();
+        assert_eq!(dialog.kind, kind);
+        dialog
+    };
+
+    // alert: the page stops, and so do its frames.
+    let alert = open(&live, 120.0, DialogKind::Alert);
+    assert_eq!(alert.message, "hello from the page");
+    let frames = settled_frames(&live, 0);
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(live.session().status().devices[0].frames, frames);
+    // Typing does not answer it, and Go does not navigate past it.
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("a", Some("a"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    live.send(Command::NavigateAll {
+        url: fixture.url("/next"),
+    });
+    live.wait("peers navigate", Duration::from_secs(10), |s| {
+        s.devices[1..]
+            .iter()
+            .all(|device| device.url == fixture.url("/next") && !device.loading)
+    });
+    thread::sleep(Duration::from_millis(500));
+    let status = live.session().status();
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(alert.token)
+    );
+    assert_eq!(status.devices[0].url, fixture.url("/dialogs"));
+    assert_eq!(status.devices[0].error.as_deref(), Some(DIALOG_OPEN));
+    assert!(
+        dialog_results(&fixture).is_empty(),
+        "the dialog was answered"
+    );
+    assert_eq!(count(&fixture, "/next"), 2);
+    // A stale token answers nothing; the user's answer does.
+    answer(&live, 0, alert.token + 1000, true, None);
+    thread::sleep(Duration::from_millis(400));
+    assert!(live.session().status().devices[0].dialog.is_some());
+    answer(&live, 0, alert.token, true, None);
+    live.wait("alert answered", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none() && s.devices[0].error.is_none()
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture) == ["alert closed"]
+    }));
+    live.wait("frames resume", Duration::from_secs(5), |s| {
+        s.devices[0].frames > frames
+    });
+    assert_eq!(
+        live.session().status().devices[0].url,
+        fixture.url("/dialogs")
+    );
+    // Input reaches the page again. The caret report shows the field has
+    // focus before typing, as a key can overtake a click in Chromium.
+    click(&live, 0, 100.0, 315.0);
+    live.wait("the field's caret", Duration::from_secs(5), |s| {
+        s.devices[0].text_input.is_some()
+    });
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("b", Some("b"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        events(fixture, "input")
+            .iter()
+            .any(|event| event["v"] == "b")
+    }));
+
+    // confirm: cancel, then accept.
+    let confirm = open(&live, 180.0, DialogKind::Confirm);
+    assert_eq!(confirm.message, "Continue?");
+    answer(&live, 0, confirm.token, false, None);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("confirm=false")
+    }));
+    let confirm = open(&live, 180.0, DialogKind::Confirm);
+    answer(&live, 0, confirm.token, true, None);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("confirm=true")
+    }));
+
+    // prompt: the user's text, then cancel.
+    let prompt = open(&live, 240.0, DialogKind::Prompt);
+    assert_eq!(prompt.message, "Your name?");
+    assert_eq!(prompt.default_text, "guest");
+    answer(&live, 0, prompt.token, true, Some("Broxser"));
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("prompt=Broxser")
+    }));
+    let prompt = open(&live, 240.0, DialogKind::Prompt);
+    answer(&live, 0, prompt.token, false, None);
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture).last().map(String::as_str) == Some("prompt=null")
+    }));
+    assert_eq!(
+        dialog_results(&fixture),
+        [
+            "alert closed",
+            "confirm=false",
+            "confirm=true",
+            "prompt=Broxser",
+            "prompt=null"
+        ]
+    );
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_dialog_survives_hide_show_scroll_and_zoom() {
+    let fixture = fixture();
+    let live = Live::start(workspace(fixture.url("/dialogs")));
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/dialogs")
+    });
+    click(&live, 0, 100.0, 120.0);
+    let alert = live
+        .wait("the alert", Duration::from_secs(10), |s| {
+            s.devices[0].dialog.is_some()
+        })
+        .devices[0]
+        .dialog
+        .clone()
+        .unwrap();
+    assert_eq!(alert.kind, DialogKind::Alert);
+    // Hiding, showing, scrolling the device off the canvas and back, and a
+    // new frame size all send commands for the device while its page waits
+    // for the user. Only the browser may be expected to answer them: one
+    // left to the blocked page would stop the runtime at the command limit.
+    let streaming = |live: &Live, what: &str, on: bool| {
+        live.wait(what, Duration::from_secs(5), |s| {
+            s.devices[0].streaming == on
+        });
+    };
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: false,
+    });
+    streaming(&live, "hidden", false);
+    live.send(Command::SetVisible {
+        device: 0,
+        visible: true,
+    });
+    streaming(&live, "shown", true);
+    live.send(Command::SetOnScreen {
+        device: 0,
+        on_screen: false,
+    });
+    streaming(&live, "off screen", false);
+    live.send(Command::SetOnScreen {
+        device: 0,
+        on_screen: true,
+    });
+    streaming(&live, "on screen", true);
+    live.send(Command::SetFrameLimit {
+        device: 0,
+        width: 400,
+        height: 700,
+    });
+    thread::sleep(Limits::default().command + Duration::from_secs(1));
+    let status = live.session().status();
+    assert!(running(&status), "{:?}", status.runtime);
+    assert!(status.devices[0].streaming);
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(alert.token)
+    );
+    assert!(
+        dialog_results(&fixture).is_empty(),
+        "the dialog was answered"
+    );
+    answer(&live, 0, alert.token, true, None);
+    live.wait("alert answered", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        dialog_results(fixture) == ["alert closed"]
+    }));
+    // Input reaches the page again.
+    click(&live, 0, 100.0, 315.0);
+    live.wait("the field's caret", Duration::from_secs(5), |s| {
+        s.devices[0].text_input.is_some()
+    });
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput::from_key("c", Some("c"), Modifiers::default(), down).unwrap(),
+        });
+    }
+    assert!(fixture.wait_for(Duration::from_secs(5), |fixture| {
+        events(fixture, "input")
+            .iter()
+            .any(|event| event["v"] == "c")
+    }));
+    assert!(running(&live.session().status()));
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_beforeunload_dialog_needs_an_explicit_leave_or_stay() {
+    let fixture = fixture();
+    let limits = Limits {
+        load: Duration::from_secs(3),
+        ..Limits::default()
+    };
+    let live = Live::start_with(workspace(fixture.url("/dirty")), limits);
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/dirty")
+    });
+    let dirty = |live: &Live| {
+        let typed = events(&fixture, "input").len();
+        click(live, 0, 100.0, 115.0);
+        // Chromium routes pointer events through its compositor and keys to
+        // the main thread directly; a key sent at once can overtake the click.
+        // The caret report shows the field has focus.
+        live.wait("the field's caret", Duration::from_secs(5), |s| {
+            s.devices[0].text_input.is_some()
+        });
+        for down in [true, false] {
+            live.send(Command::Key {
+                device: 0,
+                key: KeyInput::from_key("x", Some("x"), Modifiers::default(), down).unwrap(),
+            });
+        }
+        assert!(
+            fixture.wait_for(Duration::from_secs(5), |fixture| {
+                events(fixture, "input")
+                    .get(typed)
+                    .is_some_and(|event| event["v"] == "x" && event["w"] == "360")
+            }),
+            "typing did not reach the phone's field: input {:?} down {:?} keydown {:?} status {:#?}",
+            events(&fixture, "input"),
+            events(&fixture, "down"),
+            events(&fixture, "keydown"),
+            live.session().status().devices[0]
+        );
+    };
+    let asks = |live: &Live| {
+        let dialog = live
+            .wait("the question", Duration::from_secs(10), |s| {
+                s.devices[0].dialog.is_some()
+            })
+            .devices[0]
+            .dialog
+            .clone()
+            .unwrap();
+        assert_eq!(dialog.kind, DialogKind::BeforeUnload);
+        dialog
+    };
+
+    // Go: the peers leave; the dirty phone asks and waits past the load limit.
+    dirty(&live);
+    live.send(Command::NavigateAll {
+        url: fixture.url("/next"),
+    });
+    let question = asks(&live);
+    live.wait("peers leave", Duration::from_secs(10), |s| {
+        s.devices[1..]
+            .iter()
+            .all(|device| device.url == fixture.url("/next") && !device.loading)
+    });
+    thread::sleep(limits.load + Duration::from_secs(1));
+    let status = live.session().status();
+    assert_eq!(
+        status.devices[0].dialog.as_ref().map(|d| d.token),
+        Some(question.token)
+    );
+    assert_eq!(status.devices[0].error, None, "the navigation was stopped");
+    assert_eq!(status.devices[0].url, fixture.url("/dirty"));
+    assert_eq!(count(&fixture, "/next"), 2);
+    // Stay: the page keeps its text and reports no failure.
+    answer(&live, 0, question.token, false, None);
+    live.wait("stayed", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none() && !s.devices[0].loading
+    });
+    thread::sleep(Duration::from_millis(500));
+    let status = live.session().status();
+    assert_eq!(status.devices[0].error, None, "{status:#?}");
+    assert_eq!(status.devices[0].url, fixture.url("/dirty"));
+    assert_eq!(count(&fixture, "/next"), 2);
+    // Leave: the same Go, answered the other way, navigates. Go loads every
+    // device once, so the peers load /next again.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/next"),
+    });
+    let question = asks(&live);
+    answer(&live, 0, question.token, true, None);
+    live.wait("left", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/next") && !s.devices[0].loading
+    });
+    assert_eq!(count(&fixture, "/next"), 5);
+
+    // The page's own link asks the same question.
+    live.send(Command::NavigateAll {
+        url: fixture.url("/dirty"),
+    });
+    live.wait("dirty pages", Duration::from_secs(10), |s| {
+        loaded(s, &fixture, "/dirty")
+    });
+    dirty(&live);
+    click(&live, 0, 100.0, 180.0);
+    let question = asks(&live);
+    answer(&live, 0, question.token, false, None);
+    live.wait("stayed again", Duration::from_secs(5), |s| {
+        s.devices[0].dialog.is_none()
+    });
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        live.session().status().devices[0].url,
+        fixture.url("/dirty")
+    );
+    assert_eq!(count(&fixture, "/next"), 5);
+    click(&live, 0, 100.0, 180.0);
+    let question = asks(&live);
+    answer(&live, 0, question.token, true, None);
+    live.wait("followed the link", Duration::from_secs(10), |s| {
+        s.devices[0].url == fixture.url("/next")
+    });
+    assert_eq!(count(&fixture, "/next"), 6);
     live.close();
 }
 
