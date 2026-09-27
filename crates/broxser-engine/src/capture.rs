@@ -219,6 +219,12 @@ impl Capture<'_> {
             self.contexts.insert(context.clone());
             self.record_extension_in_context(&context);
             self.check_extension_guard()?;
+            // Broxser saves no download, whatever the browser's default (ADR 0016).
+            self.command(
+                "Browser.setDownloadBehavior",
+                json!({"behavior": "deny", "browserContextId": context}),
+                None,
+            )?;
             contexts.insert(session.id.as_str(), context);
         }
         for device in &workspace.devices {
@@ -307,9 +313,13 @@ impl Capture<'_> {
             .map(str::to_owned);
         if let Some(error) = response.get("errorText").and_then(Value::as_str) {
             self.settle(index, loader.as_deref());
-            let explanation = foreign(&self.targets[index], loader.as_deref())
-                .map(|navigation| format!(" (superseded by {})", describe(navigation)))
-                .unwrap_or_default();
+            let explanation = if response.get("isDownload").and_then(Value::as_bool) == Some(true) {
+                " (the address is a download, which Broxser does not save)".to_owned()
+            } else {
+                foreign(&self.targets[index], loader.as_deref())
+                    .map(|navigation| format!(" (superseded by {})", describe(navigation)))
+                    .unwrap_or_default()
+            };
             self.record(index, loader, Some(error.to_owned()), started_at);
             bail!(
                 "navigation failed for {}: {error}{explanation}; not retried",

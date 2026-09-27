@@ -203,6 +203,23 @@ untuknya ditolak dengan pesan, dan kedua deadline dijeda (ADR 0014). Jendela yan
 dibuka halaman di context session Broxser ditutup begitu browser melaporkannya
 dan dilaporkan pada device pembukanya dengan alamat dan token; hanya
 `Command::OpenPopup` yang memuat alamat utuhnya di device itu (ADR 0015).
+Setiap context session menolak download (`Browser.setDownloadBehavior deny`);
+engine melaporkan download yang ditolak pada device yang frame-nya memulainya,
+dengan nama file dan alamat yang dibatasi, dan menghitung pemilih file yang
+dibatalkan lewat intersepsi; halaman tidak pernah menerima file (ADR 0016).
+Sesi device mengikuti target renderer iframe secara rekursif agar event pemilih
+file dan download dari frame bersarang tetap terhubung ke device pemiliknya.
+Setup iframe berjalan asinkron di worker; event sesi iframe hanya memperbarui
+kepemilikan frame dan hitungan pemilih file. Penghapusan subtree atau pergantian
+dokumen membuang sesi dan hasil setup lama.
+Setup iframe yang gagal atau melewati deadline menandai laporan aktivitas
+iframe pada dokumen itu sebagai tidak lengkap; device lain tetap berjalan.
+Sesi yang masih ditahan debugger menunggu jawaban resume sebelum dilepas,
+tanpa mengulang aksi halaman. Inventaris dibatasi 256 subframe per device dan
+128 sesi iframe aktif atau menunggu cleanup per runtime (ADR 0016).
+Dismiss laporan download berlaku untuk runtime saat ini dan direset saat
+restart. Panel dibatasi 360 piksel UI dengan tombol di kiri agar tetap
+terjangkau ketika lebar device melampaui window.
 
 ## 6. API and data contracts
 

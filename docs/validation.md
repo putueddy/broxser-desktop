@@ -109,11 +109,142 @@ every 200 ms and sets `window.opener.location = '/hijacked'` after 300 ms:
 | Live Helium suite with popups (`--ignored`, 4 threads) | 37 of 37 passed in 61.9 s |
 | Full `scripts/desktop-smoke.sh` with popups (debug build) | 10 of 10 runs passed; no browser process, profile or window left |
 
+### Downloads and file choosers ([ADR 0016](adr/0016-downloads-and-file-choosers-refused-and-reported.md))
+
+A third scratch Node script, not committed, drove one page target with Broxser's
+setup and a fixture whose file answers arrive slowly (2 MiB in 64 KiB chunks), so
+an early cancel shows as an aborted body. Each case once, with the headless
+default and then with `Browser.setDownloadBehavior` `deny` and events for the
+context:
+
+| Case | Headless default | Denied per context |
+| --- | --- | --- |
+| Attachment link (`Content-Disposition`), `application/octet-stream`, POST answered as an attachment, redirect to an attachment, `location.href` set by a script | Request sent and aborted; `Page.downloadWillBegin` then `downloadProgress` `canceled` within 2–8 ms; no file; the page stays | The same, plus `Browser.downloadWillBegin` and its cancellation |
+| `download` attribute on a page link; `data:` URL with one | Request sent (none for `data:`) and cancelled; suggested name from the attribute | Same |
+| `blob:` URL with a `download` attribute | No download event at all | `Browser.downloadWillBegin` with the blob URL, cancelled |
+| Three `download` links clicked by one script | One request, one download event | Three requests, three events, each cancelled |
+| Attachment link inside a same-origin frame | Reported with the frame's ID on the page session | Same, at the browser level too |
+| Attachment link inside a cross-site frame (another renderer) | Nothing on the page session | `Browser.downloadWillBegin` only, with the frame ID the device session had seen attached and then detached (reason `swap`) |
+| Hostile `Content-Disposition` (`../../.bashrc`, a right-to-left override, newline, bell, escape sequence) | Suggested name `_fdp.exe___[31m.txt`: the browser sanitizes the path, not every control character | Same |
+| `Page.navigate` to an attachment | `net::ERR_ABORTED` with `isDownload: true`, no `loaderId`; download events follow | Same |
+| `<input type=file>` single, `multiple`, `webkitdirectory`, scripted click with a gesture; `showOpenFilePicker`, `showSaveFilePicker`, `showDirectoryPicker` | No chooser: the input's `cancel` event fires, the pickers reject with `AbortError`; a scripted click without a gesture does nothing | With `Page.setInterceptFileChooserDialog`: `Page.fileChooserOpened` (frame, mode, node) and the page waits; with `cancel: true` the page still gets `cancel` |
+
+No file appeared in the profile, the working directory or `~/Downloads` in any
+case.
+
+A temporary test through the live runtime at `6fefab7` (popups branch), with a
+page holding an attachment link, a `download` attribute link, a file input and a
+cross-site frame with its own attachment link:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Click the attachment link on the phone, the `download` link on the tablet, the frame's link on the desktop | Each request was sent and every device status stayed exactly as before: nothing shown | Each device reports "Refused a download the page started" with `report.pdf`, `notes.txt` and `frame.pdf` and the address; the pages stay; each request was sent once |
+| Click the phone's file input | The page got `cancel` after the headless browser opened nothing; nothing shown | The page still gets `cancel`, no file; the phone counts one file chooser |
+| Go to an attachment address | "Navigation failed: net::ERR_ABORTED; not retried" on all three devices | No error; every device reports the download `go.pdf` and stays on its page; three requests |
+| Files anywhere | None | None |
+
+| Check | Result |
+| --- | --- |
+| `downloads_and_file_choosers_are_refused_and_reported_for_their_device` (fake CDP) | Passed |
+| `live_downloads_and_file_choosers_are_refused_and_reported` (Helium) | Passed 1 of 1 alone |
+| `scripts/desktop-smoke.sh`, new run "download refused on the card" | Passed: the phone frame keeps its page, the card shows the report with the accent Dismiss below the frame, Dismiss hides it, and no file named `notes.txt` exists under the run's private `TMPDIR` or `~/Downloads`. A first version looked for the raised button color and matched the anti-aliased edges of the card's text instead; the button is now accent-filled and the run uses a 1000 px tall window so the report is not cut by the window edge |
+| `bash scripts/check.sh` with downloads | Passed: 1 CLI, 8 core, 68 engine and 25 desktop tests (the new `activity_line` unit test included); 38 live tests ignored by default; fmt and strict Clippy clean |
+| Live Helium suite with downloads (`--ignored`, 4 threads) | 37 of 38 passed in 68.9 s; `live_owner_death_while_frames_stream` failed its check that the dead owner's CDP port refuses connections ("the dead owner's CDP endpoint is open") while its browser processes and profile were gone. That check is a plain TCP connect, so a browser or fixture of one of the three other threads taking the freed port answers it; the test passed alone right after (8.4 s). The pre-existing test is not changed here |
+| Full `scripts/desktop-smoke.sh` with downloads (debug build) | 11 of 11 runs passed; no browser process, profile or window left |
+| Rerun after the cherry-pick onto `main` (42744df, PR #15 merged; conflicts in GOALS, README, `live_view.rs` imports and tests, and `dialog_text` resolved without behavior changes) | `bash scripts/check.sh` passed in 58 s (1 CLI, 8 core, 84 engine, 36 desktop tests, fmt and strict Clippy); live Helium suite 39 of 39 in 70 s; desktop smoke 9 of 9 in 1 m 10 s with nothing left running |
+| CI on the PR head (run 87, `push` event) | Failed in the fake-CDP popup test `popups_are_closed_at_once_and_reported_for_their_device`: it compared the peer's `Target.closeTarget` requests right after the tablet's report appeared and saw four of five, because the report is visible before the peer has read the request that went with it; the `pull_request` run of the same commit passed. The check now waits (up to 10 s) for the expected number of close requests before comparing: 25 of 25 targeted runs and 3 of 3 full fake suites passed afterwards |
+
+### PR #16 review corrections, 27 September 2026 (local Linux)
+
+Review of `4fd12de` found four gaps despite a passing full check (129 tests) and
+39 passing live Helium tests. A separate harness used the public `LiveSession`
+API with the pinned Helium and fresh private profiles; a private Xvfb window
+verified the desktop behavior:
+
+- A top-level file input incremented `file_choosers` to 1. A file input inside
+  a cross-site `localhost` iframe then emitted another server-observed `cancel`,
+  but the count stayed at 1. Only the device's main renderer session had chooser
+  interception enabled.
+- With `127.0.0.1` containing a `localhost` iframe, which contained another
+  `127.0.0.1` iframe, the nested frame requested its attachment once but the
+  device stayed at `downloads: 0, download: None`. The browser reported the
+  download with a frame ID absent from the main session's attachment events.
+  A subsequent top-level download correctly incremented the count.
+- Dismissing the first download, killing the owned browser and restarting
+  caused the next runtime's first report to be hidden. The activity line still
+  showed one refused download; the second download displayed its report again.
+- A 1440 × 900 device at 100% in a 1360 × 861 window showed a report whose
+  Dismiss button was beyond the right window edge. Returning to 50% made the
+  button reachable.
+
+The corrected desktop clears download dismissal on restart, limits the panel
+to 360 UI pixels and puts Dismiss on the left. The new smoke scenario
+`download_desktop_restart_run` checks the initial report, the first after a
+browser kill/restart and another fresh report at 100%; every report must appear
+and dismiss. The focused run passed twice with no browser processes or profiles
+left, and its screenshots were inspected. The existing download smoke also
+handles an absent `~/Downloads` directory without creating one or changing user
+files.
+
+Engine regression coverage exercises recursive iframe sessions, DOM ancestry
+across renderer swaps, stale frame-tree replies, removal and document replacement,
+and late detachment of an old session. The real nested-frame fixture checks
+chooser cancellation and downloads on their owning devices, a top-level control,
+one request per action, no selected files, and no replay after navigation.
+
+Qualification also caught a failure in the initial fix's deadline handling:
+one cross-site iframe ran a busy loop, and its page then inserted another iframe
+using the same renderer. `Page.enable` for that new target could not answer;
+treating that as a runtime error stopped a healthy device in another session.
+The final implementation marks only the affected document's iframe activity as
+incomplete and waits asynchronously for resume before detaching held sessions.
+An independent public-API probe used an 18 s busy loop against the default
+15 s setup deadline: the healthy peer accepted clicks throughout, the delayed
+child loaded after recovery and accepted a click, and one attachment request
+produced one download report without a lingering debugger pause or replay.
+The warning persists until a fresh main document; the global 128-session safety
+budget remains an explicit runtime-stop boundary, as recorded in ADR 0016.
+
+| Focused check | Result |
+| --- | --- |
+| Nine new fake-CDP iframe regressions | Passed |
+| Nested cross-site chooser/download Helium regression | Passed: correct owning device, one cancel per chooser and one request per download, no selected or saved files |
+| Finite-busy Helium regression | Passed: a 4 s renderer stall exceeds its 1 s setup deadline, the healthy peer remains usable, and the child resumes after recovery |
+| Independent original review harness | Passed: top chooser count 1 then iframe chooser count 2; nested download count 1 then top-level control count 2; no device/protocol errors |
+| Independent default-deadline recovery harness | Passed: 18 s busy renderer, default 15 s deadline, healthy peer and recovered child remain usable |
+| Focused desktop restart/layout regression | Passed twice at 100% zoom; each of three reports appeared and dismissed, with no browser processes or profiles left |
+
+| Final integrated check | Result |
+| --- | --- |
+| `CARGO_TARGET_DIR=/home/ipei/webdev/broxser/target CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 93 engine + 36 desktop tests (138 total); 41 live tests run separately |
+| Full live Helium suite (`--ignored --test-threads=2 --nocapture`) | Passed: 41 of 41, 208.33 s, including both new regressions and existing popup/dialog/input/navigation controls |
+| Rebuilt debug desktop | Passed; final executable used for the integrated window checks |
+| Full `scripts/desktop-smoke.sh`, private Xvfb 1600 × 1200 with Mesa Lavapipe | Passed: 12 of 12 scenarios, including the desktop download/restart regression; no browser process, profile or window left. The known static preview directory after SIGTERM was removed by the harness |
+| Independent engine review | No remaining actionable findings after the busy-renderer isolation and cleanup corrections; original review reproductions and default-deadline recovery both passed |
+
+The first strict check found one nested `if` that Clippy required collapsing;
+that was corrected and the whole check rerun successfully. The first full window
+run stopped at the older double-Restart scenario's fixed 3 s startup sleep. The
+harness now waits up to 30 s for the restarted browser's fixture request, matching
+its initial-start readiness bound, and closes the app on that failure path.
+The complete window suite then passed. The initial logs are retained alongside
+the final runs. Existing vendored GPUI numeric-fallback and `proc-macro-error2`
+future-compatibility warnings remain non-failing. Physical GPU and Wayland
+rendering were not requalified by these X11 checks.
+
+Review evidence is retained locally in the ignored `artifacts/pr16-review/`
+directory; correction logs and screenshots are in `artifacts/pr16-fixes/`.
+The native checks use Xvfb and Mesa Lavapipe with the browser sandbox enabled.
+
 ### Limits
 
-- Downloads, uploads, permissions, touch input and hover media, drag and drop and
-  accessibility keep today's behavior; each is a separate decision. The audit
-  above is their evidence.
+- Permissions, touch input and hover media, drag and drop and accessibility keep
+  today's behavior; each is a separate decision. The audit above is their
+  evidence.
+- A refused download's document request still reaches the server; export and
+  attachment flows produce no file in Broxser, and upload flows see a cancelled
+  chooser. The suggested file name is the browser's, sanitized as a path, shown
+  on one line without control characters.
 - A closed window's first document request reaches the server, and its script
   can start before the close; flows that need their window (sign-in, payment)
   do not complete.

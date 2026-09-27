@@ -261,11 +261,23 @@ dengan alamatnya, dan hanya "Open here" (token, alamat HTTP(S) utuh dalam batas
 navigasi) yang memuat alamat itu di device tersebut. Request dokumen pertama
 jendela tetap terkirim dan script-nya sesekali sempat mulai; auto-attach level
 browser yang menahan jendela sebelum berjalan tercatat sebagai opsi yang lebih
-kuat. Kapabilitas berikutnya, masing-masing PR sendiri: download dan pemilih file
-(blokir dan laporkan; tetapkan `setDownloadBehavior deny` per context), permission
-notifikasi (tolak eksplisit agar promise tidak menggantung), input touch untuk
-device touch (`Input.dispatchTouchEvent`), lalu dokumentasi batas hover/pointer
-media, drag/drop dan aksesibilitas.
+kuat.
+
+Kapabilitas ketiga, download dan pemilih file
+([ADR 0016](docs/adr/0016-downloads-and-file-choosers-refused-and-reported.md),
+PR terpisah): probe dan run pada `6fefab7` membuktikan bahwa browser headless
+membatalkan setiap download sendiri tanpa laporan apa pun di Broxser, bahwa Go
+ke alamat download berakhir sebagai error navigasi di semua device, dan bahwa
+klik `<input type=file>` tidak menghasilkan apa-apa. Kini setiap context session
+menolak download secara eksplisit (`Browser.setDownloadBehavior deny`), device
+yang frame-nya memulainya (termasuk frame lintas situs) menampilkan "Refused a
+download the page started" dengan nama file dan alamat yang dibatasi, Go ke
+alamat download berakhir tanpa error navigasi, dan pemilih file diintersepsi lalu
+dibatalkan untuk halaman dan dihitung di kartu; tidak ada file pengguna yang
+dibaca. Kapabilitas berikutnya, masing-masing PR sendiri: permission notifikasi
+(tolak eksplisit agar promise tidak menggantung), input touch untuk device touch
+(`Input.dispatchTouchEvent`), lalu dokumentasi batas hover/pointer media,
+drag/drop dan aksesibilitas.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -353,7 +365,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   paste eksplisit: ADR 0010/0011, merged melalui PR #10; P1.4 frame dan resource:
   ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, merged
   melalui PR #13; P1.6 dialog JavaScript: ADR 0014, merged melalui PR #14; popup:
-  ADR 0015, PR #15 menunggu review; kapabilitas lain menyusul).
+  ADR 0015, merged melalui PR #15; download/pemilih file: ADR 0016, PR menunggu
+  review; kapabilitas lain menyusul).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

@@ -106,9 +106,13 @@ device dan hanya dijawab lewat tombolnya; selama terbuka, input ke device itu
 dibuang dan navigasi Broxser untuknya ditolak; dialog tidak pernah dijawab
 otomatis (ADR 0014). Jendela yang dibuka halaman (popup, `target=_blank`) ditutup
 begitu muncul dan dilaporkan di kartu device; "Open here" memuat alamatnya di
-device itu atas permintaan (ADR 0015). Download, upload, permission dan input
-touch belum didukung dan berperilaku seperti default browser headless; status
-auditnya ada di `docs/validation.md`.
+device itu atas permintaan (ADR 0015). Download ditolak di setiap context session
+dan dilaporkan di kartu device dengan nama file dan alamatnya; pemilih file
+dibatalkan dan dihitung, halaman tidak pernah menerima file (ADR 0016). Jika
+renderer iframe tidak merespons saat disiapkan, device menampilkan bahwa laporan
+aktivitas iframe tidak lengkap; device lain tetap berjalan. Permission
+dan input touch belum didukung dan berperilaku seperti default browser headless;
+status auditnya ada di `docs/validation.md`.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable
