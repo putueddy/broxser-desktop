@@ -194,12 +194,33 @@ Live Helium: the three ignored dialog tests
 `live_beforeunload_dialog_needs_an_explicit_leave_or_stay`) were re-run after
 the link-retiring and dialog-answer-retry fixes and again passed 3 of 3 runs
 each, and the full ignored suite (`--ignored`, 4 threads) was re-run and
-passed 37 of 37. Desktop: 35 unit tests passed and strict Clippy is clean. Not
-run: the real X11 window check for the revised desktop panel (width,
-left-aligned buttons, scrolling message box, focus handling, and — new this
-round — composing with an IME, then a prompt taking focus, then returning to
-the canvas) — that check is still pending, unlike the original panel's, which
-was checked in a real window (P1.6 above).
+passed 37 of 37. Desktop: 35 unit tests passed and strict Clippy is clean.
+
+Real X11 window check of the revised panel, 27 September 2026: the same
+container after a restart (Xvfb 1600 × 1000 without a window manager, xdotool,
+debug build of `0fe8b01`, Helium 0.18.1.1 as the unprivileged user with the
+sandbox enabled). A scratch page, not committed, offered a prompt with a
+default, a 40-line alert, a confirm, a button that focuses a text field and
+opens a prompt 3 s later, and reported every `keydown` it saw with its
+`innerWidth` to the fixture log. Every step clicked and typed into the actual
+GPUI window; results were read from the page's reports and from XGetImage
+screenshots of the window.
+
+| Check | Result |
+| --- | --- |
+| Prompt on the selected phone | The field took focus by itself with the default selected; typing `Grace` replaced it and Enter answered `Grace`; the panel closed; no page saw a key |
+| Escape | Typing, then Escape answered `null` (cancelled); the panel closed |
+| Prompt on the phone while the tablet is selected | No auto-focus: a typed `k` reached the tablet's page. A click into the field focused it; Tab, Left, Right, Shift+Insert, Ctrl+X and `q` then reached no page; Enter answered `late defaultq`; a typed `m` afterwards reached the tablet's page, so focus had returned to the canvas and the keyboard was not dead |
+| 40-line alert | The message box stopped at 120 px and scrolled with the wheel; OK closed it. Wheel clicks over the message box also scrolled the canvas behind it (cosmetic; the page got nothing) |
+| Confirm | Cancel answered `false`; the panel closed |
+| Desktop device (1440 CSS px, a 720 px frame at 50 %) in a 700 px wide window, the other devices hidden | Panel 359 px wide at the frame's left edge, Cancel and OK at x 275–405 inside the window although the frame ran past its right edge; the field took focus and Enter answered `Fable`. At 560 px the window edge cut the panel with both buttons still visible; Escape cancelled |
+| `scripts/desktop-smoke.sh` | 9 of 9 runs passed on the second attempt, including "dialog answered on the card", with no browser process or profile left. The first attempt after the container restart failed in its first case ("live close: browser did not start"): Helium's cold start did not publish its CDP endpoint within the 15 s startup limit and the desktop showed "Stopped: browser did not publish a CDP endpoint within 15 seconds"; the script exits on that failure without stopping the desktop it started, which is a gap in the script, not in this PR |
+
+Not run: composing with an IME, then a prompt taking focus, then returning to
+the canvas. The Fcitx5 runtime of P1.3 lived under `/tmp`, which the container
+restart cleared, and this container's proxy now refuses the Arch package
+mirrors (403), so it could not be rebuilt here; that check stays pending for a
+machine with the runtime (`scripts/ime-smoke.py --manual-seconds 120`).
 
 Flake note, kept honest: the frames check in
 `live_dialogs_wait_for_an_explicit_answer` failed once under load — a frame
