@@ -7,9 +7,11 @@ serta gunakan halamannya dari satu window native.
 **Status: spike M1.** Desktop menampilkan **frame live** dari Helium headless (CDP
 screencast) untuk setiap device, dengan URL bar, reload, input pointer/wheel/keyboard
 dan sync link/scroll opt-in di dalam satu session. Ini frame streaming ke window
-native, bukan browser tertanam: copy ke clipboard sistem, paste selain teks,
-popup, download, permission, dialog JavaScript dan aksesibilitas belum didukung, dan
-frame device DPR>1 tiba pada resolusi CSS. Belum ada persistent login, DevTools panel atau console aggregator.
+native, bukan browser tertanam: copy ke clipboard sistem, paste selain teks dan
+aksesibilitas belum didukung; dialog JavaScript dijawab pengguna di kartu, jendela
+yang dibuka halaman ditutup dan dilaporkan, download ditolak dan dilaporkan, dan
+permission yang akan menunggu prompt ditolak (ADR 0014–0017); frame device DPR>1
+tiba pada resolusi CSS. Belum ada persistent login, DevTools panel atau console aggregator.
 IME memakai input handler native untuk preedit, commit dan posisi kandidat pada
 kontrol teks main frame; batas dan kualifikasinya ada di [ADR 0011](docs/adr/0011-native-ime-on-device-canvas.md).
 Ini belum pengganti Sizzy. Mode capture statis tetap tersedia lewat `--static`.
@@ -114,8 +116,11 @@ aktivitas iframe tidak lengkap; device lain tetap berjalan. Permission
 notifikasi, deteksi idle, kamera (termasuk pan/tilt/zoom atau PTZ) dan mikrofon
 ditolak per context sehingga halaman dijawab `denied` seketika, bukan menunggu
 prompt yang tidak pernah muncul
-(ADR 0017). Input touch belum didukung dan berperilaku seperti default browser
-headless; status auditnya ada di `docs/validation.md`.
+(ADR 0017). Device dengan `touch: true` menerima tekan, seret dan lepas sebagai
+satu titik sentuh (`pointerType` `touch`, `touchstart`, `touchmove`, `touchend`;
+seret menggulir seperti swipe), tanpa hover dan klik kanan; gestur multi-jari
+belum dimodelkan (ADR 0018). Status audit kapabilitas lain ada di
+`docs/validation.md`.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable

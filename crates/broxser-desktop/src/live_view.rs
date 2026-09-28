@@ -237,12 +237,14 @@ impl LiveView {
         focus.focus(window);
         let focus_out = cx.on_focus_out(&focus, window, |view, _, window, _| {
             view.release_keys();
+            view.cancel_touches();
             view.invalidate_ime();
             window.invalidate_character_coordinates();
         });
         let window_activation = cx.observe_window_activation(window, |view, window, _| {
             if !window.is_window_active() {
                 view.release_keys();
+                view.cancel_touches();
                 view.invalidate_ime();
                 window.invalidate_character_coordinates();
             }
@@ -520,7 +522,10 @@ impl LiveView {
     ) -> PromptField {
         let input = cx.new(|cx| UrlInput::new(text, Some(MAX_DIALOG_CHARS), cx));
         let focus = input.focus_handle(cx);
-        let focus_in = cx.on_focus_in(&focus, window, |view, _, _| view.invalidate_ime());
+        let focus_in = cx.on_focus_in(&focus, window, |view, _, _| {
+            view.cancel_touches();
+            view.invalidate_ime();
+        });
         let events = cx.subscribe_in(&input, window, move |view, field, event, window, cx| {
             // The auto-repeat of a key pressed elsewhere, such as the Enter
             // that answered the previous prompt, answers nothing; LineEdit::key
@@ -807,7 +812,25 @@ impl LiveView {
         true
     }
 
+    fn cancel_touches(&mut self) {
+        for index in 0..self.devices.len() {
+            if self.workspace.devices[index].touch {
+                self.release_buttons(index);
+            }
+        }
+    }
+
     fn release_buttons(&mut self, index: usize) -> bool {
+        if self.workspace.devices[index].touch {
+            if self.devices[index].buttons & 1 != 0
+                && !self.send(Command::CancelTouch { device: index })
+            {
+                return false;
+            }
+            self.devices[index].buttons = 0;
+            self.devices[index].last_point = None;
+            return true;
+        }
         let Some((x, y)) = self.devices[index].last_point else {
             self.devices[index].buttons = 0;
             return true;
@@ -1063,6 +1086,24 @@ impl LiveView {
         if self.devices[index].hidden {
             return;
         }
+        // A touch canvas has only a left-button finger. Reject other presses
+        // before they can cancel composition, select a device or alter its
+        // held-button state; the engine also rejects unsupported page input.
+        if self.workspace.devices[index].touch
+            && kind != PointerKind::Move
+            && button != Some(MouseButton::Left)
+        {
+            return;
+        }
+        // URL and prompt fields are descendants of the root focus handle,
+        // so entering them need not trigger its focus-out subscription.
+        if self.workspace.devices[index].touch
+            && kind != PointerKind::Down
+            && self.key_focus(window) != KeyFocus::Canvas
+        {
+            self.release_buttons(index);
+            return;
+        }
         let Some((x, y)) = self.map(index, position) else {
             return;
         };
@@ -1119,6 +1160,12 @@ impl LiveView {
     /// A button released outside the frame must not stay pressed in the page.
     fn release_outside(&mut self, index: usize, modifiers: &gpui::Modifiers) {
         if self.devices[index].hidden {
+            return;
+        }
+        // Outside motion has no mapped viewport point. Ending a touch at its
+        // last inside point could click the element the user dragged away from.
+        if self.workspace.devices[index].touch {
+            self.release_buttons(index);
             return;
         }
         let device = &self.devices[index];
@@ -1906,6 +1953,7 @@ impl Render for LiveView {
             }))
             .on_action(cx.listener(|view, _: &Refresh, _, cx| view.reload_selected(cx)))
             .on_action(cx.listener(|view, _: &FocusUrl, window, cx| {
+                view.cancel_touches();
                 view.url.update(cx, |input, cx| input.focus_all(window, cx));
             }))
             .on_key_up(cx.listener(|view, event: &KeyUpEvent, _, _| {

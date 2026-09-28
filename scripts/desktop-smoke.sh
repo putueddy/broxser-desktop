@@ -753,6 +753,78 @@ PY
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Touch cancellation must cross the real canvas handlers: a release outside
+# its bounds or focus moving to the URL bar must not activate the start point.
+# The final normal tap reports the complete event history, including any
+# unwanted right/middle click or stale hover after the canceled gesture.
+touch_run() {
+  local label=$1
+  local before app window= failure= button x y code=0 left_processes left_profiles
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/touch.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    xdotool windowsize "$window" 1360 861 || true
+    if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+      failure="the phone frame did not show the touch target"
+    else
+      read -r x y _ < <(echo "$button")
+      xdotool mousemove --window "$window" "$x" "$y" click 3 click 2 \
+        mousedown 1 mousemove --window "$window" 200 "$y" mouseup 1
+      for _ in $(seq 100); do
+        [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'touch=touchcancel&w=390' || true) -ge 1 ]] && break
+        sleep 0.1
+      done
+      xdotool mousemove --window "$window" "$x" "$y" mousedown 1 key ctrl+l mouseup 1 key Escape
+      for _ in $(seq 100); do
+        [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'touch=touchcancel&w=390' || true) -ge 2 ]] && break
+        sleep 0.1
+      done
+      xdotool mousemove --window "$window" $((x + 10)) "$y" click 1
+      for _ in $(seq 100); do
+        [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'touch=click&w=390' || true) -ge 1 ]] && break
+        sleep 0.1
+      done
+      if ! python3 - "$work/requests" "$before" <<'PY'
+import sys, urllib.parse
+reports = []
+for path in open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+    if query.get('w') == ['390'] and 'events' in query:
+        reports.append(query['events'][0].split(','))
+actual = max(reports, key=len, default=[])
+expected = ['touchstart', 'touchcancel', 'touchstart', 'touchcancel',
+            'touchstart', 'touchend', 'click']
+if actual != expected:
+    sys.exit('unexpected touch history: ' + repr(actual))
+PY
+      then
+        failure="outside release, focus loss or unsupported buttons changed the touch history"
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-outside release and focus loss canceled, next tap clicked}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -765,4 +837,5 @@ dialog_run "dialog answered on the card"
 popup_run "popup closed and opened on the card"
 download_run "download refused on the card"
 download_desktop_restart_run "desktop download dismissal after restart"
+touch_run "touch cancellation through the canvas"
 echo "desktop smoke passed"

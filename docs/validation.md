@@ -412,11 +412,103 @@ application-owned private profiles. No GUI code changed, so no additional
 window check was required. The PTZ regression queries permission state without
 accessing camera hardware. Existing vendored GPUI and `proc-macro-error2`
 future-compatibility warnings remain non-failing.
+### Touch input ([ADR 0018](adr/0018-touch-input-for-touch-devices.md))
+
+The audit's touch probe (above) showed mouse events with `pointerType: mouse`
+on a touch device and the event sequence `Input.dispatchTouchEvent` produces. A
+live Helium test at `77a1762`, with a page that numbers and reports every
+pointer, mouse and touch event on a box and its scroll position after a drag:
+
+| Step | Before | After |
+| --- | --- | --- |
+| Tap the box on the touch phone | `pointerdown mouse`, `pointerup mouse`, `mousedown`, `mouseup`, `click mouse` | `pointerdown touch`, `touchstart` (1 touch), `pointerup touch`, `touchend` (0), `mousedown`, `mouseup`, `click touch` |
+| Click the box on the mouse desktop | Mouse events | Unchanged: `pointerdown mouse`, `mousedown`, `pointerup mouse`, `mouseup`, `click mouse` |
+| Drag 150 CSS px upward on the phone (press, three moves 40 ms apart, release) | Mouse moves, no scroll | `touchmove` reports and `scrollend` with a positive scroll offset |
+
+| Check | Result |
+| --- | --- |
+| `touch_devices_send_touches_and_nothing_for_hover_or_other_buttons` (fake CDP) | Passed: `touchStart`/`touchMove`/`touchEnd` with the point and modifiers on the touch device, nothing for hover, right or middle, mouse events on the mouse device. A first version released before the coalesced move was sent by the loop; the move is then dropped, as for a mouse, so the test waits for it |
+| `live_touch_devices_get_touches_and_mouse_devices_get_a_mouse` (Helium) | Failed before the change as above; passed after (1.2 s) |
+| `bash scripts/check.sh` with touch | Passed: 1 CLI, 8 core, 70 engine and 25 desktop tests; 40 live tests ignored by default; fmt and strict Clippy clean |
+| Live Helium suite with touch (`--ignored`, 4 threads) | 40 of 40 passed in 76.5 s |
+| Full `scripts/desktop-smoke.sh` with touch (debug build); the example phone is a touch device, so its taps drive the dialog, popup and download runs | 11 of 11 runs passed through taps on the touch phone; no browser process, profile or window left |
+| Rerun after the cherry-pick onto `main` (`a62b3b8`, PR #18 merged; no conflicts) | `check.sh` passed: 1 CLI, 8 core, 104 engine and 36 desktop tests, 44 live tests ignored by default. Live Helium suite 44 of 44 in 68.9 s; full smoke 12 of 12 runs in 1 m 16 s; no browser process, profile or window left |
+
+### PR #19 touch review corrections, 28 September 2026 (local Linux)
+
+Review of `f1d37ab` found three gaps:
+
+- The live test waited for `click`, then asserted all preceding HTTP event
+  reports had arrived. Separate requests can arrive out of order: CI run
+  `36362294834` missed `pointerup`. Delaying that report by 150 ms reproduced
+  the same failure on the original head; waiting for both complete event
+  sequences passed with the delay still enabled. Swipe assertions also wait
+  for both their move and scroll reports.
+- A release discarded coalesced movement even though `touchEnd` has no
+  coordinates. A rapid swipe could therefore activate the original element.
+  The engine now preserves bounded unsent movement and the release position,
+  or cancels when the input budget cannot fit them. Device-local ownership
+  rejects orphan moves/releases and cancels interrupted browser touches before
+  a new press. Old releases never replay after hide, dialogs, navigation or
+  unresponsive input; cancellation is not queued behind a blocking dialog.
+- Ignored right-button presses could still cancel IME before the touch filter,
+  including through the desktop's explicit composition cancellation. Both
+  layers now filter unsupported buttons first. The desktop cancels touch on
+  release outside the canvas, device changes and focus loss, preventing a
+  click at the last in-canvas point or hover continuing an abandoned touch.
+
+Regression coverage lives in `live/touch_input.rs`, the existing touch event
+test and the X11 smoke's `touch cancellation through the canvas` scenario.
+The latter checks right/middle buttons, release outside the frame, focus
+moving to the URL bar and a subsequent normal tap through a real GPUI window.
+Its first run caught GPUI's root focus listener not firing when focus moved
+to the descendant URL field: the second gesture ended in an unintended click.
+Synchronous cancellation for Ctrl+L and a non-canvas focus guard fixed it;
+the final history was `start, cancel, start, cancel, start, end, click`.
+
+| Final local check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, strict Clippy, 1 CLI, 8 core, 118 engine and 36 desktop tests; 46 live tests ignored by default |
+| Pinned Helium 0.18.1.1 live suite, sandbox enabled, four threads | 46/46 passed in 74.46 s, including both new touch lifecycle/swipe reproducers |
+| Full `scripts/desktop-smoke.sh`, Xvfb 1600 × 1000, Mesa Lavapipe 26.2.3, debug build | 13/13 scenarios passed, including touch cancellation through the canvas; no browser process, profile or window left |
+| Independent final source/test review and `git diff --check` | No remaining actionable finding; clean diff |
+
+Logs are retained locally in ignored `artifacts/pr19-review/`. The Xvfb host
+needed a local software Vulkan driver; its package checksum was checked against
+the distro package database. The existing vendored GPUI and
+`proc-macro-error2` future-compatibility warnings remain non-failing. This run
+does not qualify Wayland, a physical IME or company GPU hardware.
+
+### Hover and pointer media, drag and drop, accessibility (documented limits)
+
+The last P1.6 items are limits, recorded from the audit above rather than
+changed:
+
+- **Hover and pointer media.** The headless browser reports no pointing device
+  of its own: a mouse device's page sees `(hover: none)` and `(pointer: none)`,
+  and `Emulation.setEmulatedMedia` accepts `hover` and `pointer` features
+  without effect. Touch devices see `(pointer: coarse)` and `(hover: none)`
+  from touch emulation, which is right for them. CSS `:hover` styles still
+  apply when the mouse device's pointer is over an element, since mouse moves
+  are sent; only the media queries misreport. This is a fidelity difference
+  for P1.7 (comparison with the user's browser), not something a card can fix.
+- **Drag and drop.** HTML5 drag and drop (`dragstart`, `dragenter`, `drop`
+  with data, `dragend`) and text selection by dragging work through mouse
+  events on mouse devices. On touch devices a drag is a swipe (ADR 0018);
+  touch-based drag and drop (long press, then move) is not modeled, and text
+  selection by touch is not available.
+- **Accessibility.** GPUI 0.2.2 exposes no accessibility tree on Linux, so the
+  Broxser window itself is not readable by a screen reader, and the page's
+  accessibility tree (`Accessibility.getFullAXTree` over CDP) is not read or
+  shown. Accessibility QA of a page needs the page opened in a browser with a
+  screen reader; a Broxser view of the page's tree is a separate capability.
 
 ### Limits
 
-- Touch input and hover media, drag and drop and accessibility keep today's
-  behavior; each is a separate decision. The audit above is their evidence.
+- Touch devices get one finger: no pinch, multi-finger gestures, long press or
+  right click, and no hover. A release preserves the final touch position;
+  interrupted gestures are canceled without replaying their release. Scroll
+  sync mirrors wheel input; swipe scrolling is local to its device.
 - `getDisplayMedia()` never resolves in the headless browser, denied or not.
   Camera and microphone are denied on the probe's evidence about prompt-type
   permissions; no device here could exercise them.

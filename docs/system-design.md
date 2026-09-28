@@ -230,6 +230,11 @@ terjangkau ketika lebar device melampaui window.
 Permission yang permintaannya akan menunggu prompt (notifikasi, deteksi idle,
 kamera termasuk PTZ, mikrofon) ditolak per context saat context dibuat, sehingga
 halaman dijawab `denied` seketika dan `permissions.query` melaporkannya (ADR 0017).
+Pada device `touch: true`, tekan, seret dan lepas tombol kiri dikirim sebagai
+satu titik sentuh lewat `Input.dispatchTouchEvent`; hover dan tombol lain tidak
+dikirim, device mouse tidak berubah. Pelepasan mempertahankan posisi sentuh
+terakhir; gestur yang kehilangan target input dibatalkan sebelum sentuhan baru,
+tanpa memutar ulang pelepasan yang dibuang (ADR 0018).
 
 ## 6. API and data contracts
 

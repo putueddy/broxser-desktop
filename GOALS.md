@@ -120,7 +120,7 @@ preview mode statis dan direktori socket `org.chromium.Chromium.*` masih terting
 (yang kedua juga pada close normal), serta kualifikasi skenario kill di Wayland,
 GPU fisik, distro dan kernel perusahaan.
 
-**Tindak lanjut P0 (27 September 2026, PR terpisah):** deadlock cleanup yang
+**Tindak lanjut P0 (27–28 September 2026, merged melalui PR #18):** deadlock cleanup yang
 tercatat di P1.4 (crash handler Helium men-trace renderer yang ikut terbunuh di
 dalam PID namespace sandbox, sehingga handler, renderer dan zombie-nya hidup
 terus sementara profilnya sudah dihapus) muncul sebagai "browser processes still
@@ -249,8 +249,8 @@ navigasi lintas dokumen yang dimulai halaman, form, tab baru dan download, serta
 peer yang memuat route SPA sebagai dokumen penuh dari server.
 
 **Status P1.6 (26–27 September 2026, dipecah per kapabilitas; dialog merged
-melalui PR #14, popup melalui PR #15, download/pemilih file melalui PR #16;
-permission menunggu review):** audit seluruh kapabilitas ada di `docs/validation.md` (P1.6). Probe CDP
+melalui PR #14, popup melalui PR #15, download/pemilih file melalui PR #16,
+permission melalui PR #17; input touch menunggu review):** audit seluruh kapabilitas ada di `docs/validation.md` (P1.6). Probe CDP
 pada Helium 0.18.1.1 dan run `main` `6495c2b` membuktikan bahwa dialog JavaScript
 membekukan halaman dan frame-nya, bahwa Go/Reload/sync membatalkan dialog diam-diam
 (navigasi menutupnya dengan hasil *cancel*), bahwa klik yang membuka dialog dihitung
@@ -297,9 +297,28 @@ dijawab dalam 10 detik) sementara `permissions.query` menjawab `prompt`. Kini
 setiap context session menolak notifikasi, deteksi idle, kamera dan mikrofon
 saat dibuat, sehingga halaman dijawab `denied` dalam hitungan milidetik dan
 `query` melaporkannya; permission lain tidak diubah karena menolak semuanya
-mengubah perilaku salin, wake lock dan font. Kapabilitas berikutnya, PR
-sendiri: input touch untuk device touch (`Input.dispatchTouchEvent`), lalu
-dokumentasi batas hover/pointer media, drag/drop dan aksesibilitas.
+mengubah perilaku salin, wake lock dan font.
+
+Kapabilitas kelima, input touch
+([ADR 0018](docs/adr/0018-touch-input-for-touch-devices.md), PR terpisah):
+tes live pada `77a1762` membuktikan bahwa klik pada device `touch: true` tiba
+di halaman sebagai event mouse (`pointerType` `mouse`, tanpa `touchstart`).
+Kini tekan, seret dan lepas tombol kiri pada device touch dikirim sebagai satu
+titik sentuh lewat `Input.dispatchTouchEvent`: halaman melihat `pointerType`
+`touch` dan `touchstart`/`touchmove`/`touchend`; tap menghasilkan `click`,
+sedangkan seret menggulir seperti swipe. Hover dan tombol lain tidak dikirim,
+device mouse tidak berubah. Posisi pelepasan tetap diteruskan pada swipe cepat;
+gestur yang terputus dibatalkan tanpa memutar ulang pelepasannya.
+
+Batas yang didokumentasikan sebagai penutup P1.6 (`docs/validation.md`): browser
+headless tidak melaporkan perangkat penunjuk, sehingga halaman device mouse
+melihat `(hover: none)` dan `(pointer: none)` walau gaya `:hover` tetap bekerja
+saat pointer di atas elemen (perbedaan fidelitas untuk P1.7); drag and drop HTML5
+dan seleksi teks bekerja lewat event mouse pada device mouse, sedangkan pada
+device touch seret adalah swipe dan drag and drop berbasis sentuh tidak
+dimodelkan; GPUI 0.2.2 tidak menyediakan pohon aksesibilitas di Linux dan pohon
+aksesibilitas halaman tidak dibaca, jadi QA aksesibilitas memerlukan browser
+dengan screen reader.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -380,7 +399,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
 - [x] Frame live, input dasar, trusted link/scroll sync dan keenam perbaikan review.
 - [x] Gabungan source diuji: 40 tes lokal, 14 tes live Helium; bukti X11/Wayland tersedia.
 - [x] P0 — cleanup browser/CDP/profil ketika induk mati, serta stale-profile recovery
-  (ADR 0007; merged melalui PR #6; sisa temp dir non-profil tercatat di status P0).
+  (ADR 0007; merged melalui PR #6, tindak lanjut deadlock cleanup melalui PR #18;
+  sisa temp dir non-profil tercatat di status P0).
 - [ ] P1 — deadline live, transisi restart, input lengkap dan resource/performance gates
   (P1.1 deadline command dan navigasi live: ADR 0008, merged melalui PR #7; P1.2
   transisi Restart dan close: ADR 0009, merged melalui PR #9; P1.3 keyboard, IME dan
@@ -388,7 +408,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   ADR 0012, merged melalui PR #12; P1.5 navigasi aplikasi modern: ADR 0013, merged
   melalui PR #13; P1.6 dialog JavaScript: ADR 0014, merged melalui PR #14; popup:
   ADR 0015, merged melalui PR #15; download/pemilih file: ADR 0016, merged melalui
-  PR #16; permission: ADR 0017, PR menunggu review; kapabilitas lain menyusul).
+  PR #16; permission: ADR 0017, merged melalui PR #17; input touch dan batas hover,
+  drag/drop serta aksesibilitas: ADR 0018, PR menunggu review).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

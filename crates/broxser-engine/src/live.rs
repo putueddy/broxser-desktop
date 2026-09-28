@@ -339,6 +339,11 @@ pub enum Command {
         device: usize,
         event: PointerEvent,
     },
+    /// Abandons a touch whose native pointer left its canvas or lost focus.
+    /// This never ends the touch as a tap or waits behind an IME identity read.
+    CancelTouch {
+        device: usize,
+    },
     /// Wheel at a CSS point; positive `delta_y` scrolls down, in CSS pixels.
     Wheel {
         device: usize,
@@ -798,11 +803,28 @@ fn same_link_activation(expected_id: u64, expected_url: &str, id: u64, url: &str
     expected_id == id && expected_url == url
 }
 
+/// Ownership of the single finger Broxser sent to CDP. Chromium keeps its
+/// active touch across hiding, dialogs and document replacement. An abandoned
+/// finger must be canceled before a fresh press, never ended as a stale click.
+#[derive(Clone, Copy, Default)]
+enum TouchGesture {
+    #[default]
+    Idle,
+    Active {
+        x: f64,
+        y: f64,
+    },
+    NeedsCancel,
+}
+
 struct LiveDevice {
     context: String,
     target_id: String,
     session: String,
     css: (f64, f64),
+    /// A touch device: pointer input reaches the page as touches (ADR 0018).
+    touch: bool,
+    touch_gesture: TouchGesture,
     visible: bool,
     /// The UI shows part of the frame; otherwise the screencast pauses.
     on_screen: bool,
@@ -831,6 +853,10 @@ struct LiveDevice {
     wheel: Option<Wheel>,
     wheel_in_flight: bool,
     pointer_move: Option<PointerEvent>,
+    /// Furthest unsent touch point from the last sent point. Together with
+    /// pointer_move (the newest point), this keeps a coalesced out-and-back
+    /// drag from turning into a tap, with no unbounded path history.
+    touch_excursion: Option<PointerEvent>,
     move_in_flight: bool,
     /// Input events sent to the page that it has not answered yet.
     unanswered: usize,
@@ -1180,6 +1206,8 @@ impl<'a> Controller<'a> {
                 target_id,
                 session,
                 css: (f64::from(device.width), f64::from(device.height)),
+                touch: device.touch,
+                touch_gesture: TouchGesture::Idle,
                 visible: true,
                 on_screen: true,
                 streaming: false,
@@ -1201,6 +1229,7 @@ impl<'a> Controller<'a> {
                 wheel: None,
                 wheel_in_flight: false,
                 pointer_move: None,
+                touch_excursion: None,
                 move_in_flight: false,
                 unanswered: 0,
                 waiting_since: None,
@@ -1258,6 +1287,14 @@ impl<'a> Controller<'a> {
     }
 
     fn handle(&mut self, command: Command) -> Result<()> {
+        // Ignored touch buttons must not wait behind an IME action or cancel
+        // the current composition when the held input is released.
+        if let Command::Pointer { device, event } = &command
+            && self.devices.get(*device).is_some_and(|state| state.touch)
+            && !is_touch(*event)
+        {
+            return Ok(());
+        }
         if let Some(index) = command
             .input_device()
             .filter(|&index| index < self.devices.len())
@@ -1290,6 +1327,12 @@ impl<'a> Controller<'a> {
                 self.start_navigation(device, "Page.reload", json!({}))?;
             }
             Command::Pointer { device, event } if device < count => self.pointer(device, event)?,
+            Command::CancelTouch { device } if device < count && self.devices[device].touch => {
+                self.devices[device]
+                    .held_input
+                    .retain(|command| !matches!(command, Command::Pointer { .. }));
+                self.cancel_touch(device)?;
+            }
             Command::Wheel {
                 device,
                 x,
@@ -1336,6 +1379,7 @@ impl<'a> Controller<'a> {
                     self.start_stream(device)?;
                     self.refresh_ime(device)?;
                 } else {
+                    self.cancel_touch(device)?;
                     self.clear_ime(device, true)?;
                     self.devices[device].visible = false;
                     let state = &mut self.devices[device];
@@ -1420,6 +1464,7 @@ impl<'a> Controller<'a> {
                 .device(index, |device| device.error = Some(DIALOG_OPEN.to_owned()));
             return Ok(false);
         }
+        self.cancel_touch(index)?;
         self.clear_ime(index, true)?;
         // Input held for the current document never reaches the next one.
         self.devices[index].held_input.clear();
@@ -1480,6 +1525,7 @@ impl<'a> Controller<'a> {
     /// for the reply to its dialog answer; late answers are discarded. Nothing
     /// is sent again.
     fn forget_input(&mut self, index: usize) {
+        self.invalidate_touch(index);
         let forgotten: Vec<u64> = self
             .pending
             .iter()
@@ -1537,6 +1583,7 @@ impl<'a> Controller<'a> {
     /// more and stays. An open dialog is no sign of a page that stopped
     /// responding; it pauses this check instead (ADR 0014).
     fn set_unresponsive(&mut self, index: usize) {
+        self.invalidate_touch(index);
         self.invalidate_ime(index);
         let device = &mut self.devices[index];
         device.unresponsive = true;
@@ -1751,8 +1798,31 @@ impl<'a> Controller<'a> {
     fn pointer(&mut self, index: usize, event: PointerEvent) -> Result<()> {
         // A middle click would paste Chromium's selection buffer, which every
         // session of the browser shares (ADR 0010).
-        if event.button == PointerButton::Middle || !self.input_allowed(index) {
+        if event.button == PointerButton::Middle
+            || (self.devices[index].touch && !is_touch(event))
+            || !self.input_allowed(index)
+        {
             return Ok(());
+        }
+        if self.devices[index].touch {
+            match event.kind {
+                PointerKind::Down => {
+                    // A second press starts a new gesture, including after a
+                    // lost release. Canceling cannot synthesize a click.
+                    self.cancel_touch(index)?;
+                    if !self.input_allowed(index) {
+                        return Ok(());
+                    }
+                }
+                PointerKind::Move | PointerKind::Up => {
+                    if !matches!(
+                        self.devices[index].touch_gesture,
+                        TouchGesture::Active { .. }
+                    ) {
+                        return Ok(());
+                    }
+                }
+            }
         }
         if event.kind == PointerKind::Down {
             self.devices[index].ime_blocked_anchor = self.devices[index].ime_anchor;
@@ -1764,15 +1834,109 @@ impl<'a> Controller<'a> {
         let device = &mut self.devices[index];
         if event.kind == PointerKind::Move {
             // Coalesce moves: only the newest one waits while another is in flight.
+            if let TouchGesture::Active { x, y } = device.touch_gesture {
+                let distance = |next| {
+                    let (next_x, next_y) = pointer_position(next, device.css);
+                    (next_x - x).powi(2) + (next_y - y).powi(2)
+                };
+                if device
+                    .touch_excursion
+                    .is_none_or(|queued| distance(event) >= distance(queued))
+                {
+                    device.touch_excursion = Some(event);
+                }
+            }
             device.pointer_move = Some(event);
             return Ok(());
         }
+        if device.touch && event.kind == PointerKind::Up {
+            return self.end_touch(index, event);
+        }
         device.pointer_move = None;
+        if device.touch {
+            let (x, y) = pointer_position(event, device.css);
+            device.touch_gesture = TouchGesture::Active { x, y };
+        }
         let session = device.session.clone();
-        let params = mouse_params(event, device.css);
-        let id = self
-            .cdp
-            .send("Input.dispatchMouseEvent", params, Some(&session))?;
+        let (method, params) = pointer_params(event, device.css, device.touch);
+        let id = self.cdp.send(method, params, Some(&session))?;
+        self.track(id, Pending::Input { device: index })
+    }
+
+    /// Drops local ownership immediately. Cancellation may only be sent while
+    /// input is allowed; otherwise a fresh Down resets the browser first.
+    fn invalidate_touch(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        if matches!(device.touch_gesture, TouchGesture::Active { .. }) {
+            device.touch_gesture = TouchGesture::NeedsCancel;
+        }
+        if device.touch {
+            device.pointer_move = None;
+            device.touch_excursion = None;
+        }
+    }
+
+    fn cancel_touch(&mut self, index: usize) -> Result<()> {
+        self.invalidate_touch(index);
+        if !matches!(self.devices[index].touch_gesture, TouchGesture::NeedsCancel)
+            || !self.input_allowed(index)
+        {
+            return Ok(());
+        }
+        let session = self.devices[index].session.clone();
+        let id = self.cdp.send(
+            "Input.dispatchTouchEvent",
+            json!({"type": "touchCancel", "touchPoints": []}),
+            Some(&session),
+        )?;
+        self.devices[index].touch_gesture = TouchGesture::Idle;
+        self.track(id, Pending::Input { device: index })
+    }
+
+    fn end_touch(&mut self, index: usize, event: PointerEvent) -> Result<()> {
+        let device = &mut self.devices[index];
+        let TouchGesture::Active { x, y } = device.touch_gesture else {
+            return Ok(());
+        };
+        let mut position = (x, y);
+        let mut moves = Vec::with_capacity(2);
+        // Preserve a coalesced excursion too: Down(A), Move(B), Move(A), Up(A)
+        // must not lose its drag just because the finger returned to its start.
+        let excursion = device.touch_excursion.take().or(device.pointer_move.take());
+        device.pointer_move = None;
+        for next in [
+            excursion,
+            Some(PointerEvent {
+                kind: PointerKind::Move,
+                ..event
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let next_position = pointer_position(next, device.css);
+            if next_position != position {
+                moves.push(next);
+                position = next_position;
+            }
+        }
+        // touchEnd has no coordinates: its last touchMove determines whether
+        // the release taps or swipes. Send the final position in order even
+        // while an earlier coalesced move waits for its reply. Never hold Up.
+        if device.unanswered + moves.len() + 1 > MAX_UNANSWERED_INPUT {
+            self.cancel_touch(index)?;
+            self.set_unresponsive(index);
+            return Ok(());
+        }
+        let (session, css) = (device.session.clone(), device.css);
+        for next in moves {
+            let (method, params) = pointer_params(next, css, true);
+            let id = self.cdp.send(method, params, Some(&session))?;
+            self.track(id, Pending::Input { device: index })?;
+        }
+        let (method, params) = pointer_params(event, css, true);
+        let id = self.cdp.send(method, params, Some(&session))?;
+        self.devices[index].touch_gesture = TouchGesture::Idle;
         self.track(id, Pending::Input { device: index })
     }
 
@@ -1999,13 +2163,16 @@ impl<'a> Controller<'a> {
     }
 
     /// Holds input to device `index` behind its waiting IME action. As for
-    /// sent input, only the newest move and the summed wheel wait. A page that
-    /// leaves too much input waiting is not responding; the held input is dropped.
+    /// sent input, only the newest mouse move and the summed wheel wait. Touch
+    /// moves retain their path until pointer() can coalesce with its gesture's
+    /// position; the same input bound drops a stalled IME's held path.
     fn hold_input(&mut self, index: usize, command: Command) {
         let device = &mut self.devices[index];
         match (device.held_input.back_mut(), &command) {
             (Some(Command::Pointer { event: held, .. }), Command::Pointer { event, .. })
-                if held.kind == PointerKind::Move && event.kind == PointerKind::Move =>
+                if !device.touch
+                    && held.kind == PointerKind::Move
+                    && event.kind == PointerKind::Move =>
             {
                 *held = *event;
                 return;
@@ -2117,11 +2284,27 @@ impl<'a> Controller<'a> {
             if !device.move_in_flight
                 && let Some(event) = device.pointer_move.take()
             {
-                let params = mouse_params(event, device.css);
+                let event = if device.touch {
+                    let excursion = device.touch_excursion.take().unwrap_or(event);
+                    if pointer_position(excursion, device.css)
+                        != pointer_position(event, device.css)
+                    {
+                        // The furthest point arrives first; the newest still
+                        // coalesces while it is in flight, or ends the gesture.
+                        device.pointer_move = Some(event);
+                        device.touch_excursion = Some(event);
+                    }
+                    excursion
+                } else {
+                    event
+                };
+                let (method, params) = pointer_params(event, device.css, device.touch);
+                if device.touch {
+                    let (x, y) = pointer_position(event, device.css);
+                    device.touch_gesture = TouchGesture::Active { x, y };
+                }
                 let session = device.session.clone();
-                let id = self
-                    .cdp
-                    .send("Input.dispatchMouseEvent", params, Some(&session))?;
+                let id = self.cdp.send(method, params, Some(&session))?;
                 self.devices[index].move_in_flight = true;
                 self.track(id, Pending::Move { device: index })?;
             }
@@ -3185,6 +3368,9 @@ impl<'a> Controller<'a> {
                 let sync_navigation = self.sync.navigation;
                 // A new tab, a new window or a download leaves the page as it is.
                 let current_tab = text("disposition").is_none_or(|value| value == "currentTab");
+                if current_tab {
+                    self.invalidate_touch(index);
+                }
                 let device = &mut self.devices[index];
                 if current_tab && let Some(navigation) = &mut device.navigation {
                     navigation.page_requested = true;
@@ -3210,6 +3396,7 @@ impl<'a> Controller<'a> {
             "Page.frameStartedNavigating"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
+                self.invalidate_touch(index);
                 if let (Some(loader), Some(kind)) = (
                     text("loaderId").filter(|loader| !loader.is_empty()),
                     text("navigationType"),
@@ -3374,6 +3561,10 @@ impl<'a> Controller<'a> {
                 }
             }
             "Page.javascriptDialogOpening" => {
+                // Input sent during the dialog would be replayed after its
+                // answer. Retire the finger locally and cancel only before a
+                // fresh press once the page can receive input again.
+                self.invalidate_touch(index);
                 let kind = match text("type") {
                     Some("alert") => DialogKind::Alert,
                     Some("confirm") => DialogKind::Confirm,
@@ -3518,6 +3709,41 @@ impl<'a> Controller<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a pointer event is the finger of a touch device: the left button
+/// pressed, released, or held while moving.
+fn is_touch(event: PointerEvent) -> bool {
+    match event.kind {
+        PointerKind::Move => event.buttons & 1 != 0,
+        PointerKind::Down | PointerKind::Up => event.button == PointerButton::Left,
+    }
+}
+
+/// The CDP input method and parameters for a pointer event: a single touch
+/// point on a touch device, a mouse event otherwise.
+fn pointer_params(event: PointerEvent, css: (f64, f64), touch: bool) -> (&'static str, Value) {
+    if !touch {
+        return ("Input.dispatchMouseEvent", mouse_params(event, css));
+    }
+    let (x, y) = pointer_position(event, css);
+    let point = json!({"x": x, "y": y});
+    let (kind, points) = match event.kind {
+        PointerKind::Down => ("touchStart", vec![point]),
+        PointerKind::Move => ("touchMove", vec![point]),
+        PointerKind::Up => ("touchEnd", Vec::new()),
+    };
+    (
+        "Input.dispatchTouchEvent",
+        json!({"type": kind, "touchPoints": points, "modifiers": event.modifiers.cdp()}),
+    )
+}
+
+fn pointer_position(event: PointerEvent, css: (f64, f64)) -> (f64, f64) {
+    (
+        event.x.clamp(0.0, css.0 - 1.0),
+        event.y.clamp(0.0, css.1 - 1.0),
+    )
 }
 
 fn mouse_params(event: PointerEvent, css: (f64, f64)) -> Value {

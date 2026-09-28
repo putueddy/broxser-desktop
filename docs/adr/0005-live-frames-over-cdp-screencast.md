@@ -67,7 +67,8 @@ canvas scale. See `docs/validation.md` for numbers.
   accessibility are not supported (ADR 0014 adds JavaScript dialogs, answered by
   the user on the device card; ADR 0015 closes and reports popups; ADR 0016
   refuses and reports downloads and cancels file choosers; ADR 0017 denies the
-  permission prompts that would otherwise wait). Each needs
+  permission prompts that would otherwise wait; ADR 0018 sends one-finger touch
+  input to touch devices). Each needs
   its own gate; ADR 0010 covers
   plain-text paste only. ADR 0011 adds native IME composition and caret placement
   for standard main-frame editable controls, qualified with Fcitx5/Pinyin over XIM.
