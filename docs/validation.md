@@ -3,6 +3,49 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #23 follow-up: input right after Apply, 28 September 2026 (cloud container)
+
+Helium 0.18.1.1 run by `broxsertest` with its sandbox enabled, debug desktop,
+Xvfb 1600 × 1000, on top of the review corrections below (`9d199c6`).
+
+- Before: GPUI delivers input to the listeners of the last drawn frame, and
+  Apply replaces the device list at once. On `9d199c6`, a pointer move over
+  the third of three frames right after an Apply that removed the first device
+  ended the desktop with exit 101, `index out of bounds: the len is 2 but the
+  index is 2` in `pointer`; a second click instead ended it in
+  `release_outside` (3 of 3 runs each). The events must arrive before the
+  next redraw, at most one refresh later: xdotool's `click` sleeps after its
+  release, so the reproducer presses and releases separately. A person rarely
+  produces a second event that soon after a click; a bouncing button, a tap
+  or automation can.
+- Change: `pointer`, `release_outside`, `wheel` and `toggle_hidden` look their
+  device up and ignore a missing index. Popup and download Dismiss act only
+  while their report is still shown, since popup tokens and download counts
+  start over with each runtime. By code reading, a stale event also reaches
+  no page: the rebuilt devices have no bounds until drawn, and the stopping
+  runtime takes no commands.
+- New smoke run "input right after Apply removed a device": three 360 × 640
+  devices, Remove the first, then Apply followed at once by a move, a wheel
+  step and a click in the third frame, and a click on the sidebar's third
+  Hide. It fails on `9d199c6` (exit 101, panic in `pointer`) and passes with
+  the fix. Builds that each left out one guard panicked in `wheel`,
+  `release_outside` and `toggle_hidden` respectively, 3 of 3 runs each, so
+  every path is reached before the redraw.
+- A scratch run opened a popup from the third device and clicked its report's
+  Dismiss right after Apply: a build without that guard panicked in the
+  Dismiss handler, the fix kept running and exited 0. A normal popup Dismiss
+  still hides its report. Screenshots were inspected and not committed.
+- `bash scripts/check.sh` passed in 40 s: 1 CLI, 12 core, 142 engine and 41
+  desktop tests, formatting and strict Clippy. `scripts/desktop-smoke.sh`
+  passed all 15 scenarios in 1 m 42 s with no browser process, profile or
+  window left. The live Helium suite was not rerun: no engine change.
+
+The timing runs rely on xdotool delivering the events within one refresh; on
+a much slower or faster machine the smoke run can pass without reaching the
+old listeners. Draft Remove buttons also keep their row index: a second Remove
+within one frame removes the device that moved into that row, and the panel
+notice names it. That path is unchanged.
+
 ## PR #23 review corrections, 28 September 2026 (Linux X11)
 
 Helium 0.18.1.1 with its sandbox enabled, debug desktop, private Xvfb

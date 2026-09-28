@@ -757,7 +757,10 @@ impl LiveView {
     }
 
     fn toggle_hidden(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = self.devices[index].hidden;
+        // As in `pointer`, the row may name a device that Apply removed.
+        let Some(visible) = self.devices.get(index).map(|device| device.hidden) else {
+            return;
+        };
         if !visible && self.selected == Some(index) {
             self.invalidate_ime();
         }
@@ -1259,7 +1262,9 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.devices[index].hidden {
+        // GPUI dispatches input to the listeners of the last drawn frame, so
+        // one can still name a device that Apply removed before the redraw.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
             return;
         }
         // A touch canvas has only a left-button finger. Reject other presses
@@ -1335,7 +1340,8 @@ impl LiveView {
 
     /// A button released outside the frame must not stay pressed in the page.
     fn release_outside(&mut self, index: usize, modifiers: &gpui::Modifiers) {
-        if self.devices[index].hidden {
+        // As in `pointer`, the device may be gone since the frame was drawn.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
             return;
         }
         // Outside motion has no mapped viewport point. Ending a touch at its
@@ -1366,7 +1372,8 @@ impl LiveView {
     }
 
     fn wheel(&mut self, index: usize, event: &ScrollWheelEvent) {
-        if self.devices[index].hidden {
+        // As in `pointer`, the device may be gone since the frame was drawn.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
             return;
         }
         let Some((x, y)) = self.map(index, event.position) else {
@@ -1752,7 +1759,17 @@ impl LiveView {
                         .text_color(rgb(BG))
                         .child("Dismiss")
                         .on_click(cx.listener(move |view, _, _, cx| {
-                            view.devices[index].dismissed_download = Some(count);
+                            // Only the report this button was drawn with: after
+                            // Apply or Restart the index names another runtime's
+                            // device, which starts without one.
+                            let shown = view
+                                .status
+                                .devices
+                                .get(index)
+                                .is_some_and(|status| status.downloads == count);
+                            if let Some(device) = view.devices.get_mut(index).filter(|_| shown) {
+                                device.dismissed_download = Some(count);
+                            }
                             cx.notify();
                         })),
                 ),
@@ -1820,7 +1837,17 @@ impl LiveView {
                     .child(
                         button("popup-dismiss", "Dismiss", false).on_click(cx.listener(
                             move |view, _, _, cx| {
-                                view.devices[index].dismissed_popup = Some(token);
+                                // As for downloads: only the report still shown.
+                                let shown = view
+                                    .status
+                                    .devices
+                                    .get(index)
+                                    .and_then(|status| status.popup.as_ref())
+                                    .is_some_and(|popup| popup.token == token);
+                                if let Some(device) = view.devices.get_mut(index).filter(|_| shown)
+                                {
+                                    device.dismissed_popup = Some(token);
+                                }
                                 cx.notify();
                             },
                         )),

@@ -70,6 +70,13 @@ Constraints found while auditing the desktop:
 - A decoded frame checks its runtime generation before looking up its device;
   a missing index is discarded too. Apply can remove or reorder devices while
   a previous runtime's decode is still running.
+- GPUI delivers input to the listeners of the last drawn frame, so a pointer,
+  wheel or Hide event that arrives after Apply but before the redraw can name
+  a removed index. Those handlers look the device up and ignore a missing one;
+  the new frame has no bounds yet, so no stale event reaches a page. A popup
+  or download report's Dismiss acts only while that report is still shown:
+  tokens and download counts start over with each runtime, and a stale click
+  must not hide the next runtime's report on the device now at that index.
 - Static mode keeps its command line; the panel is part of the live view.
 
 ## Consequences

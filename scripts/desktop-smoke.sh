@@ -1003,6 +1003,115 @@ PY
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Three devices side by side; the panel removes the first and Apply restarts
+# without it. At once the pointer moves over, scrolls and clicks the third
+# frame, then clicks Hide on the sidebar's third row: GPUI delivers these to
+# the listeners of the frame drawn before Apply, which still name index 2 of a
+# two-device list (ADR 0022). xdotool's click pauses after the release, so the
+# button is pressed and released separately to arrive before the redraw. The
+# desktop must restart with two devices and close cleanly.
+apply_input_run() {
+  local label=$1
+  local before mark app window= failure= found code=0 left_processes left_profiles
+  local x y x0 x1 y0 apply_x apply_y
+  local workspace=$work/apply-input.json state=$work/apply-input-state.json
+  python3 - "$workspace" <<'PY'
+import json, sys
+device = {"width": 360, "height": 640, "device_scale_factor": 1.0,
+          "mobile": False, "touch": False, "session": "guest"}
+workspace = {
+    "schema_version": 1,
+    "name": "Three small",
+    "url": "http://127.0.0.1:4173",
+    "sessions": [{"id": "guest", "name": "Guest"}],
+    "devices": [dict(device, id=name.lower(), name=name) for name in "ABC"],
+}
+with open(sys.argv[1], "w") as destination:
+    json.dump(workspace, destination)
+PY
+  before=$(wc -l < "$work/requests")
+  BROXSER_STATE_FILE=$state "$binary" --workspace "$workspace" --url "http://127.0.0.1:$port/live.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
+  loaded() {
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$(($1 + 1))" "$work/requests" | grep -c -- '/live.html' || true) -ge $2 ]] && return 0
+      kill -0 "$app" 2>/dev/null || return 1
+      sleep 0.1
+    done
+    return 1
+  }
+  panel_button() {
+    find_color "$window" "$2" 60 "$3" 780 "$1" 8 10 filled
+  }
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  elif ! loaded "$before" 3; then
+    failure="the three devices did not load the page"
+  else
+    size_window "$window"
+    xdotool mousemove --window "$window" 600 400 key ctrl+shift+w
+    if ! found=$(panel_button e07a7a 480 90); then
+      failure="the panel showed no Remove button"
+    else
+      read -r _ _ _ y0 x1 _ < <(echo "$found")
+      xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+      sleep 0.5
+      # The pages' dark headers and buttons lie right of the panel; once all
+      # three frames show them (about 620 px at 50%), the right edge of their
+      # bounding box is in the third frame.
+      for _ in $(seq 20); do
+        found=$(find_color "$window" 580 60 770 700 17312b 10 1 filled) || found=
+        read -r _ _ x0 y0 x1 _ < <(echo "${found:-0 0 0 0 0 0}")
+        ((x1 - x0 >= 500)) && break
+        found=
+        sleep 0.5
+      done
+      if [[ -z $found ]]; then
+        failure="the three frames did not show the page"
+      else
+        x=$((x1 - 40)) y=$((y0 + 150))
+        if ! found=$(panel_button 7ce29b 232 170); then
+          failure="Apply was unavailable after Remove"
+        else
+          read -r apply_x apply_y _ < <(echo "$found")
+          mark=$(wc -l < "$work/requests")
+          # Apply, then move, scroll and click in the third frame, then click
+          # Hide on the sidebar's third row, outside every frame.
+          xdotool mousemove --window "$window" "$apply_x" "$apply_y" mousedown 1 mouseup 1 \
+            mousemove --window "$window" "$x" "$y" mousemove --window "$window" $((x + 4)) "$y" \
+            mousedown 5 mouseup 5 mousedown 1 mouseup 1 \
+            mousemove --window "$window" 195 337 mousedown 1 mouseup 1
+          if ! loaded "$mark" 2; then
+            failure="the desktop did not restart with two devices"
+          fi
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-restarted with two devices, then closed}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -1017,4 +1126,5 @@ download_run "download refused on the card"
 download_desktop_restart_run "desktop download dismissal after restart"
 touch_run "touch cancellation through the canvas"
 workspace_run "workspace panel edits a draft and saves it"
+apply_input_run "input right after Apply removed a device"
 echo "desktop smoke passed"
