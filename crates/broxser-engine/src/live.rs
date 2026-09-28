@@ -48,6 +48,8 @@ const MAX_TRACKED_FRAMES: usize = 256;
 /// stalled cleanup. Each keeps at most one awaited setup or resume command.
 const MAX_IFRAME_SESSIONS: usize = 128;
 const INCOMPLETE_IFRAME_ACTIVITY: &str = "Iframe activity could not be fully observed. Navigate or reload explicitly to start a fresh document.";
+/// Start of the device status for a navigation Broxser started that failed.
+const NAVIGATION_FAILED: &str = "Navigation failed: ";
 /// Device status while it has an open dialog and Broxser was asked to navigate it.
 pub(crate) const DIALOG_OPEN: &str =
     "The page is waiting for an answer to its dialog; navigation was not sent.";
@@ -1490,6 +1492,18 @@ impl<'a> Controller<'a> {
         let incomplete = self.devices[index].iframe_activity_incomplete;
         self.shared.device(index, |device| {
             device.loading = true;
+            // Reload only acknowledges that it started, so it cannot confirm
+            // recovery from the current error page. Keep the last confirmed
+            // navigation failure until a real document commits (ADR 0020).
+            // A new destination via Page.navigate clears the old report.
+            if method == "Page.reload"
+                && device
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(NAVIGATION_FAILED))
+            {
+                return;
+            }
             device.error = if incomplete {
                 Some(INCOMPLETE_IFRAME_ACTIVITY.into())
             } else {
@@ -2435,10 +2449,15 @@ impl<'a> Controller<'a> {
                             self.shared.device(device, |status| status.loading = false);
                             None
                         }
-                        Ok(result) => result
-                            .get("errorText")
-                            .and_then(Value::as_str)
-                            .map(|error| format!("Navigation failed: {error}; not retried")),
+                        Ok(result) => {
+                            result
+                                .get("errorText")
+                                .and_then(Value::as_str)
+                                .map(|error| {
+                                    let note = crate::browser::certificate_note(error);
+                                    format!("{NAVIGATION_FAILED}{error}{note}; not retried")
+                                })
+                        }
                         Err(error) => Some(format!("{error:#}")),
                     };
                     if self.devices[device].dialog.is_some_and(|dialog| {
@@ -3574,9 +3593,18 @@ impl<'a> Controller<'a> {
                     // A crashed renderer is replaced on navigation; resume its stream.
                     self.start_stream(index)?;
                 }
+                // The browser's error page for a navigation Broxser started
+                // shows the failure; its report stays until a document commits.
+                let error_page = frame.get("unreachableUrl").is_some();
                 self.shared.device(index, |device| {
                     device.url = url;
-                    device.error = None;
+                    let failed = device
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with(NAVIGATION_FAILED));
+                    if !(error_page && failed) {
+                        device.error = None;
+                    }
                     device.dialog = None;
                 });
                 if self.sync.navigation

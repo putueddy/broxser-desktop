@@ -3,6 +3,129 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P2.1 storage and credential boundary, 27 September 2026 (cloud container)
+
+Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by the unprivileged
+user `broxsertest` with the sandbox enabled; `broxser capture` with the example
+workspace over a local HTTPS fixture (Python `http.server` with a server
+certificate signed by a CA made for this audit) and over the HTTP fixture;
+`strace -f` on file opens, `mkdir` and `connect`. The test CA and keys, the
+policy file and the entries in the user's NSS database were created for the
+audit and removed afterwards. Decisions are in
+[ADR 0020](adr/0020-certificate-store-and-keyring-inside-the-profile.md).
+
+### Audit: what the browser opened outside its profile before the change
+
+| Run | Outside the private profile | Result |
+| --- | --- | --- |
+| HTTP capture | Reads `~/.cache/fontconfig` (30 cache files), `~/.local/share/vulkan` (14 opens), `~/.config/vulkan/*_layer.d` (14), `~/.local/share/glib-2.0` (1), `~/.config/user-dirs.dirs` (1); reads `/etc/chromium/policies/{managed,recommended}`; connects to the system bus (3), nscd and `/dev/log`; no write under the home | 3 frames |
+| HTTPS, no CA anywhere | The above plus the user's NSS database: `~/.pki/nssdb/cert9.db` and `key4.db` opened `O_RDWR|O_CREAT`, `pkcs11.txt` read, `libnssckbi.so` looked up there (4 opens) | `net::ERR_CERT_AUTHORITY_INVALID` |
+| HTTPS, CA imported into `~/.pki/nssdb` with `certutil` | Same 4 opens | Trusted: 3 frames, 6 fixture requests |
+| HTTPS, CA in `/etc/chromium/policies/managed/*.json` (`CACertificates`), none in NSS | Same 4 opens | Trusted |
+| HTTPS, policy file removed | Same | Invalid again |
+| HTTPS, private `HOME`, no XDG variables, CA in the user's NSS | User database not opened; NSS database created under the private home; fontconfig rebuilt its caches there (about 40 cache files) | Invalid; the trusted (policy) run took 10.0 s against 7.4 s with shared caches |
+| HTTPS, private `HOME` with the user's `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` | Caches reused (30 opens), but `~/.local/share/pki/nssdb` created and opened (4) | Invalid with the CA in `~/.pki`; trusted with the policy |
+| Direct Helium launch with `XDG_CURRENT_DESKTOP=GNOME` and a session bus address | 11 connects to the session bus; 10 with `--password-store=basic`; no keyring daemon here, so `os_crypt` in `Local State` stayed empty either way | — |
+
+Chromium 154 has no environment variable for the NSS database path (`SSL_DIR`
+is not in the binary); the path follows `HOME`, or `XDG_DATA_HOME` when set.
+
+### After the change
+
+Every run: `mkdir <profile>/home` with mode 0700, 0 opens of `~/.pki`, 0 opens
+of `~/.local/share/pki`, 30 opens of `~/.cache/fontconfig` and none of a cache
+under the private home, and no other path under `/home/broxsertest`.
+
+| Run | NSS database | Result | Capture time |
+| --- | --- | --- | --- |
+| HTTPS, no CA anywhere | 14 opens under `<profile>/home/.local/share/pki/nssdb` | `net::ERR_CERT_AUTHORITY_INVALID (Broxser trusts the browser's built-in roots and the CACertificates policy, not a personal certificate store); not retried` | 4.9 s |
+| HTTPS, CA in `~/.pki/nssdb` (trusted before) | Same | Invalid, same note | 4.6 s |
+| HTTPS, CA by policy | Same | Trusted: 3 frames, 6 fixture requests | 7.7 s (7.4 s before) |
+| HTTPS, policy file removed | Same | Invalid | 4.7 s |
+| HTTP | Not opened | 3 frames | 4.9 s |
+| HTTP with `XDG_CURRENT_DESKTOP=GNOME` and a session bus address | Not opened | 3 frames; 10 session bus connects | 4.9 s |
+
+Afterwards: no profile under `/tmp`, the user's database without the test CA
+(`certutil -L` count 0), no policy file.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `cargo test -p broxser-engine --lib` (fake browser and fake CDP) | 73 passed, 0 failed, 42 ignored (the live tests), 8.4 s |
+| New unit tests: `environment_keeps_only_the_users_cache_directory`, `browser_runs_in_a_private_home`, `launch_keeps_sandbox_loopback_and_private_state` | Passed; `browser_runs_in_a_private_home` first read an empty environment while the fake browser exec'd `sleep` (1 failure in 7 runs), so it now waits for `HOME=` to appear (6 of 6 after) |
+| Live Helium suite as `broxsertest` (`--ignored`, 4 threads) | 42 passed, 0 failed, 70 s; the new `live_certificate_trust_is_the_browsers_own_not_the_users` passed alone in 3.9 s (every device: `Navigation failed: net::ERR_CERT_AUTHORITY_INVALID (…); not retried`, `cert9.db` under `<profile>/home/.local/share/pki/nssdb`, profile removed) |
+| Before the live change: the same test with the error page clearing the report | Failed as expected: every device ended at `chrome-error://chromewebdata/` with `error: None`, which hid the certificate failure from the status; the error page now keeps the report |
+| `bash scripts/check.sh` | Passed in 2 m 44 s: formatting, `cargo test --locked` (1 CLI, 8 core, 73 engine, 25 desktop), strict Clippy for the workspace and the desktop crate |
+| Desktop smoke (`scripts/desktop-smoke.sh`, Xvfb 1600 × 1000, Helium) | 9 of 9 scenarios passed in 1 m 19 s (SIGKILL, SIGINT, static SIGTERM, two restart scenarios, typing while pages animate, dialog, popup, download); no browser process, profile or preview directory left |
+| Rerun after the cherry-pick onto `main` (`770f8ac`, PR #20 merged with the owner's discovery startup; the conflict in `BrowserProcess` startup was resolved so the private home and environment apply to every browser Broxser starts, the discovery browser included) | `check.sh` passed: 1 CLI, 8 core, 137 engine and 36 desktop tests, 50 live tests ignored by default. `strace -f` of `broxser capture` over the HTTP fixture: two private homes created (discovery and runtime browser), 0 opens of `~/.pki` or `~/.local/share/pki`, nothing else under the user's home besides `~/.cache/fontconfig`. Live Helium suite 50 of 50 in 80.7 s, including `live_certificate_trust_is_the_browsers_own_not_the_users`; full smoke 13 of 13 in 1 m 22 s; nothing left |
+
+### Limits
+
+- Client certificates from a user's NSS database are not offered any more;
+  what a site that requires one shows in Broxser was not measured.
+- Fonts under the user's home and a user `fontconfig` configuration are not
+  seen by pages; system fonts are.
+- The browser's certificate error page is shown in live mode; whether its
+  "proceed" link works in headless mode was not measured, and Broxser adds no
+  bypass of its own.
+- The keyring item was not observed with a real Secret Service; the flag's
+  effect was measured as one connect fewer to the session bus.
+- Loading the system trust store through p11-kit was not measured.
+- `CACertificates` needs a machine policy file (root); there is no per-user
+  route, by decision.
+
+### PR #21 review corrections, 28 September 2026 (local Linux)
+
+Review of `d067235` found three gaps despite the initial passing CI:
+
+- Replacing HOME moved Xlib's implicit `.Xauthority` lookup. On an authenticated
+  disposable Xvfb, headed capture failed before CDP in 0.16 s with `XAUTHORITY`
+  unset; explicitly naming the caller's test authority file succeeded. The
+  launch environment now preserves explicit authorization paths and resolves
+  implicit ones before HOME changes. Independent reruns passed both variants
+  (three frames each), with the authority file unchanged.
+- The new claim that only cache remained shared was too broad. In a disposable
+  caller home, inherited `SSLKEYLOGFILE` left 388 bytes of TLS handshake secrets
+  after certificate rejection and profile cleanup. Every browser launch now
+  removes that variable. The rerun left no key log. Documentation scopes the
+  guarantee to NSS/profile storage and profile-encryption keyring access;
+  native display authorization and other environment integrations remain.
+- Reload cleared a confirmed certificate failure, but `Page.reload` replies
+  without an error even when its error page returns. The fake regression failed
+  before the fix with `None` instead of the previous certificate report. Reload
+  now retains that last confirmed failure until a successful document commits;
+  a new explicit navigation clears/replaces it. Tests cover both response/event
+  orders, successful recovery and exactly the requested navigation commands.
+
+The TLS regression launches capture in a child with disposable legacy and XDG
+NSS stores containing a test CA. NSS validates the imported test certificate,
+but the private browser must reject it, leave the caller database unchanged,
+write no ambient TLS key log and clean its private profiles. `certutil`
+(`libnss3-tools` on Ubuntu) is a test prerequisite only. The OpenSSL fixture owns
+its server before readiness checks so failed startup also cleans up.
+
+The authenticated X11 and key-log reproductions are retained under ignored
+`artifacts/pr21-review/isolation/`, including before/after observations and the
+script. No personal NSS/keyring, user authority file or system CA policy was
+modified. Secret Service/KWallet and other client-certificate providers remain
+unqualified, as noted above.
+The first full check also exposed a test-readiness race: procfs could briefly
+report the inherited parent HOME around exec, not just an empty environment.
+The child-environment test now waits for this launch's exact private HOME before
+checking the remaining fields; a wrong mapping still fails after the deadline.
+
+| Final local check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, strict Clippy, 1 CLI, 8 core, 142 engine and 36 desktop tests; 51 live tests ignored by default |
+| Full pinned Helium 0.18.1.1 suite, sandbox enabled, four threads | 51/51 passed in 90.70 s, including isolated caller NSS/key-log checks and certificate Reload/recovery |
+| Full desktop smoke, Xvfb 1600 × 1000 with Mesa Lavapipe, debug build | 13/13 passed; no browser process, profile or window left |
+| Authenticated disposable Xvfb, headed CLI capture | Implicit and explicit XAUTHORITY both passed, three frames each; authority unchanged and profiles cleaned |
+| Independent launch-isolation review | No remaining actionable finding; no real Secret Service/KWallet qualification claimed |
+
+Final logs are retained in ignored `artifacts/pr21-review/`. Existing vendored
+GPUI and `proc-macro-error2` future-compatibility warnings remain non-failing.
+
 ## P1.7 QA fidelity, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by the unprivileged

@@ -321,7 +321,7 @@ dimodelkan; GPUI 0.2.2 tidak menyediakan pohon aksesibilitas di Linux dan pohon
 aksesibilitas halaman tidak dibaca, jadi QA aksesibilitas memerlukan browser
 dengan screen reader.
 
-**Status P1.7 (27 September 2026, PR menunggu review):** pengukuran dan keputusan ada di
+**Status P1.7 (27–28 September 2026, merged melalui PR #20):** pengukuran dan keputusan ada di
 [ADR 0019](docs/adr/0019-qa-fidelity-headless-differences.md) dan
 `docs/validation.md` (P1.7). Probe pada Helium headless (konfigurasi Broxser),
 Helium headed di Xvfb, dan Chromium 141 membuktikan bahwa halaman di Broxser
@@ -337,6 +337,29 @@ URL workspace selama discovery. Tidak ada subprocess `--version`. Device non-mob
 mendapat layar seukuran viewport, dan sisanya didokumentasikan: hasil mewakili
 pengguna Helium dengan blocker mati di mesin serupa, bukan pengguna Chrome, dan
 perbandingan piksel canvas tidak stabil antar session.
+
+**Status P2.1 (27 September 2026, PR menunggu review):** audit dan keputusan ada di
+[ADR 0020](docs/adr/0020-certificate-store-and-keyring-inside-the-profile.md) dan
+`docs/validation.md` (P2.1). Trace `broxser capture` membuktikan bahwa verifikasi
+sertifikat HTTPS pertama membuka database NSS pengguna (`~/.pki/nssdb`, atau
+`$XDG_DATA_HOME/pki/nssdb`) secara read-write, CA yang diimpor pengguna ke sana
+dipercaya, dan database yang sama memuat sertifikat klien beserta kuncinya; di
+luar itu browser hanya membaca cache fontconfig, direktori layer Vulkan, skema
+glib dan `user-dirs.dirs` dari HOME, serta policy `/etc/chromium/policies`.
+Kini browser berjalan dengan `HOME` privat di dalam profil (mode 0700, tanpa
+`XDG_DATA_HOME`/`XDG_CONFIG_HOME`, cache pengguna tetap dipakai; pengukuran awal
+7,7 s vs 7,4 s), database NSS-nya dibuat dan dihapus
+bersama profil, `--password-store=basic` mencegah permintaan kunci enkripsi profil
+ke keyring desktop,
+dan corporate CA dipasang eksplisit lewat policy Chromium `CACertificates`, yang
+juga berlaku untuk Helium pengguna; tidak ada yang disalin dari database
+pengguna. Error `ERR_CERT_AUTHORITY_INVALID` membawa catatan apa yang dipercaya
+Broxser. Konsekuensi: CA yang hanya dipercaya di NSS pribadi tidak lagi
+dipercaya di Broxser, sertifikat klien tidak tersedia (keputusan P2.2), dan font
+di bawah HOME pengguna tidak terlihat halaman.
+Autentikasi X11 mempertahankan `XAUTHORITY` asli dan `SSLKEYLOGFILE` dibuang pada
+launch; environment native lainnya tetap diwarisi, jadi batas NSS/profil ini
+tidak menjamin isolasi seluruh akses filesystem.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -428,7 +451,7 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   ADR 0015, merged melalui PR #15; download/pemilih file: ADR 0016, merged melalui
   PR #16; permission: ADR 0017, merged melalui PR #17; input touch dan batas hover,
   drag/drop serta aksesibilitas: ADR 0018, merged melalui PR #19; P1.7 fidelitas QA:
-  ADR 0019, PR menunggu review).
+  ADR 0019, merged melalui PR #20).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.
