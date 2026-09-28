@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broxser console fixture</title>
+<!-- No favicon request, so no late 404 reaches the console after Clear. -->
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #3b82f6; }
+</style>
+</head>
+<body>
+<script>
+  // Every device reports one error and one warning; the smoke check expects
+  // each card to count them and the Console panel to show and clear them.
+  if (new URLSearchParams(location.search).has('selection')) {
+    // Different levels let the window smoke distinguish a stale phone console
+    // from the tablet's console after Hide changes the selection.
+    if (innerWidth <= 400) console.error('phone console', innerWidth);
+    else console.warn('other device console', innerWidth);
+  } else {
+    console.error('smoke error on', innerWidth);
+    console.warn('smoke warning on', innerWidth);
+  }
+  fetch('/console.html?logged');
+</script>
+</body>
+</html>

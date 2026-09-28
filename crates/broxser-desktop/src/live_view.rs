@@ -7,16 +7,17 @@ use crate::ime::{ImeBuffer, Origin};
 use crate::lifecycle::{AfterStop, CloseRequest, Lifecycle};
 use crate::url_input::{UrlEvent, UrlInput};
 use crate::{
-    ACCENT, BG, BORDER, DANGER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT, TogglePanel,
-    WARN,
+    ACCENT, BG, BORDER, DANGER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT,
+    ToggleConsole, TogglePanel, WARN,
 };
 use anyhow::{Context as _, Result};
 use broxser_core::{AppState, PRESETS, WindowSize, Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, DeviceStatus, DialogKind, DialogState, DownloadState,
-    Frame, ImeAction, KeyInput, LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers,
-    PasteRejected, PointerButton, PointerEvent, PointerKind, PopupState, RuntimeState, Status,
-    SyncSettings, is_paste_key, paste_text, to_viewport,
+    BrowserOptions, Cancellation, Command, ConsoleEntry, ConsoleKind, ConsoleLevel, ConsoleScope,
+    DeviceStatus, DialogKind, DialogState, DownloadState, Frame, ImeAction, KeyInput, LiveSession,
+    MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent,
+    PointerKind, PopupState, RuntimeState, Status, SyncSettings, is_paste_key, paste_text,
+    to_viewport,
 };
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
@@ -49,11 +50,16 @@ pub(crate) struct LiveView {
     workspace_path: Option<PathBuf>,
     /// The application state file that keeps the window size (ADR 0022).
     state_path: Option<PathBuf>,
-    panel_open: bool,
-    /// The last outcome of a panel action, shown in the panel.
+    /// The panel beside the device list, if one is open.
+    panel: Option<SidePanel>,
+    /// The last outcome of a workspace panel action, shown in that panel.
     panel_notice: Option<String>,
     /// Only one workspace snapshot may be written at a time.
     saving_workspace: bool,
+    /// The console of the selected device as the Console panel last read it,
+    /// with the device and revision it belongs to (ADR 0023).
+    console: Vec<ConsoleEntry>,
+    console_read: Option<(usize, u64)>,
     browser: Option<PathBuf>,
     session: Option<LiveSession>,
     status: Status,
@@ -178,6 +184,14 @@ struct DeviceView {
     dismissed_download: Option<u32>,
 }
 
+/// The panel beside the device list; one at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidePanel {
+    Workspace,
+    /// The selected device's console (ADR 0023).
+    Console,
+}
+
 struct PromptField {
     token: u64,
     input: Entity<UrlInput>,
@@ -293,9 +307,11 @@ impl LiveView {
             workspace,
             workspace_path,
             state_path,
-            panel_open: false,
+            panel: None,
             panel_notice: None,
             saving_workspace: false,
+            console: Vec::new(),
+            console_read: None,
             browser,
             session: None,
             status: Status::default(),
@@ -350,6 +366,7 @@ impl LiveView {
             Ok(session) => {
                 self.session = Some(session);
                 self.status = Status::default();
+                self.read_console();
                 self.notice = None;
                 // A new runtime streams every visible device; the next paint
                 // pauses those still off screen.
@@ -429,6 +446,7 @@ impl LiveView {
                     .update(cx, |input, cx| input.show(&url, window, cx));
             }
             self.status = status;
+            self.read_console();
             self.sync_prompts(window, cx);
             if former_caret != next_caret {
                 window.invalidate_character_coordinates();
@@ -742,6 +760,7 @@ impl LiveView {
             }
         }
         self.selected = Some(index);
+        self.read_console();
         self.focus.focus(window);
         if let Some(url) = self
             .status
@@ -790,6 +809,7 @@ impl LiveView {
         let selected = selected_after_visibility_change(self.selected, &hidden);
         if selected != self.selected {
             self.selected = selected;
+            self.read_console();
             if let Some(index) = selected
                 && let Some(url) = self
                     .status
@@ -974,6 +994,7 @@ impl LiveView {
         }
         // Nothing of the previous runtime is shown while it stops.
         self.status = Status::default();
+        self.read_console();
         self.clear_prompts(window);
         self.notice = None;
         // The panel's draft becomes the workspace of the next runtime. Its
@@ -1036,8 +1057,53 @@ impl LiveView {
     }
 
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
-        self.panel_open = !self.panel_open;
+        self.toggle(SidePanel::Workspace, cx);
+    }
+
+    /// Opens `panel` in place of another one, or closes it.
+    fn toggle(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
+        self.panel = (self.panel != Some(panel)).then_some(panel);
+        self.read_console();
         cx.notify();
+    }
+
+    /// Selects device `index` and shows its console.
+    fn open_console(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(index, window, cx);
+        if self.selected == Some(index) {
+            self.panel = Some(SidePanel::Console);
+            self.read_console();
+            cx.notify();
+        }
+    }
+
+    /// Reads the selected device's console while the Console panel shows it
+    /// and it changed since the last read.
+    fn read_console(&mut self) {
+        let wanted = self
+            .selected
+            .filter(|_| self.panel == Some(SidePanel::Console))
+            .and_then(|index| Some((index, self.status.devices.get(index)?.console_revision)));
+        if wanted.is_none() {
+            self.console_read = None;
+            self.console.clear();
+            return;
+        }
+        if wanted == self.console_read {
+            return;
+        }
+        let Some((session, (index, _))) = self.session.as_ref().zip(wanted) else {
+            return;
+        };
+        self.console = session.console(index);
+        self.console_read = wanted;
+    }
+
+    fn clear_console(&mut self, cx: &mut Context<Self>) {
+        if let Some(device) = self.selected {
+            self.send(Command::ClearConsole { device });
+            cx.notify();
+        }
     }
 
     /// Adds preset `index` to the draft, in the session of the selected
@@ -1669,7 +1735,34 @@ impl LiveView {
                         "{} frames · {} replaced",
                         status.frames, status.dropped_frames
                     ))
-                    .child(activity_line(&status)),
+                    .child(activity_line(&status))
+                    .when(
+                        status.console_errors > 0 || status.console_warnings > 0,
+                        |this| {
+                            // Filled in the danger or warning color, so a
+                            // real-window check can find it by color alone.
+                            this.child(
+                                div().flex().child(
+                                    div()
+                                        .id(("console-summary", index))
+                                        .cursor_pointer()
+                                        .rounded_md()
+                                        .bg(rgb(if status.console_errors > 0 {
+                                            DANGER
+                                        } else {
+                                            WARN
+                                        }))
+                                        .text_color(rgb(BG))
+                                        .px_2()
+                                        .py_0p5()
+                                        .child(format!("{} · Console", console_counts(&status)))
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.open_console(index, window, cx)
+                                        })),
+                                ),
+                            )
+                        },
+                    ),
             )
             .when_some(
                 status
@@ -1937,8 +2030,20 @@ impl LiveView {
                     .on_click(cx.listener(|view, _, _, cx| view.reload_selected(cx))),
             )
             .child(
-                toggle("workspace-panel", "Workspace", self.panel_open)
-                    .on_click(cx.listener(|view, _, _, cx| view.toggle_panel(cx))),
+                toggle(
+                    "workspace-panel",
+                    "Workspace",
+                    self.panel == Some(SidePanel::Workspace),
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_panel(cx))),
+            )
+            .child(
+                toggle(
+                    "console-panel-toggle",
+                    "Console",
+                    self.panel == Some(SidePanel::Console),
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.toggle(SidePanel::Console, cx))),
             )
             .child(
                 toggle("sync-navigation", "Sync links", sync.navigation).on_click(cx.listener(
@@ -2229,6 +2334,94 @@ impl LiveView {
             .into_any_element()
     }
 
+    /// The selected device's console (ADR 0023), newest first. It lives in
+    /// memory for this runtime; Clear empties it for the device.
+    fn console_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel = div()
+            .id("console-panel")
+            .w(px(340.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SURFACE))
+            .child(div().text_xs().text_color(rgb(MUTED)).child("CONSOLE"));
+        let Some((device, status)) = self.selected.and_then(|index| {
+            Some((
+                self.workspace.devices.get(index)?,
+                self.status.devices.get(index)?,
+            ))
+        }) else {
+            return panel
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("Select a device to see its console."),
+                )
+                .into_any_element();
+        };
+        panel
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(device.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(console_counts(status)),
+                            ),
+                    )
+                    // Filled in the accent color, so a real-window check can
+                    // find it by its color alone.
+                    .child(
+                        div()
+                            .id("console-clear")
+                            .cursor_pointer()
+                            .rounded_md()
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(BG))
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .child("Clear")
+                            .on_click(cx.listener(|view, _, _, cx| view.clear_console(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Newest first. Kept in memory until Clear or Restart."),
+            )
+            .children(self.console.is_empty().then(|| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("No console messages.")
+            }))
+            .children(self.console.iter().rev().map(console_row))
+            .into_any_element()
+    }
+
     fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let runtime = match &self.status.runtime {
             _ if self.lifecycle.is_restarting() => {
@@ -2323,6 +2516,9 @@ impl Render for LiveView {
                 view.url.update(cx, |input, cx| input.focus_all(window, cx));
             }))
             .on_action(cx.listener(|view, _: &TogglePanel, _, cx| view.toggle_panel(cx)))
+            .on_action(
+                cx.listener(|view, _: &ToggleConsole, _, cx| view.toggle(SidePanel::Console, cx)),
+            )
             .on_key_up(cx.listener(|view, event: &KeyUpEvent, _, _| {
                 view.key_up(&event.keystroke);
             }))
@@ -2333,7 +2529,10 @@ impl Render for LiveView {
                     .flex_1()
                     .min_h_0()
                     .child(self.sidebar(cx))
-                    .children(self.panel_open.then(|| self.workspace_panel(cx)))
+                    .children(self.panel.map(|panel| match panel {
+                        SidePanel::Workspace => self.workspace_panel(cx),
+                        SidePanel::Console => self.console_panel(cx),
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -2760,6 +2959,82 @@ fn scale_suffix(scale: f64) -> String {
     }
 }
 
+/// "2 errors · 1 warning", or that there are none.
+fn console_counts(status: &DeviceStatus) -> String {
+    let count = |count: u32, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    match (status.console_errors, status.console_warnings) {
+        (0, 0) => "No errors or warnings".into(),
+        (errors, 0) => count(errors, "error", "errors"),
+        (0, warnings) => count(warnings, "warning", "warnings"),
+        (errors, warnings) => format!(
+            "{} · {}",
+            count(errors, "error", "errors"),
+            count(warnings, "warning", "warnings")
+        ),
+    }
+}
+
+/// One console entry as the panel shows it: its level, what reported it,
+/// its text and where it came from. Page text is shown, never interpreted.
+fn console_row(entry: &ConsoleEntry) -> AnyElement {
+    let (level, color) = match entry.level {
+        ConsoleLevel::Error => ("Error", DANGER),
+        ConsoleLevel::Warning => ("Warning", WARN),
+        ConsoleLevel::Info => ("Info", MUTED),
+    };
+    let mut tags: Vec<String> = Vec::new();
+    match entry.kind {
+        ConsoleKind::Console | ConsoleKind::Navigation => {}
+        ConsoleKind::Exception => tags.push("uncaught".into()),
+        ConsoleKind::Network => tags.push("request".into()),
+        ConsoleKind::Browser => tags.push("browser".into()),
+    }
+    match entry.scope {
+        ConsoleScope::MainFrame => {}
+        ConsoleScope::Subframe => tags.push("frame".into()),
+        ConsoleScope::Unknown => tags.push("frame unknown".into()),
+    }
+    if entry.repeats > 1 {
+        tags.push(format!("×{}", entry.repeats));
+    }
+    let row = div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .py_1()
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .text_xs();
+    if entry.kind == ConsoleKind::Navigation {
+        return row
+            .text_color(rgb(MUTED))
+            .child(format!("Navigated to {}", entry.location))
+            .into_any_element();
+    }
+    row.child(
+        div()
+            .flex()
+            .gap_2()
+            .child(div().text_color(rgb(color)).child(level))
+            .children(
+                tags.into_iter()
+                    .map(|tag| div().text_color(rgb(MUTED)).child(tag)),
+            ),
+    )
+    .child(div().w_full().child(entry.text.clone()))
+    .children((!entry.location.is_empty()).then(|| {
+        div()
+            .text_color(rgb(MUTED))
+            .overflow_hidden()
+            .text_ellipsis()
+            .whitespace_nowrap()
+            .child(entry.location.clone())
+    }))
+    .into_any_element()
+}
+
 fn activity_line(status: &DeviceStatus) -> String {
     let mut parts = vec![if status.streaming {
         "Streaming".to_owned()
@@ -2781,9 +3056,9 @@ fn activity_line(status: &DeviceStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanvasKey, DeviceView, KeyFocus, PressedKeys, activity_line, canvas_key, field_answer,
-        focus_after_prompt_change, frame_device, key_down_target, key_input, map_caret,
-        open_dialog, prompt_default, selected_after_visibility_change,
+        CanvasKey, DeviceView, KeyFocus, PressedKeys, activity_line, canvas_key, console_counts,
+        field_answer, focus_after_prompt_change, frame_device, key_down_target, key_input,
+        map_caret, open_dialog, prompt_default, selected_after_visibility_change,
     };
     use crate::ime::{ImeBuffer, Origin};
     use crate::lifecycle::{AfterStop, Lifecycle};
@@ -3376,5 +3651,21 @@ mod tests {
             activity_line(&status),
             "Paused · 2 window(s) closed · 1 download(s) refused · 3 file chooser(s) cancelled"
         );
+    }
+
+    #[test]
+    fn console_counts_name_errors_and_warnings() {
+        let counts = |console_errors, console_warnings| {
+            console_counts(&DeviceStatus {
+                console_errors,
+                console_warnings,
+                ..DeviceStatus::default()
+            })
+        };
+        assert_eq!(counts(0, 0), "No errors or warnings");
+        assert_eq!(counts(1, 0), "1 error");
+        assert_eq!(counts(0, 1), "1 warning");
+        assert_eq!(counts(2, 3), "2 errors · 3 warnings");
+        assert_eq!(counts(1, 1), "1 error · 1 warning");
     }
 }
