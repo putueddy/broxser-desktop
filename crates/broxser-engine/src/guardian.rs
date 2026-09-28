@@ -265,11 +265,7 @@ fn cleanup(profile: &Path, owner: &ProcessIdentity, reported: Option<ProcessIden
         browsers.push(reported);
     }
     let mut processes: Vec<ProcessIdentity> = Vec::new();
-    for process in browsers
-        .iter()
-        .flat_map(browser::descendants)
-        .chain(browser::referencing(profile))
-    {
+    for process in browsers.iter().flat_map(browser::descendants) {
         if !processes.contains(&process) {
             processes.push(process);
         }

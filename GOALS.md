@@ -126,7 +126,8 @@ dalam PID namespace sandbox, sehingga handler, renderer dan zombie-nya hidup
 terus sementara profilnya sudah dihapus) muncul sebagai "browser processes still
 running" di suite live dan meninggalkan proses di mesin pengguna tanpa recovery.
 Kini semua jalur cleanup, sesudah menunggu lima detik, membunuh lewat pidfd
-berdasarkan identitas proses yang tercatat dan masih berjalan, proses dengan
+berdasarkan identitas turunan browser yang terverifikasi dan masih berjalan,
+proses dengan
 argumen `--user-data-dir=<profil>` persis, dan crash handler dengan
 `--database=<profil>/`, lalu menunggu sekali lagi; proses lain yang hanya menyebut
 profil tetap tidak disinyal. Bukti di `docs/validation.md` (tindak lanjut P0).

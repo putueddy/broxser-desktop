@@ -339,8 +339,7 @@ fn recover(profile: &Path, lease: &Lease, host: &Host) {
         && let Some(orphan) = lease.browser
         && browser::launched_with(profile).contains(&orphan)
     {
-        let mut processes = browser::descendants(&orphan);
-        processes.extend(browser::referencing(profile));
+        let processes = browser::descendants(&orphan);
         let _ = browser::terminate(&orphan);
         browser::release_or_stop(&processes, profile, EXIT_TIMEOUT);
     }

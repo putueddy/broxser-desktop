@@ -80,10 +80,18 @@ metadata files were readable by other local users; Chromium itself uses 0700.
   init of its sandbox PID namespace, waits for its traced threads and the
   handler waits for it (`docs/validation.md`, P1.4). When something still runs
   after the five-second wait, every cleanup path SIGKILLs through a pidfd,
-  re-checked against the recorded start time, the processes it recorded that
-  still run, the processes carrying the exact `--user-data-dir=<profile>`
+  re-checked against the recorded start time, the verified browser descendants
+  it recorded that still run, the processes carrying the exact `--user-data-dir=<profile>`
   argument and the crash handlers carrying `--database=<profile>/…`, then waits
   once more. Processes that only mention the profile are still never signaled.
+  Broad profile-reference scans are wait-only observations, including those
+  already present at the initial snapshot; they never become the kill list.
+  The owner retains the browser identity captured at spawn and verifies it
+  before taking a descendant snapshot, even after startup has reaped the child.
+  Crash database markers must begin a real NUL-delimited argument. Exact profile
+  argument matching accepts space-delimited Chromium titles only when the
+  command line contains one nonempty argv entry; embedded shell source in
+  ordinary argv is not an ownership marker.
 - **Recovery on the next start.** Before creating a profile, the engine checks
   `broxser-cdp-*` entries in the same root. An entry is stale only when it is a
   real directory owned by the user, with a valid version-1 lease, and either
@@ -144,6 +152,13 @@ profile after the browser is gone checks the release rule for the owner's
 shutdown and for the guardian. A CLI test kills the real `broxser` binary during
 a capture, and the X11 smoke script kills the real desktop with SIGKILL, Ctrl+C
 and SIGTERM.
+
+PR #18 review regressions additionally keep unrelated profile observers alive
+through shutdown, fallback Drop, guardian cleanup and stale-profile recovery.
+They cover observers present initially and arriving later, embedded marker text,
+sibling profiles, and missing/reaped/mismatched root identities. The stuck-helper
+regressions still require genuine browser helpers to stop. All subprocesses used
+by these regressions are disposable test-owned processes.
 
 Measured on 25 September 2026 (`docs/validation.md`): after owner death the
 Helium instance, its CDP endpoint and its profile were gone in 38–99 ms (43–105

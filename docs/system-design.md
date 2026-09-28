@@ -128,6 +128,12 @@ agar fitur lokal bekerja.
    menyebut profil, termasuk helper yang baru muncul saat browser berhenti, hapus
    profil sementara (lease terakhir), lalu lepaskan guardian.
 
+Cleanup membedakan identitas turunan browser yang terverifikasi dari proses lain
+yang hanya menyebut path profil. Setelah batas tunggu, hanya proses milik browser
+yang boleh menerima SIGKILL; pengamat profil tetap hanya ditunggu. Snapshot turunan
+memakai identitas browser yang dicatat saat spawn, dan pencocokan argumen tidak
+menganggap teks di dalam argumen shell sebagai flag kepemilikan (ADR 0007).
+
 Bila proses Broxser mati di langkah mana pun (SIGKILL, SIGTERM, crash), pipe ke
 guardian tertutup oleh kernel. Guardian di session sendiri menghentikan browser
 yang tercatat, menunggu helper-nya dan menghapus profil; bila guardian ikut mati,

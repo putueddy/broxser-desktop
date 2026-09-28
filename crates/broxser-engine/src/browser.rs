@@ -79,6 +79,9 @@ pub fn discover_browser() -> Result<PathBuf> {
 
 pub(crate) struct BrowserProcess {
     child: Child,
+    /// Captured once at spawn. Never infer ownership from a possibly reused PID.
+    /// `None` only while a failed identity capture unwinds startup.
+    identity: Option<ProcessIdentity>,
     /// Removed after the browser stops. `None` once `shutdown` has handled it.
     profile: Option<OwnedProfile>,
     cancel: Cancellation,
@@ -123,6 +126,7 @@ impl BrowserProcess {
         // From here on, dropping `browser` stops the child before the profile goes.
         let mut browser = Self {
             child,
+            identity,
             profile: Some(profile),
             cancel: options.cancel.clone(),
         };
@@ -133,10 +137,10 @@ impl BrowserProcess {
         Ok(browser)
     }
 
-    /// The browser, its descendants and any detached helper whose command line
-    /// names the private profile (Chromium's crash handler).
+    /// Processes useful for diagnostics, including unrelated profile observers.
+    /// This broad list must never be used as proof of signal ownership.
     pub(crate) fn processes(&self) -> Vec<ProcessIdentity> {
-        let mut processes = process_tree(self.child.id());
+        let mut processes = self.owned_processes();
         if let Some(profile) = &self.profile {
             for process in referencing(profile.path()) {
                 if !processes.contains(&process) {
@@ -145,6 +149,11 @@ impl BrowserProcess {
             }
         }
         processes
+    }
+
+    /// Only the recorded browser's verified tree is proven to belong to us.
+    fn owned_processes(&self) -> Vec<ProcessIdentity> {
+        self.identity.as_ref().map_or_else(Vec::new, descendants)
     }
 
     /// The guardian that cleans up if this process dies; it exits on release.
@@ -194,7 +203,7 @@ impl BrowserProcess {
     pub(crate) fn shutdown(mut self) -> Result<()> {
         #[cfg(test)]
         crate::test_support::abort_point("before-kill");
-        let processes = self.processes();
+        let processes = self.owned_processes();
         let _ = self.child.kill();
         self.child.wait().context("wait for browser exit")?;
         let survivors = match &self.profile {
@@ -221,8 +230,7 @@ impl Drop for BrowserProcess {
         let Some(profile) = self.profile.take() else {
             return;
         };
-        let mut processes = process_tree(self.child.id());
-        processes.extend(referencing(profile.path()));
+        let processes = self.owned_processes();
         let _ = self.child.kill();
         let _ = self.child.wait();
         release_or_stop(&processes, profile.path(), EXIT_TIMEOUT);
@@ -493,22 +501,23 @@ pub(crate) fn wait_for_release(
 }
 
 /// [`wait_for_release`], then, if something of the browser still runs, kills
-/// by process identity each recorded process that runs and each process
+/// by process identity each proven-owned process that runs and each process
 /// launched on `profile` or keeping its crash reports there, and waits once
 /// more. A crash handler that traces a renderer caught by the kill otherwise
 /// keeps itself, that renderer and its sandbox namespace alive indefinitely
 /// (validation, P1.4); a stopped handler releases them. Processes that merely
 /// mention the profile are waited for, never signalled. Returns how many
-/// still run.
+/// still run. `owned` must contain only identity-verified browser descendants;
+/// broad profile references are wait-only observations, never ownership proof.
 pub(crate) fn release_or_stop(
-    processes: &[ProcessIdentity],
+    owned: &[ProcessIdentity],
     profile: &Path,
     timeout: Duration,
 ) -> usize {
-    if wait_for_release(processes, profile, timeout) == 0 {
+    if wait_for_release(owned, profile, timeout) == 0 {
         return 0;
     }
-    let mut stopped: Vec<ProcessIdentity> = processes.iter().copied().filter(is_running).collect();
+    let mut stopped: Vec<ProcessIdentity> = owned.iter().copied().filter(is_running).collect();
     for process in launched_with(profile)
         .into_iter()
         .chain(crash_handlers_of(profile))
@@ -581,7 +590,7 @@ pub(crate) mod procfs {
     }
 
     /// Running processes with `argument` as one whole argument. Chromium may
-    /// rewrite its title and join arguments with spaces, so a space ends one too.
+    /// replace argv with one process title whose arguments are joined by spaces.
     pub(crate) fn with_argument(argument: &[u8]) -> Vec<ProcessIdentity> {
         matching(|cmdline| has_argument(cmdline, argument))
     }
@@ -603,29 +612,43 @@ pub(crate) mod procfs {
             .collect()
     }
 
-    /// An argument of `cmdline` starts with `prefix`: it is preceded by the
-    /// start, a NUL or, for rewritten titles, a space.
+    /// Crashpad keeps real NUL-separated argv, including paths with spaces.
+    /// Text embedded in another argument is never a crash database marker.
     pub(super) fn has_argument_prefix(cmdline: &[u8], prefix: &[u8]) -> bool {
         !prefix.is_empty()
             && cmdline
-                .windows(prefix.len())
-                .enumerate()
-                .any(|(at, window)| {
-                    window == prefix && (at == 0 || matches!(cmdline[at - 1], 0 | b' '))
-                })
+                .split(|&byte| byte == 0)
+                .any(|arg| arg.starts_with(prefix))
     }
 
     pub(super) fn has_argument(cmdline: &[u8], argument: &[u8]) -> bool {
-        let boundary = |byte: Option<&u8>| matches!(byte, None | Some(0 | b' '));
-        !argument.is_empty()
-            && cmdline
-                .windows(argument.len())
-                .enumerate()
-                .any(|(at, window)| {
-                    window == argument
-                        && (at == 0 || boundary(cmdline.get(at - 1)))
-                        && boundary(cmdline.get(at + argument.len()))
-                })
+        if argument.is_empty() {
+            return false;
+        }
+        let mut args = cmdline
+            .split(|&byte| byte == 0)
+            .filter(|arg| !arg.is_empty());
+        let Some(first) = args.next() else {
+            return false;
+        };
+        if first == argument {
+            return true;
+        }
+        if let Some(second) = args.next() {
+            // Ordinary argv: spaces inside a shell script or any other argument
+            // are contents, never an argument boundary.
+            return second == argument || args.any(|arg| arg == argument);
+        }
+        // Chromium's rewritten argv[0] is one nonempty string (possibly followed
+        // by NUL padding). Only this representation admits space boundaries.
+        first
+            .windows(argument.len())
+            .enumerate()
+            .any(|(at, window)| {
+                window == argument
+                    && (at == 0 || first[at - 1] == b' ')
+                    && matches!(first.get(at + argument.len()), None | Some(b' '))
+            })
     }
 
     /// Parses `/proc/<pid>/stat`: the command name may contain spaces or
@@ -775,10 +798,15 @@ mod tests {
             b"helium --type=zygote --user-data-dir=/tmp/broxser-cdp-a",
             argument
         ));
+        assert!(procfs::has_argument(
+            b"helium --type=zygote --user-data-dir=/tmp/broxser-cdp-a\0\0\0",
+            argument
+        ));
         for other in [
             &b"helium\0--user-data-dir=/tmp/broxser-cdp-ab\0"[..],
             b"ls\0/tmp/broxser-cdp-a\0",
             b"x--user-data-dir=/tmp/broxser-cdp-a\0",
+            b"sh\0-c\0read line; : --user-data-dir=/tmp/broxser-cdp-a\0sh\0",
         ] {
             assert!(!procfs::has_argument(other, argument), "{other:?}");
         }
@@ -799,9 +827,121 @@ mod tests {
             b"ls\0/tmp/broxser-cdp-a/Crash Reports\0",
             b"x\0x--database=/tmp/broxser-cdp-a/Crash Reports\0",
             b"cat\0notes--database=/tmp/broxser-cdp-a/\0",
+            b"sh\0-c\0read line; : --database=/tmp/broxser-cdp-a/Crash Reports\0sh\0",
+            b"helium_crashpad_handler --database=/tmp/broxser-cdp-a/Crash Reports",
         ] {
             assert!(!procfs::has_argument_prefix(other, prefix), "{other:?}");
         }
+    }
+
+    /// Observers present before the snapshot and arriving after the browser
+    /// exits must block release without becoming browser ownership evidence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_preserves_initial_and_late_profile_observers() {
+        use crate::test_support::{FakeBrowser, HeldProcess, fake_browser, profile_root};
+        for shutdown in [true, false] {
+            let root = profile_root();
+            let options = BrowserOptions {
+                executable: fake_browser(FakeBrowser::NeverReady),
+                headless: true,
+                profile_root: Some(root.path().to_owned()),
+                cancel: Cancellation::new(),
+            };
+            let browser = BrowserProcess::start(&options, true).unwrap();
+            let sibling = BrowserProcess::start(&options, true).unwrap();
+            let profile = browser.profile.as_ref().unwrap().path().to_owned();
+            let sibling_profile = sibling.profile.as_ref().unwrap().path().to_owned();
+            let initial = HeldProcess::argument(&profile);
+            let embedded = HeldProcess::embedded(&format!(
+                "--user-data-dir={} --database={}/Crash Reports",
+                profile.display(),
+                profile.display()
+            ));
+            let root_identity = identity(browser.child.id()).unwrap();
+            let late_profile = profile.clone();
+            let late = thread::spawn(move || {
+                let deadline = Instant::now() + EXIT_TIMEOUT;
+                while is_running(&root_identity) {
+                    assert!(Instant::now() < deadline, "the browser did not stop");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                HeldProcess::argument(late_profile)
+            });
+            let result = if shutdown {
+                browser.shutdown()
+            } else {
+                drop(browser);
+                Ok(())
+            };
+            let late = late.join().unwrap();
+            initial.assert_running();
+            embedded.assert_running();
+            late.assert_running();
+            if shutdown {
+                assert!(
+                    result.is_err(),
+                    "a live observer must report incomplete release"
+                );
+            }
+            assert!(!profile.exists());
+            assert!(sibling_profile.exists());
+            assert!(sibling.processes().iter().any(is_running));
+            sibling.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_snapshot_rejects_a_mismatched_or_reaped_browser_identity() {
+        use crate::test_support::{FakeBrowser, fake_browser, profile_root};
+        let root = profile_root();
+        let mut browser = BrowserProcess::start(
+            &BrowserOptions {
+                executable: fake_browser(FakeBrowser::NeverReady),
+                headless: true,
+                profile_root: Some(root.path().to_owned()),
+                cancel: Cancellation::new(),
+            },
+            true,
+        )
+        .unwrap();
+        let recorded = browser.identity.unwrap();
+        assert_eq!(browser.owned_processes(), [recorded]);
+        browser.identity = Some(ProcessIdentity {
+            start_time: recorded.start_time + 1,
+            ..recorded
+        });
+        assert!(
+            browser.owned_processes().is_empty(),
+            "a reused PID supplied ownership"
+        );
+        browser.identity = Some(recorded);
+        browser.child.kill().unwrap();
+        browser.child.wait().unwrap();
+        assert!(
+            browser.owned_processes().is_empty(),
+            "a reaped child supplied ownership"
+        );
+        browser.shutdown().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_scan_rejects_embedded_marker_text() {
+        use crate::test_support::{HeldProcess, profile_root};
+        let root = profile_root();
+        let profile = root.path().join("private-profile");
+        let embedded = HeldProcess::embedded(&format!(
+            "--user-data-dir={} --database={}/Crash Reports",
+            profile.display(),
+            profile.display()
+        ));
+        assert!(referencing(&profile).contains(&embedded.identity));
+        assert!(!launched_with(&profile).contains(&embedded.identity));
+        assert!(!crash_handlers_of(&profile).contains(&embedded.identity));
+        assert_eq!(release_or_stop(&[], &profile, Duration::from_millis(30)), 1);
+        embedded.assert_running();
     }
 
     #[cfg(target_os = "linux")]

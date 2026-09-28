@@ -44,6 +44,53 @@ match).
 | Live Helium suite on top of the PTZ commit `a075485` | The first run after a container restart failed the four capture tests that start first with "browser did not publish a CDP endpoint within 15 seconds" (four cold browser starts at once; shutdown is not involved) and passed the other 39; the next run passed 43 of 43 in 67 s with nothing left running |
 | `scripts/desktop-smoke.sh` (Xvfb 1600 × 1000, debug build), before and on top of `a075485` | 12 of 12 scenarios passed each time (1 m 20 s, 1 m 22 s); no browser process, profile or window left |
 
+### PR #18 ownership review corrections, 28 September 2026 (local Linux)
+
+Review of `be3aed6` found two signal-ownership regressions. The new escalation
+used the full recorded process list, but shutdown, Drop, guardian and recovery
+all added broad profile references to that list. An unrelated observer already
+naming the profile consequently became a SIGKILL target. The new crash-database
+matcher also treated a space inside an ordinary argv entry as a flag boundary,
+so shell source containing `--database=<profile>/...` could be mistaken for a
+crash handler during the fresh scan.
+
+The baseline regressions failed as expected: two argument-matching assertions
+accepted embedded shell text, and the shutdown observer test found its own
+disposable observer had been signaled. Test-owned child guards cleaned up the
+fixtures; no user processes were targeted.
+
+The fix separates verified browser descendants from wait-only profile observers
+in all four cleanup paths. The owner retains its spawn-time browser identity
+before constructing descendant snapshots, including after the child was reaped.
+Crash database matching requires the start of a NUL-delimited argument;
+space-separated exact-argument matching is restricted to Chromium's single
+nonempty argv representation. Normal argv preserves spaces inside its values.
+
+Regression coverage verifies initial and late observers, embedded marker text,
+shutdown and fallback Drop, guardian EOF, stale recovery, sibling preservation,
+and reaped/mismatched identities. Recovery still leaves unproven or foreign-boot
+processes alone. The existing stuck-helper and late-helper tests continue to
+require genuine browser helpers to stop. A persistent observer remains alive
+and produces the existing incomplete-release error; recovery retains its profile
+for a later attempt.
+
+Independent source review found no remaining actionable introduced issue after
+these corrections. Evidence is retained locally in ignored
+`artifacts/pr18-fixes/` logs. The intermittent real Crashpad deadlock is not
+claimed to have been forced by these deterministic subprocess tests.
+
+| Final local check | Result |
+| --- | --- |
+| `CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 103 engine + 36 desktop tests (148 total) |
+| Full live Helium suite (`--ignored --test-threads=2 --nocapture`) | Passed: 43 of 43, 100.12 s; includes owner-death, orphan recovery and normal browser cleanup |
+| Independent ownership review | Both signal-eligibility findings resolved; no additional actionable introduced issue found |
+| `git diff --check` | Passed |
+
+The live suite used Helium 0.18.1.1 (`Chrome/154.0.8037.57`) with sandboxing
+enabled and application-owned private profiles. No GUI code changed, so no
+additional native window check was required. Existing vendored GPUI and
+`proc-macro-error2` future-compatibility warnings remain non-failing.
+
 ### Limits
 
 - The deadlock itself is intermittent; the live runs above show no

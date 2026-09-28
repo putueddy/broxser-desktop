@@ -704,6 +704,60 @@ fn guardian_stops_the_reported_browser_when_its_owner_disappears() {
 }
 
 #[test]
+fn guardian_cleanup_preserves_initial_and_late_profile_observers() {
+    use crate::test_support::HeldProcess;
+    let mut guarded = Guarded::start(sleeper);
+    let stand_in = guarded.stand_in();
+    guarded.watch(stand_in);
+    let initial = HeldProcess::argument(&guarded.profile);
+    let embedded = HeldProcess::embedded(&format!(
+        "--user-data-dir={} --database={}/Crash Reports",
+        guarded.profile.display(),
+        guarded.profile.display()
+    ));
+    let helper = HeldProcess::argument(format!(
+        "--database={}/Crash Reports",
+        guarded.profile.display()
+    ));
+    let sibling_profile = guarded
+        ._root
+        .path()
+        .join(format!("{PROFILE_PREFIX}sibling"));
+    fs::create_dir(&sibling_profile).unwrap();
+    let sibling = HeldProcess::argument(format!("--user-data-dir={}", sibling_profile.display()));
+    let late_profile = guarded.profile.clone();
+    let late = thread::spawn(move || {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        while browser::is_running(&stand_in) {
+            assert!(
+                Instant::now() < deadline,
+                "the guardian did not stop the browser"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        HeldProcess::argument(late_profile)
+    });
+    let status = guarded.abandon();
+    let late = late.join().unwrap();
+    initial.assert_running();
+    embedded.assert_running();
+    late.assert_running();
+    sibling.assert_running();
+    assert!(sibling_profile.exists());
+    assert!(
+        !browser::is_running(&helper.identity),
+        "a genuine crash helper survived"
+    );
+    assert!(!browser::is_running(&stand_in));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a live observer must report incomplete release"
+    );
+    assert!(!guarded.profile.exists());
+}
+
+#[test]
 fn guardian_never_signals_a_reused_pid() {
     let mut guarded = Guarded::start(sleeper);
     let stand_in = guarded.stand_in();
