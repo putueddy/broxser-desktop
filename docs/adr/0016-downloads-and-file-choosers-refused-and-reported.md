@@ -61,7 +61,7 @@ runtime at `6fefab7` found:
   until removal, across renderer swaps, and cleared with each new document, so
   a cross-site frame's download is the device's too. A frame Broxser does not
   know reports nothing.
-- Device sessions auto-attach to iframe renderer targets only, and configure
+- Device sessions auto-attach to iframe renderer targets, and configure
   each attached iframe to do the same for its own descendants. The browser-level
   target and page targets are not auto-attached, so this does not change popup
   handling. New iframe renderers wait during asynchronous setup: enable Page
@@ -71,6 +71,11 @@ runtime at `6fefab7` found:
   and replaced documents retire their sessions and pending setup results.
   Child-session events update frame ownership and chooser counts only; they do
   not enter the device's main-frame input, IME, dialog or navigation-sync paths.
+  ADR 0019 also explicitly includes worker target types: pinned Helium can pause
+  a worker under `waitForDebuggerOnStart` even when the iframe-only filter hides
+  its attachment event. Owned worker sessions are immediately resumed and
+  detached after the resume acknowledgement, without Page setup or frame/input
+  ownership. They are never treated as page or iframe event sources.
 - The whole iframe setup uses one command deadline. A setup error or timeout
   marks that device's current document as having incomplete iframe activity
   reports; other devices keep running. A fresh main document clears that state;
@@ -80,7 +85,8 @@ runtime at `6fefab7` found:
   left paused. Late replies cannot restore retired frame ownership.
 - Frame ownership remains bounded to 256 subframes per device; reaching that
   limit reports incomplete activity for that device instead of stopping peers.
-  Active and retiring iframe sessions share a runtime limit of 128. Exhausting
+  Active and retiring iframe sessions and pending worker cleanup share a runtime
+  limit of 128. Exhausting
   that global safety budget stops the runtime with an explicit error and browser
   cleanup, rather than accumulating untracked debugger-held renderers.
 - Broxser's own navigation (Go, Reload, a synced link) to an address that is a

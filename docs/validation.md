@@ -73,15 +73,77 @@ screen and touch points on a touch phone, a mouse tablet and a mouse desktop:
 
 ### Limits
 
-- The user agent is the headed Linux string of the same browser; two
-  high-entropy client hints stay blank; a browser that prints no version in 3 s
-  keeps its headless user agent.
+- The user agent preserves the browser's native platform and version, changing
+  only its headless product marker. Two high-entropy client hints stay blank.
+  An absent or unsupported native UA keeps the original owned browser; a
+  discovery error stops startup instead of launching a fallback.
 - WebGL is SwiftShader without a GPU, canvas and audio output carry Helium's
   per-session noise, `hardwareConcurrency` varied once, and session contexts
   have no content blocking (ADR 0004): representative of a Helium user with
   the blocker off on a similar machine, not of a Chrome user.
 - Headed Helium was measured on Xvfb without a GPU; a user's machine differs
   in WebGL and screen.
+
+### PR #20 ownership and startup review, 28 September 2026 (local Linux)
+
+Review of `ca46c52` found that the new CLI version probe bypassed the established
+browser ownership path. A successful wrapper that retained stdout in a helper
+made the nominal three-second probe wait 6.020 s. A 64 MiB version response
+raised the probe caller's peak RSS to 68,152 KiB. Through the capture API,
+cancellation after 100 ms returned after 3.050 s and still launched the normal
+browser; killing the owner left the unregistered version child alive after
+5.2 s while the guardian and profile had already gone.
+
+The replacement removes the CLI probe and its stdout reader. Live and capture
+now share an owned discovery path: query `Browser.getVersion` in a private,
+guarded browser on `about:blank`, normalize only the native headless UA token,
+then require checked cleanup before one replacement launch. Discovery creates
+no workspace contexts or targets and never loads a workspace URL. An ordinary
+or unsupported UA uses the first runtime; errors and cancellation stop startup
+without another launch. All spawns check cancellation again after profile and
+guardian setup. Endpoint waits and commands retain their existing per-operation
+deadlines; startup may include two sequential browser launches, not a global
+three-second probe deadline.
+
+A separate sandboxed Helium probe corrected the initial metadata assumption:
+omitting optional brands/full versions from CDP UA metadata preserves native
+defaults. A per-target override, however, normalized the page and dedicated
+worker while service-worker JavaScript and requests still exposed
+`HeadlessChrome`. The browser-wide launch override is retained to keep those
+surfaces consistent. The new live regression checks page, dedicated-worker,
+shared-worker and service-worker UA against their HTTP request headers; a capture regression checks
+its headers and that the workspace is requested once per device. Measurements
+and final logs are retained locally in ignored `artifacts/pr20-review/`.
+
+That regression also exposed an existing iframe auto-attach interaction:
+`waitForDebuggerOnStart: true` plus an iframe-only filter fetched a dedicated
+worker script but never ran it, with no attachment event available to resume
+it. A raw pinned-Helium probe reproduced the stall; the same worker ran with
+the wait disabled. The fix explicitly includes worker types, validates their
+ownership and immediately resumes them through the bounded cleanup path,
+waiting for acknowledgement before detaching. Iframe interception stays paused
+until configured; workers receive no Page setup or page input privileges.
+The header probe also verified that worker-origin fetches omit `Sec-CH-UA`
+both with the default headless UA and with the launch override. The regression
+therefore checks client hints on page-origin requests and UA agreement on all
+worker requests, preserving the browser's own client-hint policy.
+The first complete live rerun passed 48/49 tests: the existing teardown-crash
+test armed its fault at process start, so it aborted discovery cleanup before
+the live-frame phase it intended to test. Fault injection is now armed only by
+the owner test's explicit close command. The targeted rerun passed both teardown
+points, with processes, endpoint and profile gone after 205 ms and 145 ms.
+
+| Final local check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, strict Clippy, 1 CLI, 8 core, 135 engine and 36 desktop tests; 49 live tests ignored by default |
+| Full pinned Helium 0.18.1.1 suite, sandbox enabled, four threads | 49/49 passed in 68.52 s after correcting the teardown fault-injection phase |
+| Full X11 desktop smoke, Xvfb 1600 × 1000 with Mesa Lavapipe, debug build | 13/13 passed; restart observed the two sequential discovery/runtime profiles, immediate close started none, and no browser process/profile/window remained |
+| Independent ownership and worker review | No remaining actionable blocker; discovery, worker and existing iframe regressions passed |
+
+Final logs are in `artifacts/pr20-review/` (ignored). The existing vendored GPUI
+and `proc-macro-error2` future-compatibility warnings remain non-failing. Native
+validation here covers X11; Wayland, a physical IME and company GPU hardware
+qualification are not implied.
 
 ## P0 follow-up: survivors of the browser's exit wait, 27 September 2026 (cloud container)
 

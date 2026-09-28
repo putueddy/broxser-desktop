@@ -29,14 +29,18 @@ headed Helium, on this machine (no GPU, Xvfb):
 
 `Emulation.setEmulatedMedia` with `hover` and `pointer` features had no
 effect; `Emulation.setUserAgentOverride` with only a user agent string drops
-every client hint, and with metadata it needs the brand list, which the
-browser does not report over CDP. Two launch flags do what is needed:
+every client hint. Omitting optional brands and versions from its metadata
+does preserve the browser's defaults, as the
+[Chromium regression test](https://chromium.googlesource.com/chromium/src/+/ada95e1c23f32870621efd684130ecfea582b087/third_party/blink/web_tests/http/tests/inspector-protocol/emulation/emulation-user-agent-metadata-override.js)
+and the review's Helium probe confirm. However, a target-level override changes
+the page and its dedicated worker while a service worker and its requests keep
+the headless user agent. The browser-wide launch flags preserve consistency:
 `--blink-settings` with the Blink pointer and hover settings restores a mouse
 for the whole browser (touch emulation still wins on touch devices), and
 `--user-agent` with the headed string keeps the client-hint brands, leaving
 only the platform-specific high-entropy hints (`Sec-CH-UA-Arch`,
 `Sec-CH-UA-Full-Version-List`) blank. The browser's version for that string
-comes from running the executable with `--version` before launch.
+comes from `Browser.getVersion` in a blank, fully owned discovery browser.
 
 ## Options
 
@@ -50,10 +54,26 @@ comes from running the executable with `--version` before launch.
 
 - Headless launches get `--blink-settings` for a fine pointer with hover and
   `--user-agent` with the same browser's headed user agent, built from the
-  major version the executable prints for `--version` within 3 s. If it does
-  not print one, the browser keeps its own user agent; nothing else changes.
+  native user agent returned by `Browser.getVersion`, replacing only its
+  `HeadlessChrome/` product token. The version, platform and other bytes come
+  from that browser rather than a synthesized Linux string or CLI output.
+- Live and capture share one connected-start path. Start a private, guarded
+  browser on `about:blank` and query its version through bounded, cancellable
+  CDP. No workspace context, target or navigation is created during discovery.
+  If its user agent needs normalization, disconnect and require successful
+  cleanup of the browser, helpers, profile and guardian before starting one
+  replacement with the browser-wide override. Recheck cancellation immediately
+  before spawning. The replacement is never probed or restarted recursively.
+  An absent, unsupported or already-headed user agent retains the first
+  browser. A CDP, timeout, cancellation or cleanup error stops startup;
+  it never authorizes another launch or a navigation retry.
 - Device setup gives non-mobile devices a screen the size of their viewport
   (`screenWidth`, `screenHeight`), in live and capture runs.
+- Keep iframe setup paused as ADR 0016 requires, but explicitly include worker
+  target types in auto-attach. The pinned browser can otherwise pause excluded
+  workers without giving Broxser a session to resume. Validated owned workers
+  are resumed once and detached only after acknowledgement using the existing
+  bounded cleanup path; no iframe/Page setup or page-input ownership is granted.
 - Everything else stays as the browser has it and is documented: SwiftShader
   WebGL where the machine has no GPU, Helium's per-session canvas and audio
   noise and its memory and storage reports, and no content blocking in
@@ -65,19 +85,26 @@ comes from running the executable with `--version` before launch.
 
 - Pages see `Chrome/<major>` with consistent brands, hover-capable mouse
   devices and a screen that fits the viewport; touch devices are unchanged.
-- The headed user agent is a Linux string; Broxser is Linux first, and the
-  value is only ever the same browser's own headed string.
+- The user agent retains the native platform and version. The qualified runtime
+  is Linux Helium; this does not add support for another operating system.
 - Two high-entropy client hints are blank; a site that requires them sees a
   browser that withheld them, as many do.
-- A browser start runs the executable once more for its version; the fake
-  browsers of the test suite answer it.
+- Headless startup normally launches two browsers sequentially with separate
+  private profiles: discovery and the aligned runtime. Discovery closes before
+  the second launch and never loads the workspace. Each endpoint wait and CDP
+  command keeps its existing per-operation deadline; there is no new global
+  startup SLA. Closing the app can cancel either phase. No `--version` child,
+  stdout reader thread or unbounded output allocation remains.
 
 ## Validation
 
-Unit: `headed_user_agent_comes_from_the_browsers_version` (version parsing,
-the probe against a fake browser, a missing executable) and the launch
+Unit/fake CDP: native UA normalization, sequential ownership, discovery failures,
+cancellation and owner death in `browser/qa_fidelity.rs`, plus the launch
 argument test. Helium: `live_pages_see_the_browser_a_user_would_run` (no
 headless marker, brands present, hover and fine pointer with a viewport-sized
 screen on the mouse devices, coarse and no hover on the touch phone; it failed
 before the change with `HeadlessChrome`, `hover: none` and an 800 × 600 screen).
-The probe's measurements are in `docs/validation.md` (P1.7).
+Additional live and capture tests verify page/worker/network UA consistency and
+that discovery never requests the workspace URL. The X11 smoke accounts for
+the two sequential launches while still accepting only one restart transition.
+The probe's measurements and review corrections are in `docs/validation.md` (P1.7).

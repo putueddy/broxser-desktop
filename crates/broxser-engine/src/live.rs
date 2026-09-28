@@ -44,8 +44,8 @@ pub const MAX_DIALOG_CHARS: usize = 2048;
 /// Subframes remembered per device, so that downloads they start are
 /// attributed to it (ADR 0016).
 const MAX_TRACKED_FRAMES: usize = 256;
-/// Bounds active and retired iframe sessions, including stalled cleanup. Each
-/// keeps at most one awaited setup or resume command.
+/// Bounds active iframe sessions and retired iframe/worker sessions, including
+/// stalled cleanup. Each keeps at most one awaited setup or resume command.
 const MAX_IFRAME_SESSIONS: usize = 128;
 const INCOMPLETE_IFRAME_ACTIVITY: &str = "Iframe activity could not be fully observed. Navigate or reload explicitly to start a fresh document.";
 /// Device status while it has an open dialog and Broxser was asked to navigate it.
@@ -742,12 +742,9 @@ fn drive(
     commands: &Receiver<Command>,
     shared: &Shared,
 ) -> Result<()> {
-    let mut browser = BrowserProcess::start(options, true)?;
-    let result = match browser.connect(&limits) {
-        Ok(cdp) => Controller::new(cdp, workspace, shared, limits)
-            .and_then(|controller| controller.run(commands)),
-        Err(error) => Err(error),
-    };
+    let (browser, cdp) = BrowserProcess::start_connected(options, true, &limits)?;
+    let result = Controller::new(cdp, workspace, shared, limits)
+        .and_then(|controller| controller.run(commands));
     let cleanup = browser.shutdown();
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -895,7 +892,8 @@ struct IframeSession {
     deadline: Instant,
 }
 
-/// A retired session is never observed again. A busy renderer may leave its
+/// A retired session is never observed again. Workers enter this release-only
+/// path without page setup or frame ownership. A busy target may leave its
 /// resume unanswered; retain only this bounded cleanup record until it answers
 /// or the browser reports destruction. Detach ancestors only after children.
 struct IframeCleanup {
@@ -922,11 +920,19 @@ struct IframeCommand {
     revision: u64,
 }
 
-/// Auto-attach is local to an owned page/iframe, and excludes pages (popups),
-/// workers and every other target type. It must be applied recursively.
+/// Auto-attach is local to an owned page/iframe and excludes pages (popups).
+/// Helium pauses related workers with waitForDebuggerOnStart even if a filter
+/// excludes them; include them so their sessions can be resumed and released.
+/// Only iframe targets get recursive observation and page setup.
 fn iframe_auto_attach() -> Value {
     json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
-        "filter": [{"type": "iframe", "exclude": false}, {"exclude": true}]})
+    "filter": [
+        {"type": "iframe", "exclude": false},
+        {"type": "worker", "exclude": false},
+        {"type": "shared_worker", "exclude": false},
+        {"type": "service_worker", "exclude": false},
+        {"exclude": true}
+    ]})
 }
 
 #[derive(Clone, Copy)]
@@ -2785,7 +2791,7 @@ impl<'a> Controller<'a> {
         }
     }
 
-    fn attach_iframe(&mut self, event: &Event) -> Result<()> {
+    fn attach_related_target(&mut self, event: &Event) -> Result<()> {
         let Some(parent_session) = event.session.as_deref() else {
             return Ok(());
         };
@@ -2807,11 +2813,29 @@ impl<'a> Controller<'a> {
         let Some(frame) = info.get("targetId").and_then(Value::as_str) else {
             return Ok(());
         };
-        if info.get("type").and_then(Value::as_str) != Some("iframe")
+        let kind = info.get("type").and_then(Value::as_str);
+        let worker = matches!(kind, Some("worker" | "shared_worker" | "service_worker"));
+        if (!worker && kind != Some("iframe"))
             || info
                 .get("browserContextId")
                 .and_then(Value::as_str)
                 .is_some_and(|context| context != self.devices[index].context)
+        {
+            return Ok(());
+        }
+        // A worker's context must explicitly match its known parent's context.
+        // It must never alias a page/iframe debugger session or frame target.
+        if worker
+            && (info.get("browserContextId").and_then(Value::as_str)
+                != Some(self.devices[index].context.as_str())
+                || self
+                    .devices
+                    .iter()
+                    .any(|device| device.session == session || device.target_id == frame)
+                || self
+                    .iframe_sessions
+                    .values()
+                    .any(|iframe| iframe.frame == frame))
         {
             return Ok(());
         }
@@ -2822,12 +2846,14 @@ impl<'a> Controller<'a> {
             || session.len() > 128
             || frame.is_empty()
             || frame.len() > 128
+            || (worker
+                && (session.chars().any(char::is_control) || frame.chars().any(char::is_control)))
             || self.iframe_sessions.len() + self.iframe_cleanup.len() >= MAX_IFRAME_SESSIONS
         {
-            bail!("CDP iframe session limit exceeded or invalid session identity");
+            bail!("CDP target session limit exceeded or invalid session identity");
         }
         let parent_session = event.session.as_ref().unwrap().clone();
-        if release_only {
+        if release_only || worker {
             let resume =
                 self.cdp
                     .send("Runtime.runIfWaitingForDebugger", json!({}), Some(session))?;
@@ -3128,7 +3154,7 @@ impl<'a> Controller<'a> {
                 return Ok(());
             }
             "Target.attachedToTarget" => {
-                self.attach_iframe(&event)?;
+                self.attach_related_target(&event)?;
                 return Ok(());
             }
             "Target.targetCrashed" | "Target.targetDestroyed" | "Target.detachedFromTarget" => {

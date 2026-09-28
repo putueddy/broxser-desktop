@@ -5,7 +5,8 @@
 # process group (Ctrl+C) while live frames stream, and with SIGTERM during a held
 # static capture: the browser guardian must stop the browser and remove its
 # profile (ADR 0007). Two runs kill the live browser and click Restart twice,
-# once followed by Ctrl+Q: at most one browser may start (ADR 0009). The last
+# once followed by Ctrl+Q: at most one runtime may start (ADR 0009), with its
+# blank discovery browser followed by the aligned browser (ADR 0019). The last
 # run types while every page animates; use a release build
 # (BROXSER_DESKTOP_BIN=target/release/broxser-desktop) for it to cover the GPUI
 # atlas race of ADR 0012. Every run must leave no browser process or profile
@@ -150,9 +151,11 @@ PY
 }
 
 # Kills the owned browser, as a crash would, so that "Restart runtime" appears,
-# then clicks it twice without delay: one browser must start (ADR 0009). With
-# `quit`, Ctrl+Q follows the clicks at once: at most that browser may start, and
-# the window closes once it and the stopped runtime are gone.
+# then clicks it twice without delay: one runtime must start (ADR 0009). The
+# pinned Helium gets two sequential private profiles: blank UA discovery and
+# the aligned runtime, with the first cleaned up before the second (ADR 0019).
+# With `quit`, Ctrl+Q follows at once: at most that pair may start, and the
+# window closes once it and the stopped runtime are gone.
 restart_run() {
   local label=$1 quit=$2
   local before app window browser launches loaded left_processes left_profiles code=0
@@ -217,7 +220,7 @@ restart_run() {
     return 1
   fi
   [[ $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]] || return 1
-  if [[ $quit == quit ]]; then [[ $launches -le 1 ]]; else [[ $launches -eq 1 ]]; fi
+  if [[ $quit == quit ]]; then [[ $launches -le 2 ]]; else [[ $launches -eq 2 ]]; fi
 }
 
 # Succeeds once the window region X Y WIDTH HEIGHT has changed in each of six

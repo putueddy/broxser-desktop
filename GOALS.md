@@ -331,7 +331,9 @@ di balik viewport 1440 × 900; canvas dan audio Helium berubah setiap session
 (noise privasi Helium; Chromium stabil), `hardwareConcurrency` sekali 2 dari 4,
 WebGL memakai SwiftShader tanpa GPU, dan context session tidak memblokir konten
 (ADR 0004). Kini launch headless membawa `--blink-settings` pointer/hover dan
-`--user-agent` versi headed dari `--version` browser, device non-mobile
+`--user-agent` dari UA native yang dibaca lewat CDP pada browser discovery
+privat; browser itu dibersihkan sebelum satu pengganti dimulai, tanpa memuat
+URL workspace selama discovery. Tidak ada subprocess `--version`. Device non-mobile
 mendapat layar seukuran viewport, dan sisanya didokumentasikan: hasil mewakili
 pengguna Helium dengan blocker mati di mesin serupa, bukan pengguna Chrome, dan
 perbandingan piksel canvas tidak stabil antar session.

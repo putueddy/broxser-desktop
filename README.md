@@ -68,7 +68,7 @@ deterministik untuk capture statis.
 | **Sync links** / **Sync scroll** | Opt-in, hanya antar-device terlihat dalam session yang sama; link memerlukan aktivasi tepercaya dan navigasi yang cocok |
 | **Hide** di sidebar | Menghentikan stream dan input; memilih device terlihat lain, atau tanpa target keyboard bila semuanya disembunyikan |
 | `+` / `−` | Skala tampilan; frame diminta sebesar ukuran tampilan |
-| **Restart runtime** | Muncul setelah browser berhenti dan selama tidak ada restart atau close berjalan; memulai satu browser, memulihkan konfigurasi, tidak memutar ulang aksi |
+| **Restart runtime** | Muncul setelah browser berhenti dan selama tidak ada restart atau close berjalan; memulai satu runtime, memulihkan konfigurasi, tidak memutar ulang aksi |
 | `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus; saat restart berjalan, tidak memulai browser baru |
 
 Go, Reload, sync atau membuka workspace yang tidak mendapat respons dalam 30 detik
@@ -124,6 +124,10 @@ device mouse dengan hover dan pointer halus, dan layar seukuran viewport; noise
 canvas/audio Helium, WebGL software tanpa GPU dan blocker yang mati di session
 tetap berbeda dari browser pengguna dan tercatat di ADR 0019. Status audit
 kapabilitas lain ada di `docs/validation.md`.
+Startup headless membaca UA lewat CDP pada browser privat di `about:blank`,
+menutup dan membersihkannya, lalu memulai satu browser pengganti dengan UA yang
+disesuaikan. Probe tidak memuat URL workspace dan tidak menjalankan subprocess
+`--version`; pembatalan menghentikan startup sebelum tahap berikutnya (ADR 0019).
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable

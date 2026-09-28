@@ -92,7 +92,9 @@ flowchart TB
 | `broxser-cli` | Validasi, bootstrap config, capture untuk otomasi | Exit nonzero; tidak menyatakan capture sukses |
 | Helium | Network, DOM/CSS/JS, storage, sandbox Chromium | Hentikan job; jangan replay aksi pengguna |
 
-Satu proses browser per capture job atau per workspace live yang terbuka, satu
+Hanya satu proses browser aktif per capture job atau workspace live; discovery
+dan runtime yang UA-nya disesuaikan berjalan berurutan, dengan cleanup di antaranya.
+Runtime memiliki satu
 BrowserContext per session, satu target per device. Device dengan session sama
 sengaja berbagi konteks. Label `Admin` hanyalah nama session; tidak memberi hak
 akses atau melakukan login.
@@ -116,6 +118,12 @@ agar fitur lokal bekerja.
    sandbox tetap aktif dan laporkan identitasnya ke guardian.
 4. Baca `DevToolsActivePort` dari profil tersebut. Validasi port dan path, lalu
    hubungkan hanya ke `127.0.0.1`. Catat `Browser.getVersion` dan versi protokol.
+   Dalam startup headless, baca UA native pada browser kosong ini. Bila ada
+   penanda `HeadlessChrome`, tutup browser dan seluruh helper, hapus profil,
+   lepaskan guardian, lalu mulai satu pengganti dengan profil privat baru dan
+   UA yang hanya mengganti penanda itu. Discovery tidak membuat target workspace
+   atau memuat URL-nya. Kegagalan dan pembatalan menghentikan startup; tidak ada
+   probe `--version` atau retry navigasi (ADR 0019).
 5. Aktifkan target discovery, buat konteks session dan target, atur emulasi,
    navigasi, tunggu lifecycle load yang sesuai dengan navigation loader, lalu ambil
    PNG. Halaman ekstensi di context session menghentikan job. Navigasi yang
@@ -222,7 +230,11 @@ Setup iframe yang gagal atau melewati deadline menandai laporan aktivitas
 iframe pada dokumen itu sebagai tidak lengkap; device lain tetap berjalan.
 Sesi yang masih ditahan debugger menunggu jawaban resume sebelum dilepas,
 tanpa mengulang aksi halaman. Inventaris dibatasi 256 subframe per device dan
-128 sesi iframe aktif atau menunggu cleanup per runtime (ADR 0016).
+128 sesi iframe atau worker aktif/menunggu cleanup per runtime (ADR 0016).
+Worker dimasukkan secara eksplisit dalam filter auto-attach lalu segera
+dilanjutkan dan dilepas setelah jawaban resume; filter iframe saja dapat
+menahannya tanpa event attachment pada Helium yang dipin. Worker tidak diberi
+setup Page atau kepemilikan frame/input (ADR 0019).
 Dismiss laporan download berlaku untuk runtime saat ini dan direset saat
 restart. Panel dibatasi 360 piksel UI dengan tombol di kiri agar tetap
 terjangkau ketika lebar device melampaui window.

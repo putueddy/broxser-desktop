@@ -13,6 +13,12 @@ mod navigation_deadlines;
 #[path = "touch_input.rs"]
 mod touch_input;
 
+#[path = "qa_fidelity.rs"]
+mod qa_fidelity;
+
+#[path = "worker_targets.rs"]
+mod worker_targets;
+
 #[test]
 fn keys_map_to_dom_values_and_text() {
     let none = Modifiers::default();
