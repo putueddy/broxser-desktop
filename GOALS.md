@@ -364,22 +364,28 @@ tidak menjamin isolasi seluruh akses filesystem.
 **Status P2.2 (27 September 2026, audit; belum ada implementasi; PR menunggu review):** pengukuran
 ada di `docs/validation.md` (P2.2) dan usulannya di
 [ADR 0021](docs/adr/0021-persistent-sessions-one-profile-per-session.md)
-(proposed, belum diterima). Context CDP tidak punya opsi persisten, jadi
-persistent session berarti satu browser dengan profil on-disk per session.
-Probe Helium membuktikan profil itu menyimpan cookie ber-expiry, localStorage
-dan IndexedDB melewati close bersih maupun SIGKILL; cookie session (termasuk
-cookie login `HttpOnly`) hilang pada setiap restart kecuali `Preferences`
-memuat `session.restore_on_startup = 1`; SIGKILL 12 s setelah login menghilangkan
-semua cookie (flush cookie berjalan per timer dan saat shutdown); context
-off-the-record di browser yang sama tidak melihat apa pun; cookie at rest hanya
-dilindungi mode direktori dan disk karena `--password-store=basic` memakai kunci
-tetap (didekripsi dalam probe); profil yang dibuat Helium 154 tidak dapat
-dipakai Chromium 141. Pekerjaan P2.2 dipecah: (a) UI kelola workspace, device
+(proposed, belum diterima). Context CDP tidak punya opsi persisten; usulan adapter
+ini memilih satu browser/default context dengan profil on-disk per session.
+Dalam fixture audit, cookie ber-expiry, localStorage dan IndexedDB bertahan
+setelah close bersih dan SIGKILL **setelah data sebelumnya sudah tersimpan**.
+Sebaliknya, SIGKILL 12 s setelah cookie baru dipasang kehilangan semua cookie;
+batas waktu kehilangan data belum diukur. Cookie session, termasuk cookie
+fixture `HttpOnly`, hanya teramati bertahan pada close bersih dengan
+`session.restore_on_startup = 1`. Preferensi itu belum boleh dijadikan seed
+tanpa membuktikan bahwa tab/navigasi lama tidak diputar ulang. Seed blocker
+ADR 0004 hanya mengatur incognito; default context memerlukan kualifikasi
+tersendiri. Cookie at rest memakai kunci tetap `--password-store=basic`, sehingga
+keputusan perlindungan kredensial persisten masih terbuka. Pada satu probe
+Chromium 141 atas profil Helium 154, query target tidak menjawab dalam 8 s;
+itu bukan bukti umum kompatibilitas atau korupsi profil.
+Pekerjaan P2.2 dipecah: (a) UI kelola workspace, device
 dan preset serta restore konfigurasi tanpa kredensial, dapat berjalan lebih dulu;
 (b) persistent session sesuai ADR 0021 menunggu gate produk (mesin mana yang
-boleh menyimpan login), lifecycle (close bersih tanpa kehilangan cookie,
-ikatan versi browser), budget resource, dan migrasi skema workspace. Default
-tetap ephemeral.
+boleh menyimpan login), binding profil lokal dan satu pemilik, retensi pada
+semua jalur cleanup, durabilitas terukur, kompatibilitas runtime lengkap terhadap
+penulis profil terakhir, resource dan migrasi. Profil tidak kompatibel tidak
+boleh menahan update keamanan browser. Default tetap ephemeral; merge dokumen
+audit ini bukan penerimaan desain atau pengiriman persistent login.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
