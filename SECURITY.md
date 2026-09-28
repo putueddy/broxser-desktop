@@ -101,6 +101,11 @@ the CLI as an unauthenticated server: that would create an SSRF boundary the cur
 design does not address. Browser permissions, redirects and content remain governed
 by the browser; input URL validation is not a network allowlist.
 
+The application state file (`$XDG_STATE_HOME/broxser/state.json`) holds the recent
+workspace file paths and the window size, nothing of a run: no page address (an
+address can carry a token), cookie, credential or profile path. It is validated
+before use and an invalid file is ignored, not repaired silently (ADR 0022).
+
 Screenshots may contain private data. CLI exports remain in the specified output
 directory until the developer deletes them. Desktop previews use an owned temporary
 directory. No analytics or application upload endpoint is configured. Website

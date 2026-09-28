@@ -43,6 +43,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path.startswith("/hang"):
             time.sleep(3600)
         return super().do_GET()
+    def end_headers(self):
+        # Every device fetches the page itself, so requests count devices.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
     def log_message(self, *args):
         pass
 handler = functools.partial(Handler, directory="examples/fixture")
@@ -58,9 +62,23 @@ for _ in $(seq 100); do [[ -f $work/port ]] && break; sleep 0.05; done
 port=$(cat "$work/port")
 touch "$work/requests"
 
-# Profiles and previews of this run live under a private TMPDIR.
+# Profiles and previews of this run live under a private TMPDIR, and the
+# application state (recent workspaces, window size; ADR 0022) under a private
+# file, so the runs never touch the user's state file.
 export TMPDIR=$work/tmp
+export BROXSER_STATE_FILE=$work/state.json
 unset WAYLAND_DISPLAY
+
+# Without a window manager GPUI draws its first frame after a configure event.
+# The desktop reopens at its last size, so one resize to the wanted size can be
+# a no-op; the first resize is always a change. Callers wait for a visible
+# window before resizing and focusing it.
+size_window() {
+  xdotool windowsize "$1" 1360 860 || true
+  xdotool windowsize "$1" 1360 861 || true
+  # Xvfb without a window manager may leave keyboard focus on the root window.
+  xdotool windowfocus "$1" || true
+}
 
 # Browser processes, browser profiles and static preview directories.
 leftovers() {
@@ -86,9 +104,8 @@ run() {
     "$binary" --workspace examples/workspace.json "$@" &
   fi
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1)
-  # Without a window manager GPUI draws its first frame after a configure event.
-  xdotool windowsize "$window" 1360 861
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1)
+  size_window "$window"
   for _ in $(seq 300); do
     [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "$wait_for" || true) -gt 0 ]] && break
     sleep 0.1
@@ -162,8 +179,8 @@ restart_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/live.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1)
-  xdotool windowsize "$window" 1360 861
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1)
+  size_window "$window"
   for _ in $(seq 300); do
     [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /live.html || true) -gt 0 ]] && break
     sleep 0.1
@@ -285,11 +302,11 @@ typing_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/$page" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
-    xdotool windowsize "$window" 1360 861 || true
+    size_window "$window"
     # Without a window manager the window draws and takes keys once the
     # pointer is in it.
     xdotool mousemove --window "$window" 600 400 || true
@@ -416,11 +433,11 @@ dialog_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/dialog.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
-    xdotool windowsize "$window" 1360 861 || true
+    size_window "$window"
     xdotool mousemove --window "$window" 600 400 || true
     for _ in $(seq 300); do
       [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /dialog.html || true) -gt 0 ]] && break
@@ -501,11 +518,11 @@ popup_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/popup.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
-    xdotool windowsize "$window" 1360 861 || true
+    size_window "$window"
     xdotool mousemove --window "$window" 600 400 || true
     for _ in $(seq 300); do
       [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /popup.html || true) -gt 0 ]] && break
@@ -567,7 +584,7 @@ download_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/download.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -650,7 +667,7 @@ with open(sys.argv[1], "w") as destination:
 PY
   "$binary" --workspace "$work/download-desktop.json" --url "http://127.0.0.1:$port/download.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -659,7 +676,7 @@ PY
       xdotool windowfocus "$window" 2>/dev/null && break
       sleep 0.05
     done
-    xdotool windowsize "$window" 1360 861 || true
+    size_window "$window"
     xdotool mousemove --window "$window" 600 400 || true
     if ! button=$(find_color "$window" 1300 10 40 38 252c29 6 30 filled); then
       failure="the zoom-in control did not appear"
@@ -766,11 +783,11 @@ touch_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/touch.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
-    xdotool windowsize "$window" 1360 861 || true
+    size_window "$window"
     if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
       failure="the phone frame did not show the touch target"
     else
@@ -828,6 +845,273 @@ PY
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# Opens the workspace panel with Ctrl+Shift+W on a copy of the example
+# workspace, adds the first preset device to the draft and applies it (a
+# restart with four devices), removes the first device and applies again
+# (three devices), and saves the draft to the copy. An invalid URL must leave
+# that file byte-for-byte unchanged; a valid URL is then saved immediately
+# before Ctrl+Q, and the save must finish before exit. The panel edits a draft:
+# the running workspace changes only on Apply (ADR 0022). Afterwards the copy
+# must hold the preset device and not the removed one, and the run's state file
+# must name the copy and the window size and hold no page address.
+workspace_run() {
+  local label=$1
+  local before mark app window= failure= found code=0 left_processes left_profiles close_requested=0
+  local workspace=$work/workspace.json state=$work/state.json
+  local snapshot=$work/workspace-before-invalid.json
+  local saved_url="http://127.0.0.1:$port/live.html?workspace-save=close"
+  cp examples/workspace.json "$workspace"
+  before=$(wc -l < "$work/requests")
+  BROXSER_STATE_FILE=$state "$binary" --workspace "$workspace" --url "http://127.0.0.1:$port/live.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
+  # Requests of /live.html since line $1 of the log reach $2 within 30 s.
+  loaded() {
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$(($1 + 1))" "$work/requests" | grep -c -- '/live.html' || true) -ge $2 ]] && return 0
+      sleep 0.1
+    done
+    return 1
+  }
+  # The panel's buttons are filled: Add, Apply and Save in the accent color,
+  # Remove in the danger color. Buttons of one kind stack vertically at the
+  # right edge, so the first one sits at the top right of the bounding box of
+  # that color, and the lowest accent button is Apply or Save, at the left.
+  # Regions of the 340 px panel next to the 230 px sidebar: its right edge
+  # holds the Add and Remove columns (the selected card's accent border sits
+  # left of it while the panel is still closed); its left part holds the one
+  # accent action at the top: Apply while the draft differs, else Save.
+  panel_button() {
+    find_color "$window" "$2" 60 "$3" 780 "$1" 8 10 filled
+  }
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  elif ! loaded "$before" 3; then
+    failure="the three devices did not load the page"
+  else
+    size_window "$window"
+    xdotool mousemove --window "$window" 600 400 key ctrl+shift+w
+    if ! found=$(panel_button 7ce29b 500 70); then
+      failure="the panel did not open with Add buttons"
+    else
+      # Add buttons are right-aligned; Save shares the color at the bottom left.
+      read -r _ _ _ y0 x1 _ < <(echo "$found")
+      xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+      sleep 0.5
+      mark=$(wc -l < "$work/requests")
+      read -r x y _ < <(panel_button 7ce29b 232 170)
+      xdotool mousemove --window "$window" "$x" "$y" click 1
+      if ! loaded "$mark" 4; then
+        failure="Apply did not restart with four devices"
+      elif ! found=$(panel_button e07a7a 480 90); then
+        failure="the draft showed no Remove button"
+      else
+        read -r _ _ _ y0 x1 _ < <(echo "$found")
+        xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+        sleep 0.5
+        mark=$(wc -l < "$work/requests")
+        read -r x y _ < <(panel_button 7ce29b 232 170)
+        xdotool mousemove --window "$window" "$x" "$y" click 1
+        if ! loaded "$mark" 3; then
+          failure="Apply did not restart with three devices"
+        else
+          sleep 1
+          read -r x y _ < <(panel_button 7ce29b 232 170)
+          xdotool mousemove --window "$window" "$x" "$y" click 1
+          for _ in $(seq 50); do
+            grep -q '"small-phone"' "$workspace" && break
+            sleep 0.1
+          done
+          if ! grep -q '"small-phone"' "$workspace"; then
+            failure="Save did not write the preset device"
+          elif grep -q '"id": "phone"' "$workspace"; then
+            failure="Save kept the removed device"
+          else
+            # Keep valid JSON with distinct bytes, so an invalid Save that
+            # rewrites the old draft is caught even when its contents match.
+            printf '\n' >> "$workspace"
+            cp "$workspace" "$snapshot"
+            xdotool key --clearmodifiers ctrl+l
+            xdotool type --clearmodifiers --delay 0 'file:///tmp/broxser-invalid-save'
+            # Locate Save again after each notice, rather than retaining its
+            # coordinates from the previous action.
+            if ! found=$(panel_button 7ce29b 232 170); then
+              failure="Save was unavailable for the invalid URL"
+            else
+              read -r x y _ < <(echo "$found")
+              xdotool mousemove --window "$window" "$x" "$y" click 1
+              sleep 0.5
+              if ! cmp -s "$snapshot" "$workspace"; then
+                failure="Save changed the file despite the invalid URL"
+              else
+                xdotool key --clearmodifiers ctrl+l
+                xdotool type --clearmodifiers --delay 0 "$saved_url"
+                if ! found=$(panel_button 7ce29b 232 170); then
+                  failure="Save was unavailable after the invalid URL notice"
+                else
+                  read -r x y _ < <(echo "$found")
+                  xdotool mousemove --window "$window" "$x" "$y" click 1 key --delay 0 ctrl+q
+                  close_requested=1
+                fi
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    if [[ $close_requested -eq 0 ]]; then
+      [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    fi
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  if [[ -z $failure ]] && ! python3 - "$workspace" "$saved_url" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    workspace = json.load(source)
+sys.exit(0 if workspace["url"] == sys.argv[2] else 1)
+PY
+  then
+    failure="Save followed by Ctrl+Q did not persist the requested URL"
+  fi
+  if [[ -z $failure ]]; then
+    if [[ ! -f $state ]]; then
+      failure="no state file was written"
+    elif ! grep -q '"window"' "$state" || ! grep -q 'workspace.json' "$state"; then
+      failure="the state file lacks the window size or the workspace path"
+    elif grep -q 'http' "$state"; then
+      failure="the state file holds a page address"
+    fi
+  fi
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-draft saved; invalid URL rejected; valid URL saved before close; state kept}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
+# Three devices side by side; the panel removes the first and Apply restarts
+# without it. At once the pointer moves over, scrolls and clicks the third
+# frame, then clicks Hide on the sidebar's third row: GPUI delivers these to
+# the listeners of the frame drawn before Apply, which still name index 2 of a
+# two-device list (ADR 0022). xdotool's click pauses after the release, so the
+# button is pressed and released separately to arrive before the redraw. The
+# desktop must restart with two devices and close cleanly.
+apply_input_run() {
+  local label=$1
+  local before mark app window= failure= found code=0 left_processes left_profiles
+  local x y x0 x1 y0 apply_x apply_y
+  local workspace=$work/apply-input.json state=$work/apply-input-state.json
+  python3 - "$workspace" <<'PY'
+import json, sys
+device = {"width": 360, "height": 640, "device_scale_factor": 1.0,
+          "mobile": False, "touch": False, "session": "guest"}
+workspace = {
+    "schema_version": 1,
+    "name": "Three small",
+    "url": "http://127.0.0.1:4173",
+    "sessions": [{"id": "guest", "name": "Guest"}],
+    "devices": [dict(device, id=name.lower(), name=name) for name in "ABC"],
+}
+with open(sys.argv[1], "w") as destination:
+    json.dump(workspace, destination)
+PY
+  before=$(wc -l < "$work/requests")
+  BROXSER_STATE_FILE=$state "$binary" --workspace "$workspace" --url "http://127.0.0.1:$port/live.html" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
+  loaded() {
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$(($1 + 1))" "$work/requests" | grep -c -- '/live.html' || true) -ge $2 ]] && return 0
+      kill -0 "$app" 2>/dev/null || return 1
+      sleep 0.1
+    done
+    return 1
+  }
+  panel_button() {
+    find_color "$window" "$2" 60 "$3" 780 "$1" 8 10 filled
+  }
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  elif ! loaded "$before" 3; then
+    failure="the three devices did not load the page"
+  else
+    size_window "$window"
+    xdotool mousemove --window "$window" 600 400 key ctrl+shift+w
+    if ! found=$(panel_button e07a7a 480 90); then
+      failure="the panel showed no Remove button"
+    else
+      read -r _ _ _ y0 x1 _ < <(echo "$found")
+      xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+      sleep 0.5
+      # The pages' dark headers and buttons lie right of the panel; once all
+      # three frames show them (about 620 px at 50%), the right edge of their
+      # bounding box is in the third frame.
+      for _ in $(seq 20); do
+        found=$(find_color "$window" 580 60 770 700 17312b 10 1 filled) || found=
+        read -r _ _ x0 y0 x1 _ < <(echo "${found:-0 0 0 0 0 0}")
+        ((x1 - x0 >= 500)) && break
+        found=
+        sleep 0.5
+      done
+      if [[ -z $found ]]; then
+        failure="the three frames did not show the page"
+      else
+        x=$((x1 - 40)) y=$((y0 + 150))
+        if ! found=$(panel_button 7ce29b 232 170); then
+          failure="Apply was unavailable after Remove"
+        else
+          read -r apply_x apply_y _ < <(echo "$found")
+          mark=$(wc -l < "$work/requests")
+          # Apply, then move, scroll and click in the third frame, then click
+          # Hide on the sidebar's third row, outside every frame.
+          xdotool mousemove --window "$window" "$apply_x" "$apply_y" mousedown 1 mouseup 1 \
+            mousemove --window "$window" "$x" "$y" mousemove --window "$window" $((x + 4)) "$y" \
+            mousedown 5 mouseup 5 mousedown 1 mouseup 1 \
+            mousemove --window "$window" 195 337 mousedown 1 mouseup 1
+          if ! loaded "$mark" 2; then
+            failure="the desktop did not restart with two devices"
+          fi
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-restarted with two devices, then closed}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -841,4 +1125,6 @@ popup_run "popup closed and opened on the card"
 download_run "download refused on the card"
 download_desktop_restart_run "desktop download dismissal after restart"
 touch_run "touch cancellation through the canvas"
+workspace_run "workspace panel edits a draft and saves it"
+apply_input_run "input right after Apply removed a device"
 echo "desktop smoke passed"

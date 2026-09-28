@@ -5,7 +5,7 @@ mod static_view;
 mod url_input;
 
 use anyhow::{Context as _, Result};
-use broxser_core::Workspace;
+use broxser_core::{AppState, Workspace};
 use broxser_engine::discover_browser;
 use clap::Parser;
 use gpui::{
@@ -25,8 +25,10 @@ const TEXT: u32 = 0xe8eee9;
 const MUTED: u32 = 0x9aa9a0;
 const ACCENT: u32 = 0x7ce29b;
 const WARN: u32 = 0xf2b872;
+/// Destructive actions, such as removing a device from the draft.
+const DANGER: u32 = 0xe07a7a;
 
-actions!(broxser, [Quit, Refresh, FocusUrl]);
+actions!(broxser, [Quit, Refresh, FocusUrl, TogglePanel]);
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +53,26 @@ struct Args {
     capture_on_start: bool,
 }
 
+/// `$XDG_STATE_HOME/broxser/state.json`, or `~/.local/state/broxser/state.json`;
+/// `None` when neither variable names an absolute directory. `BROXSER_STATE_FILE`
+/// overrides it, so a test or a smoke run keeps its state to itself.
+fn state_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("BROXSER_STATE_FILE") {
+        let path = PathBuf::from(path);
+        return path.is_absolute().then_some(path);
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local").join("state"))
+        })?;
+    Some(base.join("broxser").join("state.json"))
+}
+
 struct FileAssets;
 impl AssetSource for FileAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
@@ -71,11 +93,37 @@ fn main() -> Result<()> {
     // Browser guardians are this executable started again (ADR 0007).
     broxser_engine::run_guardian_if_requested();
     let args = Args::parse();
-    let mut workspace = if let Some(path) = args.workspace {
-        Workspace::load(&path).with_context(|| format!("load workspace {}", path.display()))?
-    } else {
-        Workspace::demo()
+    // The state file remembers workspace files and the window size, nothing
+    // of a run (ADR 0022). An unreadable one is reported and replaced later.
+    let state_path = state_path();
+    let mut state = match &state_path {
+        Some(path) => AppState::load(path).unwrap_or_else(|error| {
+            eprintln!("broxser: ignoring {}: {error}", path.display());
+            AppState::default()
+        }),
+        None => AppState::default(),
     };
+    let workspace_path = args.workspace.or_else(|| {
+        state
+            .latest_existing_workspace()
+            .map(std::path::Path::to_path_buf)
+    });
+    let mut workspace = match &workspace_path {
+        Some(path) => {
+            Workspace::load(path).with_context(|| format!("load workspace {}", path.display()))?
+        }
+        None => Workspace::demo(),
+    };
+    if let (Some(path), Some(state_path)) = (&workspace_path, &state_path) {
+        state.remember_workspace(path);
+        if let Err(error) = state.save(state_path) {
+            eprintln!("broxser: could not save {}: {error}", state_path.display());
+        }
+    }
+    let window_size = state
+        .window
+        .map(|window| size(px(window.width as f32), px(window.height as f32)))
+        .unwrap_or_else(|| size(px(1360.), px(860.)));
     if let Some(url) = args.url {
         workspace.url = url;
     }
@@ -95,6 +143,9 @@ fn main() -> Result<()> {
                 // Helium would reload the page itself, untracked (ADR 0010).
                 KeyBinding::new("f5", Refresh, None),
                 KeyBinding::new("ctrl-l", FocusUrl, None),
+                // Helium's own Ctrl+Shift+W closes a window; it never reaches
+                // a page (ADR 0010), so the panel can take it.
+                KeyBinding::new("ctrl-shift-w", TogglePanel, None),
             ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
@@ -102,7 +153,7 @@ fn main() -> Result<()> {
                 }
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
+            let bounds = Bounds::centered(None, window_size, cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("broxser".into()),
@@ -125,7 +176,9 @@ fn main() -> Result<()> {
             } else {
                 cx.open_window(options, |window, cx| {
                     window.set_window_title("Broxser");
-                    cx.new(|cx| LiveView::new(workspace, browser, window, cx))
+                    cx.new(|cx| {
+                        LiveView::new(workspace, workspace_path, state_path, browser, window, cx)
+                    })
                 })
                 .expect("open Broxser window");
             }

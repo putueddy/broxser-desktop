@@ -3,6 +3,142 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #23 follow-up: input right after Apply, 28 September 2026 (cloud container)
+
+Helium 0.18.1.1 run by `broxsertest` with its sandbox enabled, debug desktop,
+Xvfb 1600 × 1000, on top of the review corrections below (`9d199c6`).
+
+- Before: GPUI delivers input to the listeners of the last drawn frame, and
+  Apply replaces the device list at once. On `9d199c6`, a pointer move over
+  the third of three frames right after an Apply that removed the first device
+  ended the desktop with exit 101, `index out of bounds: the len is 2 but the
+  index is 2` in `pointer`; a second click instead ended it in
+  `release_outside` (3 of 3 runs each). The events must arrive before the
+  next redraw, at most one refresh later: xdotool's `click` sleeps after its
+  release, so the reproducer presses and releases separately. A person rarely
+  produces a second event that soon after a click; a bouncing button, a tap
+  or automation can.
+- Change: `pointer`, `release_outside`, `wheel` and `toggle_hidden` look their
+  device up and ignore a missing index. Popup and download Dismiss act only
+  while their report is still shown, since popup tokens and download counts
+  start over with each runtime. By code reading, a stale event also reaches
+  no page: the rebuilt devices have no bounds until drawn, and the stopping
+  runtime takes no commands.
+- New smoke run "input right after Apply removed a device": three 360 × 640
+  devices, Remove the first, then Apply followed at once by a move, a wheel
+  step and a click in the third frame, and a click on the sidebar's third
+  Hide. It fails on `9d199c6` (exit 101, panic in `pointer`) and passes with
+  the fix. Builds that each left out one guard panicked in `wheel`,
+  `release_outside` and `toggle_hidden` respectively, 3 of 3 runs each, so
+  every path is reached before the redraw.
+- A scratch run opened a popup from the third device and clicked its report's
+  Dismiss right after Apply: a build without that guard panicked in the
+  Dismiss handler, the fix kept running and exited 0. A normal popup Dismiss
+  still hides its report. Screenshots were inspected and not committed.
+- `bash scripts/check.sh` passed in 40 s: 1 CLI, 12 core, 142 engine and 41
+  desktop tests, formatting and strict Clippy. `scripts/desktop-smoke.sh`
+  passed all 15 scenarios in 1 m 42 s with no browser process, profile or
+  window left. The live Helium suite was not rerun: no engine change.
+
+The timing runs rely on xdotool delivering the events within one refresh; on
+a much slower or faster machine the smoke run can pass without reaching the
+old listeners. Draft Remove buttons also keep their row index: a second Remove
+within one frame removes the device that moved into that row, and the panel
+notice names it. That path is unchanged.
+
+## PR #23 review corrections, 28 September 2026 (Linux X11)
+
+Helium 0.18.1.1 with its sandbox enabled, debug desktop, private Xvfb
+1600 × 1000 and Mesa Lavapipe. The four review findings now have generation
+and index checks before frame delivery, dedicated workers for workspace/state
+I/O, URL validation before Save, and the first unused preset name after Remove.
+
+- `bash scripts/check.sh` passed: formatting, strict Clippy, 1 CLI, 12 core,
+  142 engine and 41 desktop tests. The new regressions cover removed/replaced
+  frame indices, close/restart/save completion orders and preset name gaps.
+- The complete live Helium suite passed 51/51 with four test threads in 91.8 s.
+  An initial run at default concurrency passed 49/51: the certificate reload
+  test saw no retained certificate error, and the rapid-swipe test's fresh tap
+  had no click in its event report. Each passed alone before the full passing
+  rerun; neither test nor engine code was changed for these results.
+- `scripts/desktop-smoke.sh` passed all 14 scenarios, including the extended
+  workspace run: invalid URL Save preserves exact file bytes, followed by a
+  valid URL Save and immediate Ctrl+Q that persists that exact URL before exit.
+  No browser process/profile or window remained. An early smoke stopped on
+  X11 `X_SetInputFocus` / `BadMatch`; the harness now waits for visible windows
+  before resizing and explicitly focusing them. The dialog case passed alone
+  and the complete suite passed afterwards.
+- A scratch `LD_PRELOAD` shim held `fsync` only for the test workspace/state
+  temporary files until explicit release markers appeared. With the desktop
+  and its children pinned to one CPU (`taskset`), the workspace panel still
+  closed/reopened and repainted while Save was held. Repeated Save started
+  one write. Close, repeated twice, cleaned every browser process/profile
+  while both writes were held, and started only one state write. Releasing
+  state alone kept the window open; releasing workspace too allowed exit 0
+  with the requested URL and 1360 × 861 window size persisted.
+- The same real-window run typed `file:///tmp/broxser-invalid-save`, clicked
+  Save and verified an unchanged file plus the visible "Not saved" validation
+  error. Screenshots of rejection, "Saving…" and waiting on close were inspected.
+  The fault-injection shim and screenshots were temporary local test artifacts.
+
+This qualifies the changed paths on X11 with software rendering. It does not
+extend the physical GPU, Wayland or HiDPI qualification. A disk operation that
+never returns can still delay final window closure, while browser cleanup and
+the GUI remain independent of that I/O.
+
+## P2.2a workspace panel, presets and application state, 27 September 2026 (cloud container)
+
+Same container: Helium 0.18.1.1 run by `broxsertest` with the sandbox enabled,
+Xvfb 1600 × 1000 (Vulkan software), debug build of the desktop. Decisions are in
+[ADR 0022](adr/0022-workspace-panel-presets-and-application-state.md).
+
+### Before the change
+
+- The only way to add or remove a device was to edit the workspace file and
+  start the desktop again; the running workspace could not be changed.
+- Nothing survived a run: the next start needed `--workspace` again and opened
+  a 1360 × 860 window whatever the previous size.
+
+### After the change
+
+- The panel (toolbar "Workspace", `Ctrl+Shift+W`) lists the draft's devices
+  with Remove, the eight presets with Add, a notice line, and Apply (when the
+  draft differs), Discard and Save. Adding "Phone" to the demo, which already
+  has a `phone`, yields `phone-2` named "Phone 2"; a ninth device or one over
+  the pixel budget is refused with the validation message and the draft stays.
+- Apply is the existing restart: four devices load the page after adding one,
+  three after removing one; the running pages never see the edit.
+- Save writes the draft and the URL bar's address to the loaded file
+  atomically; the demo workspace reports that it has no file.
+- The state file gets the workspace path and the window size on close; a
+  start without `--workspace` reopens the most recent existing file.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `cargo test -p broxser-core` | 10 passed, including the new `presets_add_named_unique_devices_and_roll_back_over_budget` and `application_state_remembers_workspaces_and_the_window_without_secrets` |
+| `bash scripts/check.sh` | Passed in 34 s: fmt, `cargo test --locked` (1 CLI, 10 core, 89 engine, 36 desktop), strict Clippy for the workspace and the desktop crate |
+| Live Helium suite as `broxsertest` (`--ignored`, 4 threads; the engine is untouched, `broxser-core` only gained derives) | 42 of 43 passed in 74 s; `live_subframe_navigations_never_sync` failed at its close with "browser processes still running" (the browser's exit outlasted the 5 s cleanup bound, as recorded under P1.4) and passed 3 of 3 alone afterwards |
+| New smoke run "workspace panel edits a draft and saves it", alone | Passed in 5.9 s: `Ctrl+Shift+W` opened the panel; Add on the first preset; Apply restarted with four page loads; Remove on the first device; Apply restarted with three; Save wrote `small-phone` and no `phone` into the copy; after Ctrl+Q the state file named the copy and the window size and held no `http` |
+| Full `scripts/desktop-smoke.sh` (Xvfb 1600 × 1000, debug build) | 10 of 10 scenarios passed in 1 m 18 s with the new run last; no browser process, profile or window left |
+| Real window, screenshots | The panel after `Ctrl+Shift+W` (file line, Save, three device rows with Remove, eight presets with Add) and after Add (the notice, Apply and Discard beside Save) were captured with `xwd` and inspected; the toolbar "Workspace" toggle closed it again |
+| Rerun after the cherry-pick onto `main` (`922bb96`, PR #22 merged; along the PR chain this commit was merged with the owner's `touch_run` in `scripts/desktop-smoke.sh`, both runs kept and `touch_run` now using `size_window`, and with the owner's Restart row in the README) | `check.sh` passed: 1 CLI, 10 core, 142 engine and 36 desktop tests, 51 live tests ignored by default. Live Helium suite 51 of 51 in 88.3 s; full smoke 14 of 14 runs in 1 m 31 s, the workspace run and the touch run included; no browser process, profile or window left |
+
+Two smoke findings on the way: with the fixture's default caching, two devices of one session loaded the page from the browser cache, so requests did not count devices; the fixture now sends `Cache-Control: no-store`. And a desktop that reopens at its last size gets no configure event from a resize to that same size, so GPUI drew nothing and clicks hit nothing (the "Restart runtime" run failed twice); the smoke now keeps a private state file and resizes to 860 then 861 px. A failing "Restart runtime" run used to leave the desktop open, and the next run's window search found the stale window; it now closes the desktop before returning.
+
+### Limits
+
+- Names, sizes and sessions are not editable in the panel; the file is.
+- No file dialog: a workspace is chosen on the command line or from the
+  state's most recent file. The Linux desktop portal that GPUI's dialogs need
+  is missing here, so it stays unmeasured.
+- The panel exists in the live view only; static mode is unchanged.
+- The smoke scenario clicks by button color at fixed panel columns; a theme or
+  layout change moves them and needs the scenario updated with it.
+- The window size restore was measured only through the smoke's state file
+  and the resize behaviour above; no multi-monitor or HiDPI case.
+
 ## P2.2 persistent session audit, 27 September 2026 (cloud container)
 
 Audit only; nothing is implemented, and the proposal is

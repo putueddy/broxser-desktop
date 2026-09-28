@@ -271,6 +271,19 @@ Launch headless memakai user agent headed browser yang sama (tanpa penanda
 `HeadlessChrome`) dan pengaturan pointer/hover Blink; device non-mobile mendapat
 layar seukuran viewport (ADR 0019).
 
+Desktop mengedit salinan draft workspace di panel (preset device generik dari
+`broxser-core`, tambah/hapus device); Apply menjalankan ulang runtime dengan draft
+dan Save menulis file secara atomik, runtime yang berjalan tidak pernah diubah di
+tempat. File state aplikasi (`$XDG_STATE_HOME/broxser/state.json`) hanya memuat
+daftar file workspace terakhir dan ukuran window, divalidasi seperti workspace
+(ADR 0022). Save memvalidasi URL bar sebelum menulis snapshot draft di background;
+URL tidak valid tidak mengubah file. I/O ukuran window juga berjalan di background.
+Close memulai cleanup browser tanpa menunggu disk, lalu menutup window setelah
+cleanup dan semua penyimpanan selesai. Frame hasil decode memeriksa generation
+sebelum mencari indeks device yang mungkin sudah dihapus oleh Apply. Input yang
+tiba sebelum redraw sesudah Apply masih memakai listener frame lama; handler
+pointer, wheel dan Hide mengabaikan indeks yang sudah hilang, dan Dismiss hanya
+berlaku untuk laporan yang masih tampil.
 Konfigurasi tidak memuat cookies, headers rahasia, token atau profil browser.
 Writer memakai file sementara di direktori yang sama dan rename; import versi baru
 memerlukan migrasi eksplisit dengan backup dan validasi. Saat ini hanya v1 tersedia;

@@ -53,6 +53,12 @@ cargo run --locked -p broxser-desktop -j 2 -- \
   --workspace examples/workspace.json --url http://127.0.0.1:4173/live.html
 ```
 
+Tanpa `--workspace`, desktop membuka kembali file workspace terakhir yang masih ada,
+atau workspace demo. File workspace yang dibuka dan ukuran window disimpan di
+`$XDG_STATE_HOME/broxser/state.json` (default `~/.local/state/broxser/state.json`;
+`BROXSER_STATE_FILE` menggantinya): tanpa alamat halaman, cookie, token atau profil
+(ADR 0022).
+
 Membuka workspace memuat URL-nya sekali di setiap device. `live.html` berubah empat
 kali per detik sehingga pembaruan terlihat tanpa tombol capture; `index.html` tetap
 deterministik untuk capture statis.
@@ -69,6 +75,7 @@ deterministik untuk capture statis.
 | **Hide** di sidebar | Menghentikan stream dan input; memilih device terlihat lain, atau tanpa target keyboard bila semuanya disembunyikan |
 | `+` / `−` | Skala tampilan; frame diminta sebesar ukuran tampilan |
 | **Restart runtime** | Muncul setelah browser berhenti dan selama tidak ada restart atau close berjalan; memulai satu runtime, memulihkan konfigurasi, tidak memutar ulang aksi |
+| **Workspace** / `Ctrl+Shift+W` | Panel draft workspace: **Add** menambah device dari preset kelas viewport generik ke session device terpilih, **Remove** menghapus device (bukan yang terakhir), **Apply (restart)** menjalankan ulang runtime dengan draft, **Save** menulis draft dan URL ke file workspace yang dimuat (demo tidak punya file), **Discard** membuang draft. Runtime yang berjalan tidak berubah sebelum Apply (ADR 0022) |
 | `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus; saat restart berjalan, tidak memulai browser baru |
 
 Go, Reload, sync atau membuka workspace yang tidak mendapat respons dalam 30 detik

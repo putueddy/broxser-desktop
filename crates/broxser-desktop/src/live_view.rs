@@ -6,9 +6,12 @@
 use crate::ime::{ImeBuffer, Origin};
 use crate::lifecycle::{AfterStop, CloseRequest, Lifecycle};
 use crate::url_input::{UrlEvent, UrlInput};
-use crate::{ACCENT, BG, BORDER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT, WARN};
+use crate::{
+    ACCENT, BG, BORDER, DANGER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT, TogglePanel,
+    WARN,
+};
 use anyhow::{Context as _, Result};
-use broxser_core::{Workspace, validate_url};
+use broxser_core::{AppState, PRESETS, WindowSize, Workspace, validate_url};
 use broxser_engine::{
     BrowserOptions, Cancellation, Command, DeviceStatus, DialogKind, DialogState, DownloadState,
     Frame, ImeAction, KeyInput, LiveSession, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers,
@@ -16,7 +19,7 @@ use broxser_engine::{
     SyncSettings, is_paste_key, paste_text, to_viewport,
 };
 use futures::StreamExt as _;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use gpui::{
     AnyElement, Bounds, Context, Corners, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent,
@@ -40,6 +43,17 @@ const PANEL_WIDTH: f32 = 360.0;
 
 pub(crate) struct LiveView {
     workspace: Workspace,
+    /// The workspace as edited in the panel; the next restart runs it.
+    draft: Workspace,
+    /// The file the workspace came from, where Save writes; the demo has none.
+    workspace_path: Option<PathBuf>,
+    /// The application state file that keeps the window size (ADR 0022).
+    state_path: Option<PathBuf>,
+    panel_open: bool,
+    /// The last outcome of a panel action, shown in the panel.
+    panel_notice: Option<String>,
+    /// Only one workspace snapshot may be written at a time.
+    saving_workspace: bool,
     browser: Option<PathBuf>,
     session: Option<LiveSession>,
     status: Status,
@@ -224,6 +238,8 @@ impl DeviceView {
 impl LiveView {
     pub(crate) fn new(
         workspace: Workspace,
+        workspace_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
         browser: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -273,7 +289,13 @@ impl LiveView {
                 .iter()
                 .map(|_| DeviceView::default())
                 .collect(),
+            draft: workspace.clone(),
             workspace,
+            workspace_path,
+            state_path,
+            panel_open: false,
+            panel_notice: None,
+            saving_workspace: false,
             browser,
             session: None,
             status: Status::default(),
@@ -435,18 +457,15 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let device = &mut self.devices[index];
-        if device.decoding == Some(generation) {
-            device.decoding = None;
-        }
-        if !self.lifecycle.accepts(generation) {
+        let Some(device) = frame_device(&mut self.devices, &self.lifecycle, index, generation)
+        else {
             // A frame of a stopped runtime is released unseen and leaves the
-            // newer runtime's decode alone.
+            // newer runtime's decode alone, even if Apply removed its index.
             if let Ok(image) = image {
                 let _ = window.drop_image(image);
             }
             return;
-        }
+        };
         match image {
             // Every frame is a new GPUI image; release the previous atlas texture.
             Ok(image) if !device.hidden => {
@@ -738,7 +757,10 @@ impl LiveView {
     }
 
     fn toggle_hidden(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = self.devices[index].hidden;
+        // As in `pointer`, the row may name a device that Apply removed.
+        let Some(visible) = self.devices.get(index).map(|device| device.hidden) else {
+            return;
+        };
         if !visible && self.selected == Some(index) {
             self.invalidate_ime();
         }
@@ -954,6 +976,22 @@ impl LiveView {
         self.status = Status::default();
         self.clear_prompts(window);
         self.notice = None;
+        // The panel's draft becomes the workspace of the next runtime. Its
+        // devices are new: hidden flags and the selection start over.
+        if self.draft_changed() {
+            self.draft.url = self.workspace.url.clone();
+            self.workspace = self.draft.clone();
+            self.devices = self
+                .workspace
+                .devices
+                .iter()
+                .map(|_| DeviceView::default())
+                .collect();
+            self.selected = Some(0);
+            self.panel_notice = None;
+        } else {
+            self.draft.url = self.workspace.url.clone();
+        }
         match self.session.take() {
             Some(previous) => self.stop_then_continue(previous, window, cx),
             None => self.after_stop(window, cx),
@@ -984,21 +1022,162 @@ impl LiveView {
         match self.lifecycle.stopped() {
             AfterStop::Start => self.start(window, cx),
             AfterStop::Close => window.remove_window(),
+            AfterStop::Wait => {}
         }
         cx.notify();
     }
 
-    /// Returns true if the window may close now. Otherwise stops the runtime, or
-    /// lets a running restart finish stopping the previous one, and removes the
-    /// window once the browser and profile are gone: GPUI ends the process as
-    /// soon as the last window closes.
+    /// Whether the panel's draft differs from the running workspace in
+    /// anything but the URL, which the URL bar owns.
+    fn draft_changed(&self) -> bool {
+        self.draft.name != self.workspace.name
+            || self.draft.sessions != self.workspace.sessions
+            || self.draft.devices != self.workspace.devices
+    }
+
+    fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        self.panel_open = !self.panel_open;
+        cx.notify();
+    }
+
+    /// Adds preset `index` to the draft, in the session of the selected
+    /// device or else the first session.
+    fn add_preset(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(preset) = PRESETS.get(index) else {
+            return;
+        };
+        let session = self
+            .selected
+            .and_then(|selected| self.workspace.devices.get(selected))
+            .map(|device| device.session.clone())
+            .or_else(|| {
+                self.draft
+                    .sessions
+                    .first()
+                    .map(|session| session.id.clone())
+            });
+        let Some(session) = session else {
+            return;
+        };
+        self.panel_notice = match self.draft.add_device_from_preset(preset, &session) {
+            Ok(added) => Some(format!(
+                "Added {}; Apply restarts the runtime with it.",
+                self.draft.devices[added].name
+            )),
+            Err(error) => Some(error.to_string()),
+        };
+        cx.notify();
+    }
+
+    fn remove_draft_device(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.panel_notice = match self.draft.remove_device(index) {
+            Ok(removed) => Some(format!(
+                "Removed {}; Apply restarts the runtime without it.",
+                removed.name
+            )),
+            Err(error) => Some(error.to_string()),
+        };
+        cx.notify();
+    }
+
+    fn discard_draft(&mut self, cx: &mut Context<Self>) {
+        self.draft = self.workspace.clone();
+        self.panel_notice = None;
+        cx.notify();
+    }
+
+    /// Writes the draft to the workspace file it was loaded from. The running
+    /// runtime is untouched; Apply is separate and explicit.
+    fn save_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving_workspace || self.lifecycle.is_closing() {
+            return;
+        }
+        let Some(path) = self.workspace_path.clone() else {
+            self.panel_notice =
+                Some("Started without --workspace; there is no file to save to.".into());
+            cx.notify();
+            return;
+        };
+        let mut saved = self.draft.clone();
+        saved.url = self.url.read(cx).text().to_owned();
+        if let Err(error) = saved.validate() {
+            self.panel_notice = Some(format!("Not saved: {error}"));
+            cx.notify();
+            return;
+        }
+        if !self.lifecycle.begin_save() {
+            return;
+        }
+        self.saving_workspace = true;
+        self.panel_notice = Some("Saving workspace…".into());
+        let saving = save_off_thread(move || match saved.save(&path) {
+            Ok(()) => format!("Saved snapshot to {}.", path.display()),
+            Err(error) => format!("Not saved: {error}"),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let notice = saving
+                .await
+                .unwrap_or_else(|error| format!("Not saved: {error:#}"));
+            this.update_in(cx, |view, window, cx| {
+                view.saving_workspace = false;
+                view.panel_notice = Some(notice);
+                if view.lifecycle.save_finished() {
+                    window.remove_window();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Remembers the window size for the next start (ADR 0022). Nothing else
+    /// of a run is written: no page address, cookie or profile.
+    fn save_window_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        if !self.lifecycle.begin_save() {
+            return;
+        }
+        let size = window.bounds().size;
+        let size = WindowSize {
+            width: f32::from(size.width).round().max(0.0) as u32,
+            height: f32::from(size.height).round().max(0.0) as u32,
+        };
+        let saving = save_off_thread(move || {
+            let mut state = AppState::load(&path).unwrap_or_default();
+            state.window = Some(size);
+            if let Err(error) = state.save(&path) {
+                eprintln!("broxser: could not save {}: {error}", path.display());
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = saving.await {
+                eprintln!("broxser: could not save window size: {error:#}");
+            }
+            this.update_in(cx, |view, window, cx| {
+                if view.lifecycle.save_finished() {
+                    window.remove_window();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops the browser independently of file I/O. GPUI ends the process when
+    /// the last window closes, so keep it until both cleanup and saves finish.
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.invalidate_ime();
+        self.save_window_size(window, cx);
         let request = self.lifecycle.begin_close(self.session.is_some());
         if request == CloseRequest::Now {
             return true;
         }
-        self.notice = Some("Closing after the live browser stops…".into());
+        self.notice = Some("Closing after the browser stops and saves finish…".into());
         cx.notify();
         if request == CloseRequest::Stop
             && let Some(session) = self.session.take()
@@ -1083,7 +1262,9 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.devices[index].hidden {
+        // GPUI dispatches input to the listeners of the last drawn frame, so
+        // one can still name a device that Apply removed before the redraw.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
             return;
         }
         // A touch canvas has only a left-button finger. Reject other presses
@@ -1159,7 +1340,8 @@ impl LiveView {
 
     /// A button released outside the frame must not stay pressed in the page.
     fn release_outside(&mut self, index: usize, modifiers: &gpui::Modifiers) {
-        if self.devices[index].hidden {
+        // As in `pointer`, the device may be gone since the frame was drawn.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
             return;
         }
         // Outside motion has no mapped viewport point. Ending a touch at its
@@ -1190,7 +1372,8 @@ impl LiveView {
     }
 
     fn wheel(&mut self, index: usize, event: &ScrollWheelEvent) {
-        if self.devices[index].hidden {
+        // As in `pointer`, the device may be gone since the frame was drawn.
+        if self.devices.get(index).is_none_or(|device| device.hidden) {
             return;
         }
         let Some((x, y)) = self.map(index, event.position) else {
@@ -1576,7 +1759,17 @@ impl LiveView {
                         .text_color(rgb(BG))
                         .child("Dismiss")
                         .on_click(cx.listener(move |view, _, _, cx| {
-                            view.devices[index].dismissed_download = Some(count);
+                            // Only the report this button was drawn with: after
+                            // Apply or Restart the index names another runtime's
+                            // device, which starts without one.
+                            let shown = view
+                                .status
+                                .devices
+                                .get(index)
+                                .is_some_and(|status| status.downloads == count);
+                            if let Some(device) = view.devices.get_mut(index).filter(|_| shown) {
+                                device.dismissed_download = Some(count);
+                            }
                             cx.notify();
                         })),
                 ),
@@ -1644,7 +1837,17 @@ impl LiveView {
                     .child(
                         button("popup-dismiss", "Dismiss", false).on_click(cx.listener(
                             move |view, _, _, cx| {
-                                view.devices[index].dismissed_popup = Some(token);
+                                // As for downloads: only the report still shown.
+                                let shown = view
+                                    .status
+                                    .devices
+                                    .get(index)
+                                    .and_then(|status| status.popup.as_ref())
+                                    .is_some_and(|popup| popup.token == token);
+                                if let Some(device) = view.devices.get_mut(index).filter(|_| shown)
+                                {
+                                    device.dismissed_popup = Some(token);
+                                }
                                 cx.notify();
                             },
                         )),
@@ -1732,6 +1935,10 @@ impl LiveView {
             .child(
                 button("reload", "Reload")
                     .on_click(cx.listener(|view, _, _, cx| view.reload_selected(cx))),
+            )
+            .child(
+                toggle("workspace-panel", "Workspace", self.panel_open)
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_panel(cx))),
             )
             .child(
                 toggle("sync-navigation", "Sync links", sync.navigation).on_click(cx.listener(
@@ -1863,6 +2070,165 @@ impl LiveView {
             )
     }
 
+    /// The workspace panel: the draft's devices with Remove, the presets with
+    /// Add, and Apply, Save and Discard. Edits touch the draft only; Apply
+    /// restarts the runtime with it and Save writes the file (ADR 0022).
+    fn workspace_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let changed = self.draft_changed();
+        let removable = self.draft.devices.len() > 1;
+        // Filled buttons: Add, Apply and Save in the accent color, Remove in
+        // the danger color, and muted headings, so a real-window check can
+        // find each kind of button by its color alone.
+        let small = |id: (&'static str, usize), label: &'static str, color: u32| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .rounded_md()
+                .bg(rgb(color))
+                .text_color(rgb(BG))
+                .text_xs()
+                .px_2()
+                .py_0p5()
+                .child(label)
+        };
+        let action = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .rounded_md()
+                .bg(rgb(if primary { ACCENT } else { RAISED }))
+                .text_color(rgb(if primary { BG } else { TEXT }))
+                .px_3()
+                .py_1()
+                .text_sm()
+                .child(label)
+        };
+        let devices: Vec<AnyElement> = self
+            .draft
+            .devices
+            .iter()
+            .enumerate()
+            .map(|(index, device)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .py_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(format!(
+                                "{} · {}×{}{} · {}",
+                                device.name,
+                                device.width,
+                                device.height,
+                                scale_suffix(device.device_scale_factor),
+                                device.session
+                            )),
+                    )
+                    .when(removable, |row| {
+                        row.child(small(("remove-device", index), "Remove", DANGER).on_click(
+                            cx.listener(move |view, _, _, cx| view.remove_draft_device(index, cx)),
+                        ))
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        let presets: Vec<AnyElement> =
+            PRESETS
+                .iter()
+                .enumerate()
+                .map(|(index, preset)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .py_1()
+                        .text_sm()
+                        .child(format!(
+                            "{} · {}×{}{}",
+                            preset.name,
+                            preset.width,
+                            preset.height,
+                            scale_suffix(preset.device_scale_factor)
+                        ))
+                        .child(small(("add-preset", index), "Add", ACCENT).on_click(
+                            cx.listener(move |view, _, _, cx| view.add_preset(index, cx)),
+                        ))
+                        .into_any_element()
+                })
+                .collect();
+        let source = match &self.workspace_path {
+            Some(path) => path.display().to_string(),
+            None => "Demo workspace; started without --workspace, so Save has no file".to_owned(),
+        };
+        div()
+            .id("workspace-panel-body")
+            .w(px(340.))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .overflow_y_scroll()
+            .bg(rgb(SURFACE))
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            .p_4()
+            .child(div().text_xs().text_color(rgb(MUTED)).child("WORKSPACE FILE"))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(source))
+            // Actions and the notice stay at the top, above the lists that may
+            // scroll: Apply and Discard while the draft differs, Save always.
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .when(changed, |row| {
+                        row.child(action("apply-draft", "Apply (restart)", true).on_click(
+                            cx.listener(|view, _, window, cx| view.restart(window, cx)),
+                        ))
+                        .child(
+                            action("discard-draft", "Discard", false)
+                                .on_click(cx.listener(|view, _, _, cx| view.discard_draft(cx))),
+                        )
+                    })
+                    .child(
+                        action(
+                            "save-draft",
+                            if self.saving_workspace { "Saving…" } else { "Save" },
+                            !changed && self.workspace_path.is_some() && !self.saving_workspace,
+                        )
+                        .when(!self.saving_workspace && !self.lifecycle.is_closing(), |button| {
+                            button.on_click(cx.listener(|view, _, window, cx| view.save_draft(window, cx)))
+                        }),
+                    ),
+            )
+            .children(
+                self.panel_notice
+                    .clone()
+                    .map(|notice| div().text_xs().text_color(rgb(WARN)).child(notice)),
+            )
+            .child(div().mt_3().text_xs().text_color(rgb(MUTED)).child("DEVICES"))
+            .children(devices)
+            .child(div().mt_3().text_xs().text_color(rgb(MUTED)).child("ADD A DEVICE"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Into the selected device's session. Generic viewport classes; edit the file for exact sizes."),
+            )
+            .children(presets)
+            .into_any_element()
+    }
+
     fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let runtime = match &self.status.runtime {
             _ if self.lifecycle.is_restarting() => {
@@ -1956,6 +2322,7 @@ impl Render for LiveView {
                 view.cancel_touches();
                 view.url.update(cx, |input, cx| input.focus_all(window, cx));
             }))
+            .on_action(cx.listener(|view, _: &TogglePanel, _, cx| view.toggle_panel(cx)))
             .on_key_up(cx.listener(|view, event: &KeyUpEvent, _, _| {
                 view.key_up(&event.keystroke);
             }))
@@ -1966,6 +2333,7 @@ impl Render for LiveView {
                     .flex_1()
                     .min_h_0()
                     .child(self.sidebar(cx))
+                    .children(self.panel_open.then(|| self.workspace_panel(cx)))
                     .child(
                         div()
                             .flex_1()
@@ -2333,6 +2701,43 @@ fn selected_after_visibility_change(selected: Option<usize>, hidden: &[bool]) ->
         .find(|&index| !hidden[index])
 }
 
+/// Resolve a decode only in its own runtime, before inspecting any device slot:
+/// applying a draft can shrink or reorder the list while decoding is in flight.
+fn frame_device<'a>(
+    devices: &'a mut [DeviceView],
+    lifecycle: &Lifecycle,
+    index: usize,
+    generation: u64,
+) -> Option<&'a mut DeviceView> {
+    if !lifecycle.accepts(generation) {
+        return None;
+    }
+    let device = devices.get_mut(index)?;
+    if device.decoding == Some(generation) {
+        device.decoding = None;
+    }
+    Some(device)
+}
+
+/// At most two writes run: one workspace snapshot and the close-time state.
+/// Give blocking filesystem calls their own threads so they cannot occupy
+/// GPUI's finite background pool and delay frame decoding or browser teardown,
+/// even on a single-CPU machine. Spawn failures and panics complete the waiter.
+fn save_off_thread<T: Send + 'static>(
+    save: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = Result<T>> {
+    let (done, result) = oneshot::channel();
+    let started = std::thread::Builder::new()
+        .name("broxser-save".into())
+        .spawn(move || {
+            let _ = done.send(save());
+        });
+    async move {
+        started.context("start save worker")?;
+        result.await.context("save worker stopped before reporting")
+    }
+}
+
 fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
     let mut pixels = image::load_from_memory_with_format(&frame.jpeg, image::ImageFormat::Jpeg)
         .context("decode live frame")?
@@ -2346,6 +2751,15 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
 
 /// The card's activity line: the stream state, then what the page tried that
 /// Broxser closed or refused (ADR 0015, ADR 0016).
+/// ` @2×` for a device scale factor other than 1, else nothing.
+fn scale_suffix(scale: f64) -> String {
+    if scale == 1.0 {
+        String::new()
+    } else {
+        format!(" @{scale}×")
+    }
+}
+
 fn activity_line(status: &DeviceStatus) -> String {
     let mut parts = vec![if status.streaming {
         "Streaming".to_owned()
@@ -2368,10 +2782,11 @@ fn activity_line(status: &DeviceStatus) -> String {
 mod tests {
     use super::{
         CanvasKey, DeviceView, KeyFocus, PressedKeys, activity_line, canvas_key, field_answer,
-        focus_after_prompt_change, key_down_target, key_input, map_caret, open_dialog,
-        prompt_default, selected_after_visibility_change,
+        focus_after_prompt_change, frame_device, key_down_target, key_input, map_caret,
+        open_dialog, prompt_default, selected_after_visibility_change,
     };
     use crate::ime::{ImeBuffer, Origin};
+    use crate::lifecycle::{AfterStop, Lifecycle};
     use crate::url_input::{KeyOutcome, LineEdit, UrlEvent};
     use broxser_engine::{
         CaretRect, Command, DeviceStatus, DialogKind, DialogState, ImeAction, MAX_DIALOG_CHARS,
@@ -2428,6 +2843,35 @@ mod tests {
             } => (device, token, accept, text),
             other => panic!("not a dialog answer: {other:?}"),
         }
+    }
+
+    #[test]
+    fn decoded_frames_cannot_touch_devices_replaced_by_apply() {
+        let mut lifecycle = Lifecycle::default();
+        let old = lifecycle.generation();
+        let mut devices: Vec<_> = (0..3)
+            .map(|_| DeviceView {
+                decoding: Some(old),
+                ..DeviceView::default()
+            })
+            .collect();
+        assert!(lifecycle.begin_restart());
+        // Apply removes a device, leaving callbacks for all three old slots.
+        devices.remove(0);
+        for device in &mut devices {
+            *device = DeviceView::default();
+        }
+        assert!(frame_device(&mut devices, &lifecycle, 2, old).is_none());
+        assert_eq!(lifecycle.stopped(), AfterStop::Start);
+        let current = lifecycle.generation();
+        devices[0].decoding = Some(current);
+        assert!(frame_device(&mut devices, &lifecycle, 2, old).is_none());
+        assert!(frame_device(&mut devices, &lifecycle, 0, old).is_none());
+        assert_eq!(devices[0].decoding, Some(current));
+        // Missing indices are harmless even when tagged with this generation.
+        assert!(frame_device(&mut devices, &lifecycle, 2, current).is_none());
+        assert!(frame_device(&mut devices, &lifecycle, 0, current).is_some());
+        assert_eq!(devices[0].decoding, None);
     }
 
     #[test]
