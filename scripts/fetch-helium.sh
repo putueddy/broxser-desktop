@@ -17,7 +17,9 @@ if [[ -f .local/helium/.broxser-runtime.json ]] && cmp -s runtime/helium-linux-x
   fi
 fi
 if [[ -e .local/helium ]]; then
-  echo 'Existing .local/helium differs from this baseline. Move it aside before preparing another version.' >&2
+  # Updating or rolling back the pin: keep the other version, never delete it.
+  held=$(python3 -c 'import json, re, sys; v = json.load(open(sys.argv[1]))["version"]; print(v if re.fullmatch(r"\d+(\.\d+){3}", v) else "other")' .local/helium/.broxser-runtime.json 2>/dev/null || echo other)
+  echo "Existing .local/helium (Helium $held) differs from this baseline. Move it aside before preparing another version: mv .local/helium .local/helium-$held" >&2
   exit 1
 fi
 mkdir -p .local

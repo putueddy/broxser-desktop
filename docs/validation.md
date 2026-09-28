@@ -3,6 +3,88 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P3.1 Helium qualification and rollback rehearsal, 28 September 2026 (cloud container)
+
+Same container; the live suite and the smoke run as the unprivileged user
+`broxsertest` against Xvfb `:99` (1600 × 1000), with the sandbox enabled.
+Decisions and open owner decisions:
+[ADR 0026](adr/0026-helium-qualification-and-rollback.md).
+
+### Before the change
+
+- The pin's SHA-256 was the only check; nothing recorded where it came from or
+  that the tarball is Helium's. Helium publishes a detached OpenPGP signature
+  next to each tarball and its public key in `imputnet/helium-linux`
+  (`pubkey.asc`, identical to the key in its README, fingerprint
+  `BE677C1989D35EAB2C5F26C9351601AD01D6378E`). Checked by hand with `gpgv`: the
+  pinned 0.18.1.1 tarball has a good signature made 2026-09-23 18:41:31 UTC and
+  the pinned SHA-256; the previous release 0.17.2.1 has a good signature made
+  2026-09-17 23:11:31 UTC and SHA-256 `2a639df5…c7c3e299`.
+- Qualifying another version was manual and unrecorded, and no rollback had
+  been tried. `fetch-helium.sh` refused an `.local/helium` of another version
+  without saying which one it held.
+
+### After the change
+
+- `python3 scripts/qualify-helium.py verify runtime/helium-linux-x86_64.json`
+  (2.7 s): "Helium 0.18.1.1: signed by BE677C19…01D6378E at
+  2026-09-23T18:41:31Z; SHA-256 matches". It leaves no `~/.gnupg` and no
+  `gpg-agent` behind.
+- `run runtime/helium-linux-x86_64.json` (2 m 46 s): **qualified**. Signature
+  and SHA-256, reported version `Helium 0.18.1.1 (Chromium 154.0.8037.57)`, live
+  suite 48 passed and 0 failed in 70.6 s, smoke 15 of 15 in 84.7 s.
+- `propose 0.17.2.1` (10 s) wrote a manifest with Chromium 153.0.8010.52 and the
+  SHA-256 above, from a signature-verified download.
+- `run` of that manifest (2 m 41 s): **not qualified**. Live suite 46 passed
+  and 2 failed in 75.0 s; the smoke passed 15 of 15 in 86.2 s:
+  - `live_dialog_survives_hide_show_scroll_and_zoom`: "the browser did not
+    answer Page.stopScreencast within 15 seconds", and the runtime stopped. The
+    test opens an alert, then hides and shows the device, scrolls it off and
+    back and changes its frame limit; each of these stops the screencast.
+    Failed 3 of 3 alone and in two more full suite runs (6 of 6 in all);
+    passes 3 of 3 alone on 0.18.1.1.
+  - `live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device`:
+    timed out waiting for the inner frame once in the 4-thread suite; passed in
+    the two later suite runs (47 of 48 each, only the dialog test failed) and 3
+    of 3 alone on both versions. This was a race in the test, fixed in PR #26
+    (see "PR #26 CI" below).
+- `run` again with the committed script (`569c333`, 2 m 35 s): not qualified,
+  47 passed and 1 failed, the record naming
+  `live::tests::live_dialog_survives_hide_show_scroll_and_zoom`; smoke 15 of 15.
+- Pin switch in a clone of this commit: `fetch-helium.sh` prepared 0.18.1.1 in
+  10.7 s. With 0.17.2.1's manifest as the pin, `verify` and `sbom.py --check`
+  passed and `fetch-helium.sh` refused with "Existing .local/helium (Helium
+  0.18.1.1) differs from this baseline. Move it aside before preparing another
+  version: mv .local/helium .local/helium-0.18.1.1". After that `mv` it prepared
+  0.17.2.1 in 9.6 s. Back on the committed pin it refused naming 0.17.2.1; two
+  renames and "Helium already prepared" took 0.04 s, without a download.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `python3 -m unittest discover -s scripts/tests` | 8 tests passed in 0.3 s: manifest checks, version and test-result parsing, verdicts; with throwaway keys, a signature by the pinned key is accepted and changed data, another signer, another key file and a file with two keys are refused; the committed key has the pinned fingerprint |
+| Qualification records (`artifacts/qualification/`, outside Git) | 0.18.1.1 qualified; 0.17.2.1 not qualified, with the steps, times, Broxser commit, host and logs as listed above |
+| `bash scripts/check.sh` with the tooling tests | Passed in 37 s: SBOM check, the 8 tooling tests, fmt, `cargo test --locked` (1 CLI, 2 + 10 core, 113 engine, 41 desktop; 48 live tests ignored by default), strict Clippy for the workspace and the desktop crate |
+| Manual | No UI change; the smoke ran in a real X11 window twice |
+| Rerun on `main` `880679e` (after PR #26), 29 September 2026 | `bash scripts/check.sh` passed in 46 s (SBOM check, the 8 tooling tests, 1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default); `verify` passed in 2.8 s; `run runtime/helium-linux-x86_64.json` **qualified** in 3 m 37 s: live suite 54 passed and 0 failed in 98.3 s, smoke 18 of 18 in 110.4 s, no browser process or profile left |
+
+### Limits
+
+- For this commit no earlier Helium qualifies: the rollback target for the next
+  update is the current pin, and an engine-only rollback to 0.17.2.1 would ship
+  the runtime stop above.
+- Trust in the key rests on GitHub over HTTPS, here through the environment's
+  TLS-inspecting proxy; the fingerprint was not confirmed through a second
+  channel. `gpgv` checks neither expiry nor revocation.
+- Only X11 on Xvfb with software rendering; no Wayland, physical GPU or other
+  distribution. The unprivileged user cannot build here, so it ran binaries
+  built by root from the same commit (`BROXSER_ENGINE_TESTS`,
+  `BROXSER_DESKTOP_BIN`) and used the system CA store, because it cannot read
+  this container's proxy CA bundle.
+- The Chromium 153 behavior was observed through the test, not traced in the
+  browser.
+
 ## PR #26 CI: three engine test races, 29 September 2026 (cloud container)
 
 CI on `e37328e` failed three engine tests that the PR's diff (scripts, CI and
@@ -148,7 +230,7 @@ Same container. Decisions and open owner decisions:
 - System libraries (X11/Wayland, Vulkan, fonts) are not bundled; no
   distribution other than this container was tried.
 - No Helium update or rollback was qualified: the pinned engine is the newest,
-  and the qualification script is the next part.
+  and the qualification script is the next part (the section above).
 
 ## PR #25 review corrections, 28 September 2026 (Linux X11)
 

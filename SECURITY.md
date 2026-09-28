@@ -4,6 +4,15 @@ This foundation is not yet approved for company-wide browsing. The release gates
 in docs/system-design.md include runtime updates, crash cleanup, recovery,
 permissions, and a pilot with representative company applications.
 
+The engine is Helium's official Linux tarball, pinned by SHA-256 in
+`runtime/helium-linux-x86_64.json` and not bundled. A new pin is written only from
+a tarball whose detached OpenPGP signature was made by Helium's release key
+(`runtime/helium-signing-key.asc`, its fingerprint pinned in
+`scripts/qualify-helium.py`), and CI rechecks the pinned tarball's signature on
+every run (ADR 0026). Users' fetch checks the SHA-256 only. Rolling back to an
+older Helium reintroduces the vulnerabilities fixed since and goes through the
+same qualification; the previous release, 0.17.2.1, did not qualify.
+
 The browser subprocess keeps Chromium's sandbox enabled, uses a private temporary
 profile (mode 0700), and exposes CDP on a random loopback port. CDP can control every
 page in that subprocess. Loopback prevents remote network access, but does not

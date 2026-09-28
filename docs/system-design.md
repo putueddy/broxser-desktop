@@ -385,7 +385,12 @@ Review lisensi dilakukan sebelum packaging; [NOTICE.md](../NOTICE.md) merangkum
 status tanpa menganggap pemisahan proses menghapus kewajiban distribusi. Arsip
 rilis Linux (`scripts/package.sh`, ADR 0025) berisi binary, notices, SBOM SPDX
 dari graph yang benar-benar di-link dan `SHA256SUMS`, deterministik per commit,
-tanpa Helium dan belum ber-signature.
+tanpa Helium dan belum ber-signature. Update dan rollback Helium dikualifikasi
+dengan `scripts/qualify-helium.py` (ADR 0026): pin baru hanya dari tarball yang
+ditandatangani kunci rilis Helium, lalu live suite dan smoke dijalankan terhadap
+browser kandidat di samping engine yang dipin dan hasilnya dicatat per pasangan
+commit Broxser dan versi Helium. Rollback memakai jalur yang sama; rilis
+sebelumnya (0.17.2.1) tidak lulus untuk commit ini.
 
 ## 9. Operational readiness and ten year stewardship
 
@@ -412,7 +417,7 @@ masih diperlukan sebelum 8 device dipakai sebagai fitur production.
 
 Cargo.lock, Rust toolchain, GPUI exact version dan checksum Helium memberi baseline
 yang dapat direproduksi. Dependabot membantu Rust/action; pembaruan browser tetap
-pekerjaan owner dengan contract test. CI memeriksa compile dan headless integration;
+pekerjaan owner dengan contract test (`scripts/qualify-helium.py`, ADR 0026). CI memeriksa compile dan headless integration;
 matrix GPU Wayland/X11, fractional scale, IME dan accessibility memerlukan test
 desktop nyata sebelum rilis.
 
