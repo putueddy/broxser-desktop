@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -95,6 +95,60 @@ pub(crate) fn assert_cleaned_up(root: &Path, processes: &[ProcessIdentity]) {
         .filter(|name| name.to_string_lossy().starts_with("broxser-cdp-"))
         .collect();
     assert!(leftovers.is_empty(), "profiles left: {leftovers:?}");
+}
+
+/// An isolated subprocess blocked in a shell builtin, with no descendants.
+/// Always reaps its own child, including when a cleanup regression panics.
+pub(crate) struct HeldProcess {
+    child: Child,
+    pub identity: ProcessIdentity,
+}
+
+impl HeldProcess {
+    pub(crate) fn argument(argument: impl AsRef<std::ffi::OsStr>) -> Self {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "read line", "held-process"])
+            .arg(argument);
+        Self::start(command)
+    }
+
+    pub(crate) fn embedded(text: &str) -> Self {
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("read line; : {text}"), "held-process"]);
+        Self::start(command)
+    }
+
+    fn start(mut command: Command) -> Self {
+        let child = command.stdin(Stdio::piped()).spawn().unwrap();
+        let identity = browser::identity(child.id()).unwrap();
+        let held = Self { child, identity };
+        // The child may still carry the test runner's argv before exec.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read(format!("/proc/{}/cmdline", held.identity.pid)).is_ok_and(|cmdline| {
+            cmdline
+                .split(|&byte| byte == 0)
+                .any(|arg| arg == b"held-process")
+        }) {
+            assert!(Instant::now() < deadline, "the held shell did not start");
+            thread::sleep(Duration::from_millis(5));
+        }
+        held
+    }
+
+    pub(crate) fn assert_running(&self) {
+        assert!(
+            browser::is_running(&self.identity),
+            "an unrelated test process was signaled"
+        );
+    }
+}
+
+impl Drop for HeldProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -351,6 +405,7 @@ pub(crate) fn fake_browser(kind: FakeBrowser) -> PathBuf {
             FakeBrowser::NeverReady => "never-ready",
             FakeBrowser::LoopbackEndpoint => "loopback-endpoint",
             FakeBrowser::LateHelper => "late-helper",
+            FakeBrowser::StuckHelper => "stuck-helper",
         })
 }
 
@@ -362,6 +417,9 @@ pub(crate) enum FakeBrowser {
     /// Never publishes an endpoint; once it is gone, a process that did not
     /// exist before writes into the profile for about 0.3 seconds.
     LateHelper,
+    /// Never publishes an endpoint and leaves a helper, named like Chromium's
+    /// crash handler after the profile's crash database, that outlives it.
+    StuckHelper,
 }
 
 /// How a fake CDP websocket peer behaves after its (optionally delayed) handshake.

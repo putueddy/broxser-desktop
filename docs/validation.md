@@ -3,6 +3,104 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P0 follow-up: survivors of the browser's exit wait, 27 September 2026 (cloud container)
+
+Same container: Helium 0.18.1.1 run by `broxsertest` with the sandbox enabled.
+Decision: [ADR 0007](adr/0007-browser-ownership-after-owner-death.md), "Stop
+what outlives the wait".
+
+### Before the change
+
+- The cleanup deadlock recorded under P1.4 kept failing live tests at their
+  close with "browser processes still running": on 27 September one full suite
+  run of 45 failed `live_session_sync_stays_in_session_without_loops_or_replay`
+  (it passed 3 of 3 alone), and a P2.2a run failed
+  `live_subframe_navigations_never_sync` the same way. Afterwards two
+  `helium_crashpad_handler` processes (`--database=<profile>/Crash Reports`),
+  a `[helium]` renderer and its zombie were still running for each of two
+  test profiles, one of them from a run hours earlier; the profiles had been
+  removed. Killing the two handlers by PID released all four processes of
+  each set within 5 s.
+- Reproducer: a fake browser, `stuck-helper`, starts a helper that carries
+  `--database=<profile>/Crash Reports` and never exits by itself.
+  `shutdown_stops_helpers_that_would_outlive_the_browser` failed with "2
+  processes of the browser or naming its profile did not exit after the
+  browser was stopped"; `guardian_stops_helpers_that_would_outlive_the_browser`
+  failed with "3 of 5 processes running, profile exists: false, after 10.0 s"
+  after the owner's SIGKILL.
+
+### After the change
+
+Both reproducers pass: shutdown and the guardian wait five seconds, stop the
+survivors by identity and finish with no process left. A process that only
+mentions the profile is still waited for and never signaled
+(`crash_database_argument_matches_only_the_profiles_own` covers the argument
+match).
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, `cargo test --locked` (1 CLI, 8 core, 97 engine, 36 desktop), strict Clippy for the workspace and the desktop crate |
+| Live Helium suite (`--ignored`, 4 threads, `broxsertest`) before the owner's PTZ commit, twice | 42 of 42 passed in 77 s and in 73 s; no browser process left afterwards, zombies aside |
+| Live Helium suite on top of the PTZ commit `a075485` | The first run after a container restart failed the four capture tests that start first with "browser did not publish a CDP endpoint within 15 seconds" (four cold browser starts at once; shutdown is not involved) and passed the other 39; the next run passed 43 of 43 in 67 s with nothing left running |
+| `scripts/desktop-smoke.sh` (Xvfb 1600 × 1000, debug build), before and on top of `a075485` | 12 of 12 scenarios passed each time (1 m 20 s, 1 m 22 s); no browser process, profile or window left |
+
+### PR #18 ownership review corrections, 28 September 2026 (local Linux)
+
+Review of `be3aed6` found two signal-ownership regressions. The new escalation
+used the full recorded process list, but shutdown, Drop, guardian and recovery
+all added broad profile references to that list. An unrelated observer already
+naming the profile consequently became a SIGKILL target. The new crash-database
+matcher also treated a space inside an ordinary argv entry as a flag boundary,
+so shell source containing `--database=<profile>/...` could be mistaken for a
+crash handler during the fresh scan.
+
+The baseline regressions failed as expected: two argument-matching assertions
+accepted embedded shell text, and the shutdown observer test found its own
+disposable observer had been signaled. Test-owned child guards cleaned up the
+fixtures; no user processes were targeted.
+
+The fix separates verified browser descendants from wait-only profile observers
+in all four cleanup paths. The owner retains its spawn-time browser identity
+before constructing descendant snapshots, including after the child was reaped.
+Crash database matching requires the start of a NUL-delimited argument;
+space-separated exact-argument matching is restricted to Chromium's single
+nonempty argv representation. Normal argv preserves spaces inside its values.
+
+Regression coverage verifies initial and late observers, embedded marker text,
+shutdown and fallback Drop, guardian EOF, stale recovery, sibling preservation,
+and reaped/mismatched identities. Recovery still leaves unproven or foreign-boot
+processes alone. The existing stuck-helper and late-helper tests continue to
+require genuine browser helpers to stop. A persistent observer remains alive
+and produces the existing incomplete-release error; recovery retains its profile
+for a later attempt.
+
+Independent source review found no remaining actionable introduced issue after
+these corrections. Evidence is retained locally in ignored
+`artifacts/pr18-fixes/` logs. The intermittent real Crashpad deadlock is not
+claimed to have been forced by these deterministic subprocess tests.
+
+| Final local check | Result |
+| --- | --- |
+| `CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 bash scripts/check.sh` | Passed: formatting, strict Clippy, 1 CLI + 8 core + 103 engine + 36 desktop tests (148 total) |
+| Full live Helium suite (`--ignored --test-threads=2 --nocapture`) | Passed: 43 of 43, 100.12 s; includes owner-death, orphan recovery and normal browser cleanup |
+| Independent ownership review | Both signal-eligibility findings resolved; no additional actionable introduced issue found |
+| `git diff --check` | Passed |
+
+The live suite used Helium 0.18.1.1 (`Chrome/154.0.8037.57`) with sandboxing
+enabled and application-owned private profiles. No GUI code changed, so no
+additional native window check was required. Existing vendored GPUI and
+`proc-macro-error2` future-compatibility warnings remain non-failing.
+
+### Limits
+
+- The deadlock itself is intermittent; the live runs above show no
+  regression, not that it occurred and was resolved. The fake reproducer
+  proves the mechanism.
+- A shutdown that meets it takes about five seconds longer than a normal one
+  (the first wait), then a few milliseconds for the kill and the second wait.
+- The container's PID 1 does not reap orphans, so zombies of stopped browser
+  processes stay listed here; they hold no memory or files.
+
 ## P1.6 unsupported browser interactions, 26 September 2026 (cloud container)
 
 Same container as P1.5: Helium 0.18.1.1 (Chrome/154.0.8037.57), headless, run by
@@ -699,7 +797,7 @@ desktop remains to be measured.
 | New `live_off_screen_devices_pause_frames_keep_input_and_resume_fresh` | Passed 3 of 3; without the on-screen check in `start_stream` it failed, because showing the device restarted its stream while off screen |
 | `scripts/desktop-smoke.sh` with the debug and the release build | Passed all eight runs each, before and after the typing run's readiness fix; no browser process, profile or window left, and the known preview directory after SIGTERM |
 
-### Browser cleanup deadlock under load (not changed here)
+### Browser cleanup deadlock under load (fixed later, see the P0 follow-up)
 
 In the failed run, the IME assertions passed, but processes of the stopped browser
 still ran 10 s after `LiveSession` was dropped. A renderer had crashed while the

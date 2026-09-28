@@ -310,7 +310,18 @@ fn leased_to(root: &Path, owner: u32) -> Option<Armed> {
 /// Waits until every process has exited, zombies included, and the profile is
 /// gone. Returns the milliseconds that took after `since`.
 fn assert_gone(what: &str, processes: &[ProcessIdentity], profile: &Path, since: Instant) -> u128 {
-    let deadline = since + EXIT_TIMEOUT;
+    assert_gone_within(what, processes, profile, since, EXIT_TIMEOUT)
+}
+
+/// [`assert_gone`] with another bound.
+fn assert_gone_within(
+    what: &str,
+    processes: &[ProcessIdentity],
+    profile: &Path,
+    since: Instant,
+    bound: Duration,
+) -> u128 {
+    let deadline = since + bound;
     loop {
         let running = processes
             .iter()
@@ -489,6 +500,72 @@ fn shutdown_waits_for_helpers_started_after_its_snapshot() {
     assert_cleaned_up(root.path(), &processes);
 }
 
+/// Waits until a process whose arguments include `name` names `profile`.
+fn wait_for_named(profile: &Path, name: &[u8]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !browser::referencing(profile).iter().any(|process| {
+        fs::read(format!("/proc/{}/cmdline", process.pid))
+            .is_ok_and(|cmdline| cmdline.split(|&byte| byte == 0).any(|arg| arg == name))
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "the fake browser's helper never started"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Validation, P1.4 ("Browser cleanup deadlock"): a crash handler that traces
+/// a renderer caught by the kill kept itself, the renderer and its sandbox
+/// namespace alive after every wait, and the profile was removed under them.
+/// Before the change this shutdown failed after 5 s with the helper running.
+#[test]
+fn shutdown_stops_helpers_that_would_outlive_the_browser() {
+    let root = profile_root();
+    let browser = BrowserProcess::start(
+        &options(fake_browser(FakeBrowser::StuckHelper), root.path()),
+        true,
+    )
+    .unwrap();
+    let profile = leased_to(root.path(), process::id()).unwrap().profile;
+    wait_for_named(&profile, b"stuck-helper");
+    let mut processes = browser.processes();
+    processes.extend(browser.guardian());
+    processes.extend(browser::referencing(&profile));
+    let started = Instant::now();
+    browser.shutdown().unwrap();
+    println!("shutdown with a stuck helper: {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < 2 * EXIT_TIMEOUT,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_cleaned_up(root.path(), &processes);
+}
+
+#[test]
+fn guardian_stops_helpers_that_would_outlive_the_browser() {
+    let root = profile_root();
+    let browser = fake_browser(FakeBrowser::StuckHelper);
+    let mut owner = Owner::start("capture", &browser, root.path(), None, None);
+    let armed = owner.armed(root.path());
+    wait_for_named(&armed.profile, b"stuck-helper");
+    let mut processes = armed.processes();
+    processes.extend(browser::referencing(&armed.profile));
+    let died = Instant::now();
+    owner.die(Death::Kill);
+    // The guardian waits out the exit bound once before it stops survivors.
+    let elapsed = assert_gone_within(
+        "stuck helper",
+        &processes,
+        &armed.profile,
+        died,
+        2 * EXIT_TIMEOUT,
+    );
+    println!("owner SIGKILL with a stuck helper: cleaned up after {elapsed} ms");
+    assert_cleaned_up(root.path(), &processes);
+}
+
 #[test]
 fn guardian_waits_for_helpers_started_after_its_owner_died() {
     let root = profile_root();
@@ -624,6 +701,60 @@ fn guardian_stops_the_reported_browser_when_its_owner_disappears() {
         "guardian cleanup after EOF: {} ms",
         started.elapsed().as_millis()
     );
+}
+
+#[test]
+fn guardian_cleanup_preserves_initial_and_late_profile_observers() {
+    use crate::test_support::HeldProcess;
+    let mut guarded = Guarded::start(sleeper);
+    let stand_in = guarded.stand_in();
+    guarded.watch(stand_in);
+    let initial = HeldProcess::argument(&guarded.profile);
+    let embedded = HeldProcess::embedded(&format!(
+        "--user-data-dir={} --database={}/Crash Reports",
+        guarded.profile.display(),
+        guarded.profile.display()
+    ));
+    let helper = HeldProcess::argument(format!(
+        "--database={}/Crash Reports",
+        guarded.profile.display()
+    ));
+    let sibling_profile = guarded
+        ._root
+        .path()
+        .join(format!("{PROFILE_PREFIX}sibling"));
+    fs::create_dir(&sibling_profile).unwrap();
+    let sibling = HeldProcess::argument(format!("--user-data-dir={}", sibling_profile.display()));
+    let late_profile = guarded.profile.clone();
+    let late = thread::spawn(move || {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        while browser::is_running(&stand_in) {
+            assert!(
+                Instant::now() < deadline,
+                "the guardian did not stop the browser"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        HeldProcess::argument(late_profile)
+    });
+    let status = guarded.abandon();
+    let late = late.join().unwrap();
+    initial.assert_running();
+    embedded.assert_running();
+    late.assert_running();
+    sibling.assert_running();
+    assert!(sibling_profile.exists());
+    assert!(
+        !browser::is_running(&helper.identity),
+        "a genuine crash helper survived"
+    );
+    assert!(!browser::is_running(&stand_in));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a live observer must report incomplete release"
+    );
+    assert!(!guarded.profile.exists());
 }
 
 #[test]

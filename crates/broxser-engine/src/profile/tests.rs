@@ -301,3 +301,108 @@ fn stale_profiles_are_recovered_conservatively() {
     let _ = stranger.wait();
     zombie_child.wait().unwrap();
 }
+
+/// Recovery stops only a same-boot recorded browser and its proven helpers.
+/// Broad initial and late observers keep the stale profile for a later start.
+#[test]
+fn recovery_preserves_initial_and_late_profile_observers() {
+    use crate::test_support::HeldProcess;
+    let root = profile_root();
+    let mut lease = Lease::for_current_process().unwrap();
+    lease.owner = exited();
+    let profile = leased(root.path(), "observed-orphan", &lease);
+    let orphan = HeldProcess::argument(user_data_dir(&profile));
+    lease.browser = Some(orphan.identity);
+    lease.write(&profile).unwrap();
+    let initial = HeldProcess::argument(&profile);
+    let embedded = HeldProcess::embedded(&format!(
+        "--user-data-dir={} --database={}/Crash Reports",
+        profile.display(),
+        profile.display()
+    ));
+    let helper = HeldProcess::argument(format!("--database={}/Crash Reports", profile.display()));
+    let sibling_profile = leased(
+        root.path(),
+        "sibling",
+        &Lease::for_current_process().unwrap(),
+    );
+    let sibling = HeldProcess::argument(user_data_dir(&sibling_profile));
+    let orphan_identity = orphan.identity;
+    let late_profile = profile.clone();
+    let late = thread::spawn(move || {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        while browser::is_running(&orphan_identity) {
+            assert!(
+                Instant::now() < deadline,
+                "recovery did not stop the orphan"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        HeldProcess::argument(late_profile)
+    });
+    recover_stale(root.path());
+    let late = late.join().unwrap();
+    initial.assert_running();
+    embedded.assert_running();
+    late.assert_running();
+    sibling.assert_running();
+    assert!(!browser::is_running(&orphan.identity));
+    assert!(
+        !browser::is_running(&helper.identity),
+        "a genuine crash helper survived"
+    );
+    assert!(
+        profile.join(LEASE).exists(),
+        "an observed profile was removed"
+    );
+    assert!(sibling_profile.join(LEASE).exists());
+    drop((initial, embedded, late));
+    recover_stale(root.path());
+    assert!(!profile.exists());
+    sibling.assert_running();
+}
+
+#[test]
+fn recovery_never_stops_helpers_without_a_verified_same_boot_browser() {
+    use crate::test_support::HeldProcess;
+    let root = profile_root();
+    let mut lease = Lease::for_current_process().unwrap();
+    lease.owner = exited();
+    for case in [
+        "missing",
+        "reaped",
+        "mismatched",
+        "foreign-boot",
+        "embedded",
+    ] {
+        let profile = leased(root.path(), case, &lease);
+        let actual = HeldProcess::argument(user_data_dir(&profile));
+        let embedded = HeldProcess::embedded(&format!("--user-data-dir={}", profile.display()));
+        let helper =
+            HeldProcess::argument(format!("--database={}/Crash Reports", profile.display()));
+        let mut stale = lease.clone();
+        stale.browser = match case {
+            "missing" => None,
+            "reaped" => Some(exited()),
+            "mismatched" => Some(ProcessIdentity {
+                start_time: actual.identity.start_time + 1,
+                ..actual.identity
+            }),
+            "foreign-boot" => {
+                stale.boot_id = "00000000-0000-0000-0000-000000000000".into();
+                Some(actual.identity)
+            }
+            "embedded" => Some(embedded.identity),
+            _ => unreachable!(),
+        };
+        stale.write(&profile).unwrap();
+        recover_stale(root.path());
+        actual.assert_running();
+        embedded.assert_running();
+        helper.assert_running();
+        assert!(
+            profile.join(LEASE).exists(),
+            "{case}: an unproven browser was recovered"
+        );
+    }
+}
