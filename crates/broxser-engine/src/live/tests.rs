@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[path = "navigation_deadlines.rs"]
 mod navigation_deadlines;
 
+#[path = "touch_input.rs"]
+mod touch_input;
+
 #[test]
 fn keys_map_to_dom_values_and_text() {
     let none = Modifiers::default();
@@ -2758,7 +2761,13 @@ const TOUCH_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport conte
 <div id=t></div>
 <script>
 let n = 0;
-const ping = (name, value) => fetch('/event?' + new URLSearchParams({kind: 'touch', name, value: String(value), w: innerWidth, n: n++}));
+const ping = (name, value) => {
+  const url = '/event?' + new URLSearchParams({kind: 'touch', name, value: String(value), w: innerWidth, n: n++});
+  // HTTP reports may arrive out of order. Force pointerup to arrive after
+  // click so the test cannot mistake the final event for a complete report.
+  if (name === 'pointerup') setTimeout(() => fetch(url), 150);
+  else fetch(url);
+};
 for (const type of ['pointerdown', 'pointerup', 'pointermove', 'touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'click']) {
   t.addEventListener(type, e => ping(type, e.pointerType || (e.touches ? 'touches=' + e.touches.length : 'mouse')));
 }
@@ -6856,8 +6865,9 @@ fn live_touch_devices_get_touches_and_mouse_devices_get_a_mouse() {
     click(&live, 2, 100.0, 200.0);
     assert!(
         fixture.wait_for(Duration::from_secs(10), |f| {
-            touch_events(f, "360").contains(&"click touch".to_owned())
-                && touch_events(f, "1000").contains(&"click mouse".to_owned())
+            // Each event uses a separate HTTP request: receiving click does
+            // not prove the earlier pointerup report has arrived yet.
+            touch_events(f, "360").len() >= 7 && touch_events(f, "1000").len() >= 5
         }),
         "phone {:?}, desktop {:?}",
         touch_events(&fixture, "360"),
@@ -6886,7 +6896,7 @@ fn live_touch_devices_get_touches_and_mouse_devices_get_a_mouse() {
         ]
     );
     // A drag on the phone is a swipe: the page scrolls and sees touch moves.
-    let before = events(&fixture, "touch").len();
+    let before = touch_events(&fixture, "360").len();
     for (kind, buttons, y) in [
         (PointerKind::Down, 1, 250.0),
         (PointerKind::Move, 1, 200.0),
@@ -6910,14 +6920,15 @@ fn live_touch_devices_get_touches_and_mouse_devices_get_a_mouse() {
     }
     assert!(
         fixture.wait_for(Duration::from_secs(10), |f| {
-            events(f, "touch")[before..]
-                .iter()
-                .any(|e| e["name"] == "scrollend")
+            let after = touch_events(f, "360");
+            let after = &after[before..];
+            after.contains(&"touchmove touches=1".to_owned())
+                && after.iter().any(|event| event.starts_with("scrollend "))
         }),
         "{:?}",
-        &events(&fixture, "touch")[before..]
+        &touch_events(&fixture, "360")[before..]
     );
-    let after: Vec<String> = touch_events(&fixture, "360")[7..].to_vec();
+    let after = touch_events(&fixture, "360")[before..].to_vec();
     assert!(
         after.contains(&"touchmove touches=1".to_owned()),
         "{after:?}"

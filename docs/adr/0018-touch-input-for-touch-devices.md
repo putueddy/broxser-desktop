@@ -38,13 +38,30 @@ at `77a1762` found:
   a `touchEnd`, all through `Input.dispatchTouchEvent`, with the keyboard
   modifiers. Moves without the finger down and the right and middle buttons
   send nothing to a touch device. Mouse devices are unchanged.
-- The rest of the input path stays: moves are coalesced so only the newest
-  waits while one is in flight, unanswered input counts toward "not
-  responding", input is dropped while a dialog is open or the device is
-  hidden, and a move still coalesced when the release arrives is dropped, as
-  it is for a mouse.
+- Moves are coalesced with one move in flight and at most the newest and
+  furthest unsent point retained, so a fast out-and-back drag cannot become a tap.
+  A touch release preserves its final position with a `touchMove` before
+  `touchEnd` when needed: unlike a mouse release, `touchEnd` has no position.
+  Dropping this move could turn a fast swipe into a click at its starting point.
+  Release commands count toward the unanswered-input limit; if the final
+  movement and end cannot fit, the gesture is canceled instead of becoming a tap.
+  Touch input waiting for an IME identity check retains its path in the existing
+  bounded input queue; an explicit cancellation removes held pointer commands.
+- Each device owns at most one active touch. Moves and releases without an
+  accepted press are ignored. Hide, navigation, dialogs and unresponsive
+  input abandon that ownership and discard coalesced input. A browser touch
+  that remains after a dropped release is canceled before a fresh press;
+  its old release is never replayed. Cancellation waits for input to be allowed
+  rather than leaving a command behind an open dialog or unresponsive page.
+- Leaving the canvas on release, switching devices or losing canvas/window
+  focus cancels the touch instead of ending it at the last visible point.
+  An abandoned drag must not activate the element where it started.
+- Unsupported buttons are filtered before they can cancel IME composition.
+  Mouse devices keep their existing input behavior.
 - Wheel input stays a mouse wheel on every device: the browser scrolls a
   touch page for it, and a mouse wheel is how the user scrolls the card.
+  Opt-in scroll sync still mirrors wheel deltas; native swipe scrolling stays
+  in its own device.
 
 ## Consequences
 

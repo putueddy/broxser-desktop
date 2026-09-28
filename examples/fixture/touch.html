@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broxser touch cancellation fixture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; }
+  #target { position: absolute; inset: 0; border: 0; background: #3b82f6;
+    color: #fff; touch-action: none; }
+</style>
+<button id="target">Tap or drag outside this frame</button>
+<script>
+  // Each report includes the complete history, so a later request is enough
+  // to inspect earlier events even if the HTTP reports arrive out of order.
+  const history = [];
+  for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel', 'click', 'contextmenu']) {
+    document.getElementById('target').addEventListener(type, event => {
+      history.push(type);
+      fetch('/event?' + new URLSearchParams({touch: type, w: innerWidth, events: history.join(',')}));
+      if (type === 'contextmenu') event.preventDefault();
+    });
+  }
+</script>

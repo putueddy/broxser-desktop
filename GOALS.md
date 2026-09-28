@@ -305,8 +305,10 @@ tes live pada `77a1762` membuktikan bahwa klik pada device `touch: true` tiba
 di halaman sebagai event mouse (`pointerType` `mouse`, tanpa `touchstart`).
 Kini tekan, seret dan lepas tombol kiri pada device touch dikirim sebagai satu
 titik sentuh lewat `Input.dispatchTouchEvent`: halaman melihat `pointerType`
-`touch`, `touchstart`/`touchmove`/`touchend` lalu `click`, dan seret menggulir
-seperti swipe; hover dan tombol lain tidak dikirim, device mouse tidak berubah.
+`touch` dan `touchstart`/`touchmove`/`touchend`; tap menghasilkan `click`,
+sedangkan seret menggulir seperti swipe. Hover dan tombol lain tidak dikirim,
+device mouse tidak berubah. Posisi pelepasan tetap diteruskan pada swipe cepat;
+gestur yang terputus dibatalkan tanpa memutar ulang pelepasannya.
 
 Batas yang didokumentasikan sebagai penutup P1.6 (`docs/validation.md`): browser
 headless tidak melaporkan perangkat penunjuk, sehingga halaman device mouse
