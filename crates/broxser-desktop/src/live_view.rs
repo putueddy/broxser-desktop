@@ -64,8 +64,12 @@ pub(crate) struct LiveView {
     console_read: Option<(usize, u64)>,
     /// Where Save report writes (ADR 0024); `None` without a home directory.
     reports: Option<PathBuf>,
+    /// Resolving XDG paths may read a slow filesystem; never do it on the GUI.
+    reports_loading: bool,
     /// The report waiting for its screenshot.
     report: Option<PendingReport>,
+    /// A captured report owns a close-time save until both files are written.
+    saving_report: bool,
     next_report: u64,
     /// The outcome of the last Save report, and whether it failed.
     report_notice: Option<(String, bool)>,
@@ -333,8 +337,10 @@ impl LiveView {
             saving_workspace: false,
             console: Vec::new(),
             console_read: None,
-            reports: report::reports_dir(|name| std::env::var_os(name)),
+            reports: None,
+            reports_loading: true,
             report: None,
+            saving_report: false,
             next_report: 0,
             report_notice: None,
             browser,
@@ -358,8 +364,32 @@ impl LiveView {
             _window_bounds: window_bounds,
             _key_presses: key_presses,
         };
+        view.resolve_reports(window, cx);
         view.start(window, cx);
         view
+    }
+
+    fn resolve_reports(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let resolved = save_off_thread(|| report::reports_dir(|name| std::env::var_os(name)));
+        cx.spawn_in(window, async move |this, cx| {
+            let resolved = resolved.await;
+            this.update(cx, |view, cx| {
+                view.reports_loading = false;
+                match resolved {
+                    Ok(path) => {
+                        view.reports = path;
+                        view.report_notice = None;
+                    }
+                    Err(error) => {
+                        view.report_notice =
+                            Some((format!("Reports unavailable: {error:#}"), true));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Starts a browser for the workspace. Opening loads its URL once per device.
@@ -468,6 +498,13 @@ impl LiveView {
                     cx.notify();
                 }
             }
+        }
+        if matches!(status.runtime, RuntimeState::Stopped { .. }) && self.report.take().is_some() {
+            self.report_notice = Some((
+                "Not saved: the runtime stopped before returning the screenshot.".into(),
+                true,
+            ));
+            cx.notify();
         }
         if status != self.status {
             let former_caret = self
@@ -1159,7 +1196,12 @@ impl LiveView {
         let Some(device) = self.selected else {
             return;
         };
-        if self.report.is_some() {
+        if self.report.is_some() || self.saving_report || !self.lifecycle.is_live() {
+            return;
+        }
+        if self.reports_loading {
+            self.report_notice = Some(("Locating the reports directory…".into(), false));
+            cx.notify();
             return;
         }
         if self.reports.is_none() {
@@ -1171,18 +1213,25 @@ impl LiveView {
             cx.notify();
             return;
         }
-        let Some(status) = self.status.devices.get(device) else {
+        let Some(session) = self.session.as_ref() else {
+            self.report_notice = Some(("Not saved: the runtime is not running.".into(), true));
+            cx.notify();
             return;
         };
+        let Some((status, console)) = session.console_snapshot(device) else {
+            return;
+        };
+        let runtime = session.status().runtime;
         self.next_report += 1;
+        let expected_revision = status.page_revision;
         let report = PendingReport {
             device,
             token: self.next_report,
-            console: self.console.clone(),
+            console,
             errors: status.console_errors,
             warnings: status.console_warnings,
             url: status.url.clone(),
-            browser: match &self.status.runtime {
+            browser: match &runtime {
                 RuntimeState::Running { product, protocol } => {
                     Some((product.clone(), protocol.clone()))
                 }
@@ -1191,7 +1240,11 @@ impl LiveView {
             saved: SystemTime::now(),
         };
         let token = report.token;
-        if self.send(Command::Screenshot { device, token }) {
+        if self.send(Command::Screenshot {
+            device,
+            token,
+            expected_revision,
+        }) {
             self.report = Some(report);
             self.report_notice = Some(("Taking the screenshot…".into(), false));
         } else {
@@ -1220,32 +1273,41 @@ impl LiveView {
             .iter()
             .find(|session| session.id == device.session)
             .map_or_else(|| device.session.clone(), |session| session.name.clone());
-        let text = report::report_text(&report::Report {
-            device: &device,
-            session: &session,
-            url: &pending.url,
-            browser: pending
-                .browser
-                .as_ref()
-                .map(|(product, protocol)| (product.as_str(), protocol.as_str())),
-            console: &pending.console,
-            errors: pending.errors,
-            warnings: pending.warnings,
-            saved: pending.saved,
-            screenshot: (screenshot.width, screenshot.height),
-        });
+        if !self.lifecycle.begin_save() {
+            self.report_notice = Some(("Not saved: the window is closing.".into(), true));
+            cx.notify();
+            return;
+        }
+        self.saving_report = true;
         self.report_notice = Some(("Saving the report…".into(), false));
-        let saved = pending.saved;
-        let written = cx.background_executor().spawn(async move {
-            report::write_report(&root, &device.id, saved, &screenshot.png, &text)
+        let written = save_off_thread(move || {
+            let text = report::report_text(&report::Report {
+                device: &device,
+                session: &session,
+                url: &pending.url,
+                browser: pending
+                    .browser
+                    .as_ref()
+                    .map(|(product, protocol)| (product.as_str(), protocol.as_str())),
+                console: &pending.console,
+                errors: pending.errors,
+                warnings: pending.warnings,
+                saved: pending.saved,
+                screenshot: (screenshot.width, screenshot.height),
+            });
+            report::write_report(&root, &device.id, pending.saved, &screenshot.png, &text)
         });
         cx.spawn_in(window, async move |this, cx| {
-            let written = written.await;
-            this.update(cx, |view, cx| {
+            let written = written.await.and_then(|result| result.map_err(Into::into));
+            this.update_in(cx, |view, window, cx| {
+                view.saving_report = false;
                 view.report_notice = Some(match written {
                     Ok(folder) => (format!("Saved to {}", folder.display()), false),
                     Err(error) => (format!("Not saved: {error}"), true),
                 });
+                if view.lifecycle.save_finished() {
+                    window.remove_window();
+                }
                 cx.notify();
             })
             .ok();
@@ -1254,10 +1316,13 @@ impl LiveView {
         cx.notify();
     }
 
-    /// A new or stopped runtime answers no earlier screenshot request.
+    /// Cancels a report still awaiting its screenshot when leaving a runtime.
     fn forget_report(&mut self) {
         if self.report.take().is_some() {
-            self.report_notice = None;
+            self.report_notice = Some((
+                "Not saved: the screenshot was cancelled before writing.".into(),
+                true,
+            ));
         }
     }
 
@@ -1393,6 +1458,8 @@ impl LiveView {
     /// the last window closes, so keep it until both cleanup and saves finish.
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.invalidate_ime();
+        // Stop can cancel a capture; a write already started must finish.
+        self.forget_report();
         self.save_window_size(window, cx);
         let request = self.lifecycle.begin_close(self.session.is_some());
         if request == CloseRequest::Now {
@@ -2492,6 +2559,12 @@ impl LiveView {
     /// The selected device's console (ADR 0023), newest first. It lives in
     /// memory for this runtime; Clear empties it for the device.
     fn console_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let can_save_report = self.reports.is_some()
+            && !self.reports_loading
+            && self.report.is_none()
+            && !self.saving_report
+            && self.lifecycle.is_live()
+            && matches!(self.status.runtime, RuntimeState::Running { .. });
         let panel = div()
             .id("console-panel")
             .w(px(340.))
@@ -2555,15 +2628,27 @@ impl LiveView {
                             .child(
                                 div()
                                     .id("console-save-report")
-                                    .cursor_pointer()
+                                    .w(px(100.))
+                                    .flex_none()
+                                    .text_center()
                                     .rounded_md()
-                                    .bg(rgb(ACCENT))
-                                    .text_color(rgb(BG))
+                                    .bg(rgb(if can_save_report { ACCENT } else { RAISED }))
+                                    .text_color(rgb(if can_save_report { BG } else { MUTED }))
                                     .px_2()
                                     .py_1()
                                     .text_sm()
-                                    .child("Save report")
-                                    .on_click(cx.listener(|view, _, _, cx| view.save_report(cx))),
+                                    .child(if self.saving_report {
+                                        "Saving…"
+                                    } else if self.report.is_some() {
+                                        "Taking…"
+                                    } else {
+                                        "Save report"
+                                    })
+                                    .when(can_save_report, |button| {
+                                        button.cursor_pointer().on_click(
+                                            cx.listener(|view, _, _, cx| view.save_report(cx)),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
@@ -2589,6 +2674,9 @@ impl LiveView {
                     }))
                     .child(match (&self.report_notice, &self.reports) {
                         (Some((notice, _)), _) => notice.clone(),
+                        (None, _) if self.reports_loading => {
+                            "Locating the reports directory…".into()
+                        }
                         (None, Some(dir)) => format!(
                             "Save report writes a screenshot and a redacted report to {}.",
                             dir.display()
@@ -3110,7 +3198,8 @@ fn frame_device<'a>(
     Some(device)
 }
 
-/// At most two writes run: one workspace snapshot and the close-time state.
+/// At most three file operations run: one workspace save, report operation
+/// (directory discovery or writing) and close-time state save.
 /// Give blocking filesystem calls their own threads so they cannot occupy
 /// GPUI's finite background pool and delay frame decoding or browser teardown,
 /// even on a single-CPU machine. Spawn failures and panics complete the waiter.

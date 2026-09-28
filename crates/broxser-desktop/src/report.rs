@@ -6,13 +6,14 @@ use broxser_core::{Device, redact_text, redact_url};
 use broxser_engine::{ConsoleEntry, ConsoleKind, ConsoleLevel, ConsoleScope};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCREENSHOT_FILE: &str = "screenshot.png";
 pub(crate) const REPORT_FILE: &str = "report.md";
+const MAX_USER_DIRS_BYTES: usize = 64 * 1024;
 
 /// What a report says about one device.
 pub(crate) struct Report<'a> {
@@ -44,8 +45,15 @@ pub(crate) fn reports_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<Path
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .unwrap_or_else(|| home.join(".config"));
-    let downloads = fs::read_to_string(config.join("user-dirs.dirs"))
+    let downloads = fs::File::open(config.join("user-dirs.dirs"))
         .ok()
+        .and_then(|file| {
+            let mut dirs = String::new();
+            file.take((MAX_USER_DIRS_BYTES + 1) as u64)
+                .read_to_string(&mut dirs)
+                .ok()?;
+            (dirs.len() <= MAX_USER_DIRS_BYTES).then_some(dirs)
+        })
         .and_then(|dirs| download_dir(&dirs, &home))
         .unwrap_or_else(|| home.join("Downloads"));
     Some(downloads.join("Broxser"))
@@ -57,9 +65,39 @@ fn download_dir(dirs: &str, home: &Path) -> Option<PathBuf> {
     let value = dirs
         .lines()
         .find_map(|line| line.trim().strip_prefix("XDG_DOWNLOAD_DIR="))?
-        .trim()
-        .trim_matches('"');
-    let dir = match value.strip_prefix("$HOME") {
+        .trim();
+    let expand_home = value.starts_with("\"$HOME/")
+        || value.starts_with("\"$HOME\"")
+        || value.starts_with("$HOME/")
+        || value == "$HOME";
+    // xdg-user-dirs writes double-quoted shell strings. Decode their escapes,
+    // without evaluating commands or expanding arbitrary environment variables.
+    let value = if let Some(quoted) = value.strip_prefix('"') {
+        let mut decoded = String::new();
+        let mut chars = quoted.char_indices();
+        let end = loop {
+            let (index, c) = chars.next()?;
+            match c {
+                '"' => break index + 1,
+                '\\' => {
+                    let (_, escaped) = chars.next()?;
+                    if !matches!(escaped, '"' | '\\' | '$' | '`') {
+                        decoded.push('\\');
+                    }
+                    decoded.push(escaped);
+                }
+                _ => decoded.push(c),
+            }
+        };
+        let tail = quoted[end..].trim_start();
+        if !tail.is_empty() && !tail.starts_with('#') {
+            return None;
+        }
+        decoded
+    } else {
+        value.to_owned()
+    };
+    let dir = match value.strip_prefix("$HOME").filter(|_| expand_home) {
         Some(rest) => home.join(rest.trim_start_matches('/')),
         None => PathBuf::from(value),
     };
@@ -118,20 +156,22 @@ pub(crate) fn report_text(report: &Report) -> String {
     if device.touch {
         traits.push("touch".into());
     }
-    let page = redact_url(report.url);
+    let page = redact_text(&redact_url(report.url));
     let mut text = format!(
         "# Broxser bug report\n\n\
          - Device: {} ({})\n\
          - Session: {}\n\
          - Page: {}\n",
-        device.name,
+        inline_code(&device.name),
         traits.join(", "),
-        report.session,
-        if page.is_empty() { "none" } else { &page },
+        inline_code(report.session),
+        inline_code(if page.is_empty() { "none" } else { &page }),
     );
     match report.browser {
         Some((product, protocol)) => text.push_str(&format!(
-            "- Browser: {product}, CDP {protocol}, headless Helium (ADR 0019)\n"
+            "- Browser: {}, CDP {}, headless browser (ADR 0019)\n",
+            inline_code(product),
+            inline_code(protocol),
         )),
         None => text.push_str("- Browser: not running\n"),
     }
@@ -157,11 +197,45 @@ pub(crate) fn report_text(report: &Report) -> String {
         text.push_str("No console messages.\n");
     }
     for entry in report.console {
-        text.push_str("    ");
-        text.push_str(&console_line(entry));
-        text.push('\n');
+        // Usually engine entries have one line, but keep every line as code if
+        // a caller supplies multiline text or a location with line controls.
+        for line in console_line(entry).split(['\n', '\r', '\u{2028}', '\u{2029}']) {
+            text.push_str("    ");
+            text.push_str(line);
+            text.push('\n');
+        }
     }
     text
+}
+
+/// Show untrusted metadata literally, including Markdown, backticks and line
+/// controls. A delimiter longer than any backtick run cannot close the span.
+fn inline_code(value: &str) -> String {
+    if value.is_empty() {
+        return "`unknown`".into();
+    }
+    let mut shown = String::new();
+    let mut longest = 0;
+    let mut run = 0;
+    for c in value.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(longest + 1);
+    if shown.starts_with(['`', ' ']) || shown.ends_with(['`', ' ']) {
+        format!("{fence} {shown} {fence}")
+    } else {
+        format!("{fence}{shown}{fence}")
+    }
 }
 
 /// One console entry on one line: level, what reported it, text, location.
@@ -172,7 +246,7 @@ fn console_line(entry: &ConsoleEntry) -> String {
         ConsoleLevel::Info => "Info",
     };
     if entry.kind == ConsoleKind::Navigation {
-        return format!("{level:<8}Navigated to {}", entry.location);
+        return format!("{level:<8}Navigated to {}", redact_text(&entry.location));
     }
     let mut tags = Vec::new();
     match entry.kind {
@@ -197,7 +271,7 @@ fn console_line(entry: &ConsoleEntry) -> String {
     line.push_str(&redact_text(&entry.text));
     if !entry.location.is_empty() {
         line.push_str(" · ");
-        line.push_str(&entry.location);
+        line.push_str(&redact_text(&entry.location));
     }
     line
 }
@@ -311,10 +385,10 @@ mod tests {
             screenshot: (780, 1688),
         });
         for wanted in [
-            "- Device: Phone (390 × 844 CSS px at 2×, mobile, touch)",
-            "- Session: Guest",
-            "- Page: https://app.test/cart\n",
-            "- Browser: Chrome/154.0.8037.57, CDP 1.3",
+            "- Device: `Phone` (390 × 844 CSS px at 2×, mobile, touch)",
+            "- Session: `Guest`",
+            "- Page: `https://app.test/cart`\n",
+            "- Browser: `Chrome/154.0.8037.57`, CDP `1.3`, headless browser (ADR 0019)",
             "- Saved: 2026-09-26 22:40:12 UTC",
             "- Screenshot: screenshot.png, 780 × 1688 px",
             "## Console: 3 error(s), 1 warning(s), oldest first",
@@ -327,6 +401,90 @@ mod tests {
         for secret in ["S3CR3T", "step=2", "user:pw", "4111", jwt] {
             assert!(!text.contains(secret), "{secret} leaked:\n{text}");
         }
+    }
+
+    #[test]
+    fn report_metadata_and_every_console_line_are_literal_markdown() {
+        let mut device = phone();
+        device.name = "![x](https://attacker.test/pixel) `device`".into();
+        let console = [entry(
+            ConsoleLevel::Warning,
+            ConsoleKind::Console,
+            "first\n\n![x](https://attacker.test/console)\r# heading\u{2028}<img src='https://attacker.test/image'>",
+            "https://app.test/path\n[link](https://attacker.test/location)",
+        )];
+        let text = report_text(&Report {
+            device: &device,
+            session: "`![session](https://attacker.test/session)`\nnext",
+            url: "https://app.test/![page](https://attacker.test/page)?secret=removed",
+            browser: Some(("Chrome/`build`\r\n<img>", "1.3\u{2029}next")),
+            console: &console,
+            errors: 0,
+            warnings: 1,
+            saved: UNIX_EPOCH,
+            screenshot: (780, 1688),
+        });
+        for wanted in [
+            "- Device: `` ![x](https://attacker.test/pixel) `device` `` (",
+            "- Session: `` `![session](https://attacker.test/session)`\\nnext ``\n",
+            "- Page: `https://app.test/![page](https://attacker.test/page)`\n",
+            "- Browser: ``Chrome/`build`\\r\\n<img>``, CDP `1.3\\u{2029}next`",
+        ] {
+            assert!(text.contains(wanted), "{wanted:?} missing in:\n{text}");
+        }
+        let console_text = text.split_once("oldest first\n\n").unwrap().1;
+        assert!(console_text.lines().all(|line| line.starts_with("    ")));
+        assert!(console_text.contains("    ![x](https://attacker.test/console)\n"));
+        assert!(!text.contains("secret=removed"));
+        assert_eq!(inline_code("normal"), "`normal`");
+        assert_eq!(inline_code(""), "`unknown`");
+        assert_eq!(inline_code("````"), "````` ```` `````");
+        assert_eq!(inline_code("<tag>\tvalue"), "`<tag>\\tvalue`");
+    }
+
+    #[test]
+    fn report_page_and_console_locations_redact_tokens_in_url_paths() {
+        let device = phone();
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl";
+        let page = format!("https://app.test/reset/{jwt}?secret=query");
+        let location = format!("https://app.test/source/{jwt}:10:3");
+        let console = [
+            entry(
+                ConsoleLevel::Info,
+                ConsoleKind::Navigation,
+                "Navigated",
+                &page,
+            ),
+            entry(
+                ConsoleLevel::Error,
+                ConsoleKind::Exception,
+                "failed",
+                &location,
+            ),
+        ];
+        let text = report_text(&Report {
+            device: &device,
+            session: "Guest",
+            url: &page,
+            browser: None,
+            console: &console,
+            errors: 1,
+            warnings: 0,
+            saved: UNIX_EPOCH,
+            screenshot: (780, 1688),
+        });
+        for wanted in [
+            "- Page: `https://app.test/reset/[token removed]`\n",
+            "    Info    Navigated to https://app.test/reset/[token removed]\n",
+            "    Error   [uncaught] failed · https://app.test/source/[token removed]:10:3\n",
+        ] {
+            assert!(text.contains(wanted), "{wanted:?} missing in:\n{text}");
+        }
+        assert!(!text.contains(jwt));
+        assert!(!text.contains("secret=query"));
+        // Export sanitization does not change the console snapshot itself.
+        assert_eq!(console[0].location, page);
+        assert_eq!(console[1].location, location);
     }
 
     #[test]
@@ -397,5 +555,76 @@ mod tests {
             Some(PathBuf::from("/home/me/Downloads/Broxser"))
         );
         assert_eq!(reports_dir(vars(vec![])), None);
+    }
+
+    #[test]
+    fn download_directory_decodes_xdg_quoted_paths_without_shell_evaluation() {
+        let home = Path::new("/home/me");
+        for (dirs, path) in [
+            (
+                r#"XDG_DOWNLOAD_DIR="$HOME/Down loads""#,
+                "/home/me/Down loads",
+            ),
+            (
+                r#"XDG_DOWNLOAD_DIR="$HOME/Down\"loads""#,
+                "/home/me/Down\"loads",
+            ),
+            (
+                r#"XDG_DOWNLOAD_DIR="$HOME/Down\\loads""#,
+                "/home/me/Down\\loads",
+            ),
+            (
+                r#"XDG_DOWNLOAD_DIR="/tmp/\$HOME/\`literal\`" # comment"#,
+                "/tmp/$HOME/`literal`",
+            ),
+            (r#"XDG_DOWNLOAD_DIR="/tmp/Down\loads""#, "/tmp/Down\\loads"),
+            (r#"XDG_DOWNLOAD_DIR="/tmp/$(command)""#, "/tmp/$(command)"),
+        ] {
+            assert_eq!(
+                download_dir(dirs, home),
+                Some(PathBuf::from(path)),
+                "{dirs}"
+            );
+        }
+        for dirs in [
+            r#"XDG_DOWNLOAD_DIR="$HOME""#,
+            r#"XDG_DOWNLOAD_DIR="$HOMELESS/Downloads""#,
+            r#"XDG_DOWNLOAD_DIR="\$HOME/Downloads""#,
+            r#"XDG_DOWNLOAD_DIR="$HOME/unfinished"#,
+            r#"XDG_DOWNLOAD_DIR="/tmp/Downloads"; command"#,
+        ] {
+            assert_eq!(download_dir(dirs, home), None, "{dirs}");
+        }
+    }
+
+    #[test]
+    fn oversized_user_directories_config_falls_back_without_affecting_override() {
+        let config = tempfile::tempdir().unwrap();
+        let vars = |name: &str| match name {
+            "HOME" => Some(OsString::from("/home/me")),
+            "XDG_CONFIG_HOME" => Some(config.path().as_os_str().to_owned()),
+            _ => None,
+        };
+        let mut dirs = "XDG_DOWNLOAD_DIR=\"$HOME/Unduhan\"\n#".to_owned();
+        dirs.push_str(&"x".repeat(MAX_USER_DIRS_BYTES - dirs.len()));
+        fs::write(config.path().join("user-dirs.dirs"), &dirs).unwrap();
+        assert_eq!(
+            reports_dir(vars),
+            Some(PathBuf::from("/home/me/Unduhan/Broxser"))
+        );
+        dirs.push('x');
+        fs::write(config.path().join("user-dirs.dirs"), &dirs).unwrap();
+        assert_eq!(
+            reports_dir(vars),
+            Some(PathBuf::from("/home/me/Downloads/Broxser"))
+        );
+        assert_eq!(
+            reports_dir(|name| if name == "BROXSER_REPORT_DIR" {
+                Some(OsString::from("/tmp/reports"))
+            } else {
+                vars(name)
+            }),
+            Some(PathBuf::from("/tmp/reports"))
+        );
     }
 }

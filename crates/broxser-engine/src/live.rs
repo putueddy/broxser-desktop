@@ -30,6 +30,7 @@ const LIVE_POLL: Duration = Duration::from_millis(8);
 /// Release debugger references in batches rather than once per console call.
 const CONSOLE_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SCREENSHOT_BYTES: usize = 64 * 1024 * 1024;
 /// Input events, including the coalesced move and wheel in flight, that one
 /// page may leave unanswered before Broxser reports it as not responding.
 const MAX_UNANSWERED_INPUT: usize = 32;
@@ -149,6 +150,7 @@ impl LiveSession {
                     .collect(),
             ),
             screenshots: Mutex::new(vec![None; workspace.devices.len()]),
+            screenshot_requests: Mutex::new(ScreenshotRequests::default()),
             notify: Box::new(notify),
         });
         let cancel = options.cancel.clone();
@@ -172,6 +174,20 @@ impl LiveSession {
     pub fn send(&self, command: Command) -> bool {
         if let Command::ClearConsole { device } = command {
             return self.shared.console(device, ConsoleLog::clear);
+        }
+        if let Command::Screenshot { device, token, .. } = command {
+            let mut requests = lock(&self.shared.screenshot_requests);
+            if requests.stopped
+                || device >= lock(&self.shared.screenshots).len()
+                || requests.tokens.len() >= COMMAND_QUEUE + MAX_DEVICES
+            {
+                return false;
+            }
+            if self.commands.try_send(command).is_err() {
+                return false;
+            }
+            requests.tokens.push_back((device, token));
+            return true;
         }
         self.commands.try_send(command).is_ok()
     }
@@ -198,6 +214,16 @@ impl LiveSession {
             .get(device)
             .map(ConsoleLog::entries)
             .unwrap_or_default()
+    }
+
+    /// One device's status and console at the same instant, for report exports.
+    pub fn console_snapshot(&self, device: usize) -> Option<(DeviceStatus, Vec<ConsoleEntry>)> {
+        let logs = lock(&self.shared.console);
+        let status = lock(&self.shared.status);
+        Some((
+            status.devices.get(device)?.clone(),
+            logs.get(device)?.entries(),
+        ))
     }
 
     /// True once the worker has stopped the browser and removed its profile.
@@ -283,6 +309,8 @@ pub struct DeviceStatus {
     /// Changes whenever the console of this device changes; read it with
     /// [`LiveSession::console`].
     pub console_revision: u64,
+    /// Changes when navigation or page lifecycle invalidates a report snapshot.
+    pub page_revision: u64,
 }
 
 /// A window the page opened and Broxser closed as soon as the browser
@@ -326,6 +354,9 @@ fn parse_screenshot(response: Value) -> ScreenshotResult {
         .get("data")
         .and_then(Value::as_str)
         .ok_or("The browser's screenshot reply had no image.")?;
+    if data.len() > MAX_SCREENSHOT_BYTES.div_ceil(3) * 4 {
+        return Err("The browser's screenshot exceeded the image byte limit.".into());
+    }
     let png = base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|_| "The browser's screenshot was not valid base64.".to_owned())?;
@@ -334,6 +365,26 @@ fn parse_screenshot(response: Value) -> ScreenshotResult {
     }
     let (width, height) =
         crate::capture::png_dimensions(&png).map_err(|error| format!("{error:#}"))?;
+    if png.len() > MAX_SCREENSHOT_BYTES
+        || width > 16_384
+        || height > 16_384
+        || u64::from(width) * u64::from(height) > broxser_core::MAX_PHYSICAL_PIXELS as u64
+    {
+        return Err("The browser's screenshot exceeded the image size limit.".into());
+    }
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(&png));
+    decoder.set_limits(png::Limits {
+        bytes: MAX_SCREENSHOT_BYTES,
+    });
+    decoder.ignore_checksums(false);
+    let invalid = |error| format!("The browser's screenshot was not a complete valid PNG: {error}");
+    let mut reader = decoder.read_info().map_err(invalid)?;
+    if reader.info().animation_control.is_some() {
+        return Err("The browser's screenshot was an animated PNG.".into());
+    }
+    while reader.next_row().map_err(invalid)?.is_some() {}
+    reader.finish().map_err(invalid)?;
+    drop(reader);
     Ok(Screenshot { png, width, height })
 }
 
@@ -486,6 +537,7 @@ pub enum Command {
     Screenshot {
         device: usize,
         token: u64,
+        expected_revision: u64,
     },
     /// Crashes a renderer so tests can check crash reporting and recovery.
     #[cfg(test)]
@@ -775,7 +827,14 @@ struct Shared {
     console: Mutex<Vec<ConsoleLog>>,
     /// Per device: the latest screenshot result and its token (ADR 0024).
     screenshots: Mutex<Vec<Option<(u64, ScreenshotResult)>>>,
+    screenshot_requests: Mutex<ScreenshotRequests>,
     notify: Box<dyn Fn() + Send + Sync>,
+}
+
+#[derive(Default)]
+struct ScreenshotRequests {
+    stopped: bool,
+    tokens: VecDeque<(usize, u64)>,
 }
 
 impl Shared {
@@ -794,10 +853,28 @@ impl Shared {
 
     /// Publishes a screenshot result for the UI to take.
     fn screenshot(&self, index: usize, token: u64, result: ScreenshotResult) {
+        lock(&self.screenshot_requests)
+            .tokens
+            .retain(|request| *request != (index, token));
         if let Some(slot) = lock(&self.screenshots).get_mut(index) {
             *slot = Some((token, result));
         }
         (self.notify)();
+    }
+
+    fn finish_screenshots(&self) {
+        let tokens = {
+            let mut requests = lock(&self.screenshot_requests);
+            requests.stopped = true;
+            std::mem::take(&mut requests.tokens)
+        };
+        for (device, token) in tokens {
+            self.screenshot(
+                device,
+                token,
+                Err("The browser runtime stopped before returning the screenshot.".into()),
+            );
+        }
     }
 
     /// Changes the console of `device` and publishes its counts.
@@ -844,9 +921,11 @@ fn run_worker(
     lock(&shared.frames)
         .iter_mut()
         .for_each(|frame| *frame = None);
+    shared.finish_screenshots();
     shared.update(|status| {
         status.runtime = RuntimeState::Stopped { error };
         for device in &mut status.devices {
+            device.page_revision = device.page_revision.wrapping_add(1);
             device.loading = false;
             device.streaming = false;
             // No browser is left to show a dialog or take its answer.
@@ -960,6 +1039,8 @@ struct LiveDevice {
     /// Increments on every committed cross-document navigation.
     generation: u64,
     link_context: Option<i64>,
+    page_revision: u64,
+    page_changing: bool,
     ime_context: Option<i64>,
     /// The page's own main-frame context. Console entries from other
     /// contexts of the page session come from its same-process frames.
@@ -1208,6 +1289,7 @@ enum Pending {
     Screenshot {
         device: usize,
         token: u64,
+        expected_revision: u64,
     },
 }
 
@@ -1380,6 +1462,8 @@ impl<'a> Controller<'a> {
                 console_active: true,
                 limit: (physical(device.width), physical(device.height)),
                 generation: 0,
+                page_revision: 0,
+                page_changing: false,
                 link_context: None,
                 ime_context: None,
                 main_context: None,
@@ -1554,6 +1638,12 @@ impl<'a> Controller<'a> {
                     self.start_stream(device)?;
                     self.refresh_ime(device)?;
                 } else {
+                    let revision = self.change_page(
+                        device,
+                        "The device was hidden while its screenshot was pending.",
+                    );
+                    self.shared
+                        .device(device, |status| status.page_revision = revision);
                     self.cancel_touch(device)?;
                     self.clear_ime(device, true)?;
                     self.devices[device].visible = false;
@@ -1598,8 +1688,12 @@ impl<'a> Controller<'a> {
                 }
             }
             Command::SetSync(settings) => self.set_sync(settings)?,
-            Command::Screenshot { device, token } if device < count => {
-                self.screenshot(device, token)?;
+            Command::Screenshot {
+                device,
+                token,
+                expected_revision,
+            } if device < count => {
+                self.screenshot(device, token, expected_revision)?;
             }
             #[cfg(test)]
             Command::CrashForTest { device } if device < count => {
@@ -1642,6 +1736,11 @@ impl<'a> Controller<'a> {
                 .device(index, |device| device.error = Some(DIALOG_OPEN.to_owned()));
             return Ok(false);
         }
+        let revision = self.change_page(
+            index,
+            "The page navigated while its screenshot was pending.",
+        );
+        self.devices[index].page_changing = true;
         self.cancel_touch(index)?;
         self.clear_ime(index, true)?;
         // Input held for the current document never reaches the next one.
@@ -1661,6 +1760,7 @@ impl<'a> Controller<'a> {
         let unresponsive = self.devices[index].unresponsive;
         let incomplete = self.devices[index].iframe_activity_incomplete;
         self.shared.device(index, |device| {
+            device.page_revision = revision;
             device.loading = true;
             // Reload only acknowledges that it started, so it cannot confirm
             // recovery from the current error page. Keep the last confirmed
@@ -1686,14 +1786,20 @@ impl<'a> Controller<'a> {
     /// Asks for a PNG of device `index` for a bug report (ADR 0024). A hidden
     /// device, a page frozen by its dialog and a second request while one is
     /// in flight are answered at once with the reason.
-    fn screenshot(&mut self, index: usize, token: u64) -> Result<()> {
+    fn screenshot(&mut self, index: usize, token: u64, expected_revision: u64) -> Result<()> {
         let device = &self.devices[index];
         let refused = if !device.visible {
             Some("Show the device to take its screenshot.")
         } else if device.dialog.is_some() {
             Some("Answer the page's dialog first; the page is frozen until then.")
+        } else if device.page_revision != expected_revision {
+            Some("The page changed before the screenshot request; save a new report explicitly.")
         } else if device.screenshot.is_some() {
             Some("A screenshot of this device is already being taken.")
+        } else if device.page_changing {
+            Some("Wait for the page navigation to finish before taking its screenshot.")
+        } else if !device.console_active {
+            Some("The page is unavailable; reload or restart before taking its screenshot.")
         } else {
             None
         };
@@ -1712,10 +1818,21 @@ impl<'a> Controller<'a> {
             Pending::Screenshot {
                 device: index,
                 token,
+                expected_revision,
             },
         )?;
         self.devices[index].screenshot = Some((id, token, Instant::now() + self.limits.command));
         Ok(())
+    }
+
+    fn change_page(&mut self, index: usize, reason: &str) -> u64 {
+        self.devices[index].page_revision = self.devices[index].page_revision.wrapping_add(1);
+        if let Some((id, token, _)) = self.devices[index].screenshot.take() {
+            self.pending.remove(&id);
+            self.cdp.abandon(id);
+            self.shared.screenshot(index, token, Err(reason.into()));
+        }
+        self.devices[index].page_revision
     }
 
     fn track(&mut self, id: u64, pending: Pending) -> Result<()> {
@@ -1915,6 +2032,8 @@ impl<'a> Controller<'a> {
         let stayed = dialog.is_some_and(|dialog| {
             dialog.kind == DialogKind::BeforeUnload && dialog.for_navigation && !accepted
         });
+        let page_stayed =
+            dialog.is_some_and(|dialog| dialog.kind == DialogKind::BeforeUnload && !accepted);
         if dialog.is_some() {
             let now = Instant::now();
             let device = &mut self.devices[index];
@@ -1926,10 +2045,16 @@ impl<'a> Controller<'a> {
         if stayed {
             self.forget_navigation(index);
         }
+        let stayed_on_page = page_stayed && self.devices[index].navigation.is_none();
+        if stayed_on_page {
+            // Staying may cancel a page-initiated navigation too. Keep a
+            // different Broxser navigation blocked until its own terminal event.
+            self.devices[index].page_changing = false;
+        }
         self.shared.device(index, |status| {
             status.dialog = None;
             clear_dialog_error(status);
-            if stayed {
+            if stayed_on_page {
                 status.loading = false;
             }
         });
@@ -2012,6 +2137,7 @@ impl<'a> Controller<'a> {
                         });
                 self.forget_navigation(index);
                 if !settled_before_reply {
+                    self.devices[index].page_changing = false;
                     let session = self.devices[index].session.clone();
                     // Like the Stop button: the page keeps its current document.
                     self.cdp
@@ -2663,6 +2789,10 @@ impl<'a> Controller<'a> {
             };
             match self.pending.remove(&id) {
                 Some(Pending::Navigate { device }) => {
+                    let mut ended_without_commit = response
+                        .pointer("/result/isDownload")
+                        .and_then(Value::as_bool)
+                        == Some(true);
                     let mut error = match parse_response(response, "Page.navigate") {
                         // The address is a download. The browser refused it and
                         // the device reports it instead of an error (ADR 0016).
@@ -2695,6 +2825,7 @@ impl<'a> Controller<'a> {
                         // the user stayed; the browser can report that before the
                         // dialog's closing.
                         error = None;
+                        ended_without_commit = true;
                         self.shared.device(device, |status| status.loading = false);
                     }
                     let navigation = &mut self.devices[device].navigation;
@@ -2707,6 +2838,12 @@ impl<'a> Controller<'a> {
                             started.command = None;
                         }
                         _ => *navigation = None,
+                    }
+                    if !settled_before_reply && (ended_without_commit || error.is_some()) {
+                        // Downloads, a refused navigation and an explicit Stop
+                        // leave the current document available without a new
+                        // commit or an extra frameStoppedLoading notification.
+                        self.devices[device].page_changing = false;
                     }
                     if let Some(error) = error.filter(|_| !settled_before_reply) {
                         self.shared.device(device, |status| {
@@ -2734,9 +2871,17 @@ impl<'a> Controller<'a> {
                     self.answered(device);
                     self.ime_target_read(device, id, response)?;
                 }
-                Some(Pending::Screenshot { device, token }) => {
+                Some(Pending::Screenshot {
+                    device,
+                    token,
+                    expected_revision,
+                }) => {
                     self.devices[device].screenshot = None;
-                    let screenshot = parse_screenshot(response);
+                    let screenshot = if self.devices[device].page_revision == expected_revision {
+                        parse_screenshot(response)
+                    } else {
+                        Err("The page changed while its screenshot was pending.".into())
+                    };
                     self.shared.screenshot(device, token, screenshot);
                 }
                 Some(Pending::DialogAnswer { device, token }) => {
@@ -3521,6 +3666,10 @@ impl<'a> Controller<'a> {
                     Some(device.target_id.as_str()) == text("targetId")
                         || Some(device.session.as_str()) == text("sessionId")
                 }) {
+                    let revision = self.change_page(
+                        index,
+                        "The page became unavailable while its screenshot was pending.",
+                    );
                     self.forget_console_release(&self.devices[index].session.clone());
                     let crashed = event.method == "Target.targetCrashed";
                     // The renderer or the session that owed these answers is
@@ -3533,6 +3682,7 @@ impl<'a> Controller<'a> {
                     self.devices[index].console_active = false;
                     self.devices[index].dialog = None;
                     self.shared.device(index, |device| {
+                        device.page_revision = revision;
                         device.loading = false;
                         device.streaming = false;
                         device.dialog = None;
@@ -3761,6 +3911,15 @@ impl<'a> Controller<'a> {
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
                 let loading = event.method == "Page.frameStartedLoading";
+                let revision = if loading {
+                    self.change_page(
+                        index,
+                        "The page started loading while its screenshot was pending.",
+                    )
+                } else {
+                    self.devices[index].page_revision
+                };
+                self.devices[index].page_changing = loading;
                 if !loading {
                     let navigation = &mut self.devices[index].navigation;
                     let reload_started = navigation
@@ -3776,7 +3935,10 @@ impl<'a> Controller<'a> {
                         self.navigation_settled(index);
                     }
                 }
-                self.shared.device(index, |device| device.loading = loading);
+                self.shared.device(index, |device| {
+                    device.loading = loading;
+                    device.page_revision = revision;
+                });
             }
             "Page.frameRequestedNavigation"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
@@ -3786,6 +3948,13 @@ impl<'a> Controller<'a> {
                 // A new tab, a new window or a download leaves the page as it is.
                 let current_tab = text("disposition").is_none_or(|value| value == "currentTab");
                 if current_tab {
+                    let revision = self.change_page(
+                        index,
+                        "The page requested navigation while its screenshot was pending.",
+                    );
+                    self.devices[index].page_changing = true;
+                    self.shared
+                        .device(index, |status| status.page_revision = revision);
                     self.invalidate_touch(index);
                 }
                 let device = &mut self.devices[index];
@@ -3813,6 +3982,13 @@ impl<'a> Controller<'a> {
             "Page.frameStartedNavigating"
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
+                let revision = self.change_page(
+                    index,
+                    "The page started navigating while its screenshot was pending.",
+                );
+                self.devices[index].page_changing = true;
+                self.shared
+                    .device(index, |status| status.page_revision = revision);
                 self.invalidate_touch(index);
                 if let (Some(loader), Some(kind)) = (
                     text("loaderId").filter(|loader| !loader.is_empty()),
@@ -3884,6 +4060,11 @@ impl<'a> Controller<'a> {
                 if text("frameId") == Some(self.devices[index].target_id.as_str()) =>
             {
                 let url = text("url").unwrap_or_default().to_owned();
+                let revision = self.change_page(
+                    index,
+                    "The page address changed while its screenshot was pending.",
+                );
+                self.devices[index].page_changing = false;
                 let window = self.limits.link_follow;
                 let device = &mut self.devices[index];
                 device.requested_link = None;
@@ -3899,7 +4080,10 @@ impl<'a> Controller<'a> {
                     && device.link_intent.take().is_some_and(|intent| {
                         intent.generation == device.generation && intent.at.elapsed() <= window
                     });
-                self.shared.device(index, |device| device.url = url.clone());
+                self.shared.device(index, |device| {
+                    device.url = url.clone();
+                    device.page_revision = revision;
+                });
                 if self.sync.navigation && followed && self.devices[index].visible {
                     self.sync_navigation(index, url)?;
                 }
@@ -3921,6 +4105,11 @@ impl<'a> Controller<'a> {
                     field("url").unwrap_or_default(),
                     field("urlFragment").unwrap_or_default()
                 );
+                let revision = self.change_page(
+                    index,
+                    "The page committed a new document while its screenshot was pending.",
+                );
+                self.devices[index].page_changing = false;
                 // A new document answers input again; the old one's is moot,
                 // and so is a dialog of the old one. Its frames went with it.
                 self.forget_input(index);
@@ -3974,6 +4163,7 @@ impl<'a> Controller<'a> {
                 }
                 self.shared.device(index, |device| {
                     device.url = url;
+                    device.page_revision = revision;
                     let failed = device
                         .error
                         .as_deref()
@@ -3991,6 +4181,12 @@ impl<'a> Controller<'a> {
                 }
             }
             "Page.javascriptDialogOpening" => {
+                let revision = self.change_page(
+                    index,
+                    "The page opened a dialog while its screenshot was pending.",
+                );
+                self.shared
+                    .device(index, |status| status.page_revision = revision);
                 // Input sent during the dialog would be replayed after its
                 // answer. Retire the finger locally and cancel only before a
                 // fresh press once the page can receive input again.

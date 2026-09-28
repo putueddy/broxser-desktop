@@ -126,6 +126,11 @@ information of HTTP(S) addresses, JWT-shaped tokens and bearer credentials. That
 redaction is best effort: other secrets a page prints, and anything the
 screenshot shows, stay, and the report says so. Broxser never reads a report
 back, uploads or deletes it.
+Redaction recognizes IPv6/Unicode hosts and JWT-shaped path segments, and
+bearer credentials have no minimum length. Untrusted report metadata and console
+text render as literal code, including embedded Markdown/HTML. Screenshots are
+bound to the page revision behind the report snapshot; stale results are refused.
+Their complete PNG contents are checked within byte and pixel limits before export.
 
 Screenshots may contain private data. CLI exports remain in the specified output
 directory until the developer deletes them. Desktop previews use an owned temporary

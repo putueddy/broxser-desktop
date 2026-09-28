@@ -44,12 +44,25 @@ Constraints found while auditing:
   is hidden, the page's dialog is open, another screenshot is in flight, the
   reply is no PNG, or no reply came within the command limit. It is no page
   input, so it never makes a page "not responding".
+  The request names the page revision that supplied its metadata; navigation,
+  document/URL changes, hiding, dialogs and target loss invalidate a pending
+  capture instead of pairing another page's pixels with that metadata. A page
+  still navigating refuses capture; a failed/cancelled navigation permits a
+  fresh explicit request. Runtime exit completes pending requests with an error.
+  PNG validation checks the complete image, chunk checksums and IEND within
+  limits of 64 MiB encoded PNG data, 24 million pixels and 16,384 pixels per edge.
 - The desktop then writes a new folder `<date>-<time>-<device id>` with
   `screenshot.png` and `report.md` into the reports directory:
   `BROXSER_REPORT_DIR` if set (absolute), else `Broxser` in the XDG download
   directory (`user-dirs.dirs`), else `~/Downloads/Broxser`. Folders are mode
   0700 and files 0600; an existing name gets a number. Writing happens off the
   UI thread, and the panel shows the folder or the error.
+  Directory discovery also runs off the GUI thread; `user-dirs.dirs` is capped
+  at 64 KiB and quoted path escapes are decoded without evaluating shell code.
+  One report operation runs at a time. Dedicated file-I/O threads keep a slow
+  report from occupying the pool used for frame decoding and browser cleanup.
+  Close/Apply cancel a screenshot still awaiting its reply; an already-started
+  file write completes before the window closes, independently of browser cleanup.
 - `report.md` names the device (size, scale, mobile, touch), its session, the
   page, browser product and protocol, Broxser's version, the time in UTC and the
   screenshot size, then the device's console oldest first, as it was when the
@@ -57,7 +70,11 @@ Constraints found while auditing:
   text loses the query, fragment and user information of HTTP(S) addresses,
   JWT-shaped tokens and bearer credentials (`broxser-core::redact_text`); the
   report says that anything else the page printed remains and asks for review.
-  Console lines are indented, so a tracker shows them as code.
+  Recognition includes IPv6 and Unicode hosts, balanced brackets/parentheses,
+  short bearer credentials and JWT-shaped tokens in retained URL paths.
+  Device status/counts and console entries are read as one snapshot. Metadata
+  uses safe inline code spans and every console line is indented, so a tracker
+  renders untrusted Markdown and HTML literally.
 - **Retention**: nothing is written without the click. Broxser never reads a
   report back, sends it anywhere or deletes it; the files are the user's until
   the user deletes them. Nothing of a report goes to Broxser's output or logs.

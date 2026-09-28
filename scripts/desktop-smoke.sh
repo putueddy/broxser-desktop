@@ -1327,11 +1327,12 @@ if png[:8] != b"\x89PNG\r\n\x1a\n" or png[12:16] != b"IHDR":
     problems.append("the screenshot is no PNG")
 elif (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")) != (390, 844):
     problems.append("the screenshot is not 390 x 844")
-for wanted in ["- Device: Phone (390 × 844 CSS px at 1×, mobile, touch)", "smoke error on 390",
-               "/console.html\n", "failed at http://127.0.0.1:"]:
+for wanted in ["- Device: `Phone` (390 × 844 CSS px at 1×, mobile, touch)", "smoke error on 390",
+               "/console.html`\n", "failed at http://127.0.0.1:"]:
     if wanted not in report:
         problems.append(f"the report lacks {wanted!r}")
-for secret in ["smoke-secret", "smoke-fragment"]:
+for secret in ["smoke-secret", "smoke-fragment", "ipv6-secret", "unicode-secret",
+               "paren-secret", "short-secret", "eyJhbGciOiJIUzI1NiJ9"]:
     if secret in report:
         problems.append(f"the report holds {secret!r}")
 for path, mode in [(folder, 0o700), (os.path.join(folder, "report.md"), 0o600)]:

@@ -301,6 +301,12 @@ Save report (ADR 0024) mengirim `Command::Screenshot`; worker menjawab lewat
 bawah batas command dan tanpa dihitung sebagai input. Desktop menyusun
 `report.md` dengan redaksi dari `broxser-core` (`redact_url`, `redact_text`) dan
 menulis folder laporan di luar thread UI, hanya atas klik pengguna.
+Permintaan screenshot membawa revisi halaman dari snapshot metadata/console;
+perubahan halaman membatalkannya, dan runtime yang berhenti mengakhiri request
+dengan error. PNG diperiksa sampai akhir dengan batas ukuran. Resolusi direktori
+serta penulisan laporan memakai thread I/O tersendiri; Close menunggu penulisan
+yang sudah dimulai tanpa menunda cleanup browser. Metadata laporan ditampilkan
+sebagai kode literal, dan token JWT pada path URL juga disunting saat ekspor.
 Konfigurasi tidak memuat cookies, headers rahasia, token atau profil browser.
 Writer memakai file sementara di direktori yang sama dan rename; import versi baru
 memerlukan migrasi eksplisit dengan backup dan validasi. Saat ini hanya v1 tersedia;

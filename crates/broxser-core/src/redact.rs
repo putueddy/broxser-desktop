@@ -40,7 +40,10 @@ pub fn redact_text(text: &str) -> String {
     let mut rest = text;
     while !rest.is_empty() {
         if let Some(length) = url_length(rest) {
-            out.push_str(&redact_url(&rest[..length]));
+            // Query removal still keeps the path, which may itself contain a
+            // recognizable token. Scan that retained text without URL parsing
+            // so it cannot repeatedly recognize the same address.
+            out.push_str(&redact_tokens(&redact_url(&rest[..length])));
             rest = &rest[length..];
         } else if let Some(length) = jwt_length(rest) {
             out.push_str("[token removed]");
@@ -49,33 +52,78 @@ pub fn redact_text(text: &str) -> String {
             out.push_str("Bearer [token removed]");
             rest = &rest[length..];
         } else {
-            let c = rest.chars().next().unwrap();
-            out.push(c);
-            rest = &rest[c.len_utf8()..];
-            // Skip the rest of a word, so tokens are only found at its start.
-            if c.is_ascii_alphanumeric() {
-                let word = rest
-                    .find(|c: char| !c.is_ascii_alphanumeric())
-                    .unwrap_or(rest.len());
-                out.push_str(&rest[..word]);
-                rest = &rest[word..];
-            }
+            let length = ordinary_length(rest);
+            out.push_str(&rest[..length]);
+            rest = &rest[length..];
         }
     }
     out
 }
 
+/// A bounded token-only pass over retained address text. `redact_url` remains
+/// suitable for console locations in the UI, where paths are kept verbatim.
+fn redact_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(length) = jwt_length(rest) {
+            out.push_str("[token removed]");
+            rest = &rest[length..];
+        } else if let Some(length) = bearer_length(rest) {
+            out.push_str("Bearer [token removed]");
+            rest = &rest[length..];
+        } else {
+            let length = ordinary_length(rest);
+            out.push_str(&rest[..length]);
+            rest = &rest[length..];
+        }
+    }
+    out
+}
+
+/// Skip a whole ASCII word so token look-alikes within it are left alone.
+fn ordinary_length(text: &str) -> usize {
+    let c = text.chars().next().unwrap();
+    if c.is_ascii_alphanumeric() {
+        text.find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(text.len())
+    } else {
+        c.len_utf8()
+    }
+}
+
 /// Length of the HTTP(S) address at the start of `text`: it ends at
-/// whitespace, a quote, an angle bracket or a closing bracket.
+/// whitespace, a quote, an angle bracket or an unmatched closing bracket.
 fn url_length(text: &str) -> Option<usize> {
-    let lower = text.get(..8)?.to_ascii_lowercase();
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+    if !text
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        && !text
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
         return None;
     }
-    Some(
-        text.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']'))
-            .unwrap_or(text.len()),
-    )
+    // IPv6 hosts and paths can contain matched brackets or parentheses.
+    // Their closing delimiters belong to the address, unlike a delimiter
+    // closing a surrounding list or parenthesized sentence.
+    let mut brackets = 0;
+    let mut parentheses = 0;
+    for (index, c) in text.char_indices() {
+        if c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>') {
+            return Some(index);
+        }
+        match c {
+            '[' => brackets += 1,
+            ']' if brackets > 0 => brackets -= 1,
+            ']' => return Some(index),
+            '(' => parentheses += 1,
+            ')' if parentheses > 0 => parentheses -= 1,
+            ')' => return Some(index),
+            _ => {}
+        }
+    }
+    Some(text.len())
 }
 
 fn token_char(c: char) -> bool {
@@ -107,17 +155,23 @@ fn jwt_length(text: &str) -> Option<usize> {
     Some(length)
 }
 
-/// Length of `Bearer <credential>` at the start of `text`, for credentials of
-/// at least eight characters.
+/// Length of `Bearer <credential>` at the start of `text`. Credentials have
+/// no minimum length; whitespace may separate the scheme from the credential.
 fn bearer_length(text: &str) -> Option<usize> {
-    let prefix = text.get(..7)?;
-    if !prefix.eq_ignore_ascii_case("bearer ") {
+    if !text.get(..6)?.eq_ignore_ascii_case("bearer") {
         return None;
     }
-    let run = text[7..]
+    let space = text[6..]
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(text.len() - 6);
+    if space == 0 {
+        return None;
+    }
+    let start = 6 + space;
+    let run = text[start..]
         .find(|c: char| !(token_char(c) || matches!(c, '.' | '~' | '+' | '/' | '=')))
-        .unwrap_or(text.len() - 7);
-    (run >= 8).then_some(7 + run)
+        .unwrap_or(text.len() - start);
+    (run > 0).then_some(start + run)
 }
 
 #[cfg(test)]
@@ -155,7 +209,7 @@ mod tests {
         );
         assert_eq!(
             redact_text("Authorization: Bearer abc.def-ghi_jkl~mno and bearer short"),
-            "Authorization: Bearer [token removed] and bearer short"
+            "Authorization: Bearer [token removed] and Bearer [token removed]"
         );
         // Unsigned tokens count; look-alikes inside words and short parts do not.
         assert_eq!(
@@ -172,5 +226,88 @@ mod tests {
             assert_eq!(redact_text(kept), kept, "{kept}");
         }
         assert_eq!(redact_text("see HTTPS://Host/p?q=1"), "see HTTPS://Host/p");
+    }
+
+    #[test]
+    fn addresses_with_ipv6_and_unicode_hosts_are_redacted_in_surrounding_text() {
+        for (text, shown) in [
+            ("(http://[::1]/?token=SECRET)", "(http://[::1]/)"),
+            (
+                "[https://user:pw@[2001:db8::1]:8443/resource?token=abc123#secret]",
+                "[https://[2001:db8::1]:8443/resource]",
+            ),
+            (
+                "{\"url\":\"http://éxample.test/callback?token=abc123\",\"id\":42}",
+                "{\"url\":\"http://éxample.test/callback\",\"id\":42}",
+            ),
+            (
+                "http://例.test/道?key=SECRET next",
+                "http://例.test/道 next",
+            ),
+            ("<HTTPS://[::1]/p?q=secret>", "<HTTPS://[::1]/p>"),
+            ("http://[::1]/path", "http://[::1]/path"),
+            (
+                "(https://host/photo(1).png?token=SECRET)",
+                "(https://host/photo(1).png)",
+            ),
+            (
+                "[http://[::1]/nested(a(b)c)/file?q=SECRET] trailing",
+                "[http://[::1]/nested(a(b)c)/file] trailing",
+            ),
+        ] {
+            assert_eq!(redact_text(text), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn bearer_credentials_are_redacted_without_length_or_single_space_assumptions() {
+        for (text, shown) in [
+            (
+                "Authorization: Bearer s3cr3t",
+                "Authorization: Bearer [token removed]",
+            ),
+            ("(bearer  x)", "(Bearer [token removed])"),
+            (
+                "{\"auth\":\"BEARER\t a.b_~+/=\",\"ok\":true}",
+                "{\"auth\":\"Bearer [token removed]\",\"ok\":true}",
+            ),
+            ("Bearer\n\tabc, done", "Bearer [token removed], done"),
+        ] {
+            assert_eq!(redact_text(text), shown, "{text}");
+        }
+        for text in [
+            "Bearer",
+            "Bearer   ",
+            "Bearer: text",
+            "bearerish x",
+            "keyBearer x",
+        ] {
+            assert_eq!(redact_text(text), text);
+        }
+        assert_eq!(
+            redact_text("{\"token\":\"eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.\",\"ok\":true}"),
+            "{\"token\":\"[token removed]\",\"ok\":true}"
+        );
+    }
+
+    #[test]
+    fn tokens_in_retained_url_paths_are_redacted_only_in_export_text() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl";
+        let url = format!("https://host/reset/{jwt}?secret=q");
+        assert_eq!(redact_text(&url), "https://host/reset/[token removed]");
+        assert_eq!(redact_url(&url), format!("https://host/reset/{jwt}"));
+        assert_eq!(
+            redact_text(&format!("request {url}; token {jwt}")),
+            "request https://host/reset/[token removed] token [token removed]"
+        );
+        for kept in [
+            "https://host/assets/app.js",
+            "http://例.test/道/eyJx.y.z",
+            "https://host/keyJabc.defgh.ijkl",
+            "https://[::1]/photo(1).png",
+            "https://host/Bearer next",
+        ] {
+            assert_eq!(redact_text(kept), kept, "{kept}");
+        }
     }
 }

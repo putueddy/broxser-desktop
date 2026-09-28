@@ -25,6 +25,13 @@
     console.warn('smoke warning on', innerWidth);
     // A report must not keep the query or fragment of this address.
     console.error('failed at', location.href);
+    // These are diagnostic strings only; no request visits these addresses.
+    console.log('redaction cases',
+      'http://[::1]/path?token=ipv6-secret',
+      'http://éxample.test/path?token=unicode-secret',
+      'https://host/photo(1).png?token=paren-secret',
+      'Bearer short-secret',
+      'https://host/reset/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl');
   }
   fetch('/console.html?logged');
 </script>

@@ -588,15 +588,16 @@ fn touch_held_behind_ime_keeps_its_excursion_and_cancel_preserves_other_input() 
         drop(live);
     }
 }
-// One same-origin fetch carries each complete gesture report. There is no
-// cross-request arrival-order assumption when checking its events and click.
+// Each snapshot travels in one fetch. End/cancel reports check gestures that
+// must not click; a positive tap waits for its actual click report, since the
+// browser can synthesize it after the end-report timer has already fired.
 const REGRESSION_PAGE: &str = r#"<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <style>body{margin:0}#t{position:absolute;left:20px;top:100px;width:200px;height:200px;background:#36c;touch-action:none}</style>
 <div id=t></div><script>
 let log = [], gesture = 0, asked = false;
-const report = () => {
+const report = (kind = 'touch-regression', delay = 50) => {
   const recorded = log, n = gesture;
-  setTimeout(() => fetch('/event?' + new URLSearchParams({kind:'touch-regression',w:innerWidth,path:location.pathname,n,events:JSON.stringify(recorded)})), 50);
+  setTimeout(() => fetch('/event?' + new URLSearchParams({kind,w:innerWidth,path:location.pathname,n,events:JSON.stringify(recorded)})), delay);
 };
 for (const type of ['pointerdown','pointermove','pointerup','pointercancel','touchstart','touchmove','touchend','touchcancel','click']) {
   t.addEventListener(type, e => {
@@ -604,6 +605,7 @@ for (const type of ['pointerdown','pointermove','pointerup','pointercancel','tou
     const point = e.changedTouches ? e.changedTouches[0] : e;
     log.push({type, x:Math.round(point.clientX), y:Math.round(point.clientY)});
     if (type === 'touchend' || type === 'touchcancel') report();
+    if (type === 'click') report('touch-regression-click', 0);
     if (type === 'touchstart' && location.pathname === '/dialog' && !asked) { asked = true; alert('touch'); }
   });
 }
@@ -642,8 +644,16 @@ fn regression_reports(fixture: &Fixture) -> Vec<Value> {
 }
 
 fn wait_regression_report(fixture: &Fixture, path: &str, gesture: u32) -> Value {
+    wait_gesture_report(fixture, path, gesture, "touch-regression")
+}
+
+fn wait_tap_report(fixture: &Fixture, path: &str, gesture: u32) -> Value {
+    wait_gesture_report(fixture, path, gesture, "touch-regression-click")
+}
+
+fn wait_gesture_report(fixture: &Fixture, path: &str, gesture: u32, kind: &str) -> Value {
     let report = |f: &Fixture| {
-        events(f, "touch-regression")
+        events(f, kind)
             .into_iter()
             .find(|event| {
                 event["w"] == "360" && event["path"] == path && event["n"] == gesture.to_string()
@@ -652,7 +662,7 @@ fn wait_regression_report(fixture: &Fixture, path: &str, gesture: u32) -> Value 
     };
     assert!(
         fixture.wait_for(Duration::from_secs(10), |f| report(f).is_some()),
-        "missing {path} gesture {gesture}: {:?}",
+        "missing {kind} {path} gesture {gesture}: {:?}",
         regression_reports(fixture)
     );
     report(fixture).unwrap()
@@ -663,7 +673,12 @@ fn fresh_tap(report: &Value, x: u32, y: u32) -> bool {
     events
         .iter()
         .any(|event| event["type"] == "touchstart" && event["x"] == x && event["y"] == y)
-        && events.iter().any(|event| event["type"] == "click")
+        && events
+            .iter()
+            .any(|event| event["type"] == "touchend" && event["x"] == x && event["y"] == y)
+        && events
+            .iter()
+            .any(|event| event["type"] == "click" && event["x"] == x && event["y"] == y)
 }
 
 fn live_touch_regression(fixture: &Fixture, path: &str) -> Live {
@@ -710,10 +725,11 @@ fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
             "swipe generated click: {report:?}"
         );
     }
-    live.send(pointer(PointerKind::Down, 100.0, 200.0));
-    live.send(pointer(PointerKind::Up, 100.0, 200.0));
-    let report = wait_regression_report(&fixture, "/touch", 3);
-    assert!(fresh_tap(&report, 100, 200), "fresh tap: {report}");
+    // A late click from the preceding swipe must not satisfy this fresh tap.
+    live.send(pointer(PointerKind::Down, 120.0, 220.0));
+    live.send(pointer(PointerKind::Up, 120.0, 220.0));
+    let report = wait_tap_report(&fixture, "/touch", 3);
+    assert!(fresh_tap(&report, 120, 220), "fresh tap: {report}");
     assert_eq!(live.session().status().protocol_error, None);
     live.close();
 }
@@ -752,7 +768,7 @@ fn live_abandoned_touch_is_canceled_after_hide_dialog_and_navigation() {
     );
     live.send(pointer(PointerKind::Down, 120.0, 220.0));
     live.send(pointer(PointerKind::Up, 120.0, 220.0));
-    let tap = wait_regression_report(&fixture, "/touch", 2);
+    let tap = wait_tap_report(&fixture, "/touch", 2);
     assert!(fresh_tap(&tap, 120, 220), "after hide: {tap}");
 
     live.send(Command::NavigateAll {
@@ -803,7 +819,7 @@ fn live_abandoned_touch_is_canceled_after_hide_dialog_and_navigation() {
             .any(|e| e["type"] == "click"),
         "dialog: {cancel}"
     );
-    let tap = wait_regression_report(&fixture, "/dialog", 2);
+    let tap = wait_tap_report(&fixture, "/dialog", 2);
     assert!(fresh_tap(&tap, 120, 220), "after dialog: {tap}");
 
     live.send(pointer(PointerKind::Down, 100.0, 200.0));
@@ -820,7 +836,7 @@ fn live_abandoned_touch_is_canceled_after_hide_dialog_and_navigation() {
     });
     live.send(pointer(PointerKind::Down, 120.0, 220.0));
     live.send(pointer(PointerKind::Up, 120.0, 220.0));
-    let tap = wait_regression_report(&fixture, "/replacement", 1);
+    let tap = wait_tap_report(&fixture, "/replacement", 1);
     assert!(fresh_tap(&tap, 120, 220), "after navigation: {tap}");
     assert_eq!(live.session().status().protocol_error, None);
     live.close();

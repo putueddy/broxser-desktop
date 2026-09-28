@@ -3,6 +3,66 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #25 review corrections, 28 September 2026 (Linux X11)
+
+Review of `424fd6e` found and corrected the following export problems:
+
+| Priority | Finding and correction |
+| --- | --- |
+| P2 | Closing during report writing could exit with an empty PNG and no Markdown. Report writes now use a dedicated I/O thread, keep the window alive until completion, and reject overlapping Save clicks. Screenshot requests not yet writing are explicitly cancelled by Close/Apply. |
+| P2 | Directory discovery read `user-dirs.dirs` on the GUI thread. It now runs independently; the window remains usable while discovery waits. |
+| P2 | Captures could outlive the document/URL behind the report metadata. Requests now carry the page revision from an atomic status/console snapshot; page transitions and target loss invalidate them. Terminal navigation failures, downloads, timeouts and beforeunload Stay allow a fresh request without waiting for an extra loading event. |
+| P2 | Runtime exit left an accepted screenshot request pending and Save stuck. The engine now completes queued/active tokens with an error, and the UI also clears its wait when the runtime stops. |
+| P2 | IPv6 closing brackets, a multibyte host after `http://`, and parentheses in filenames could leave URL query secrets in the report. The lexer now recognizes UTF8 prefixes and matched delimiters. |
+| P2 | Short bearer credentials and JWT-shaped tokens in retained URL paths escaped redaction. Bearer has no minimum length, and a token-only pass also checks retained URL parts. Exported page metadata and console locations use it too; the live console remains unchanged. |
+| P2 | Workspace names and page paths could insert active Markdown images/HTML into metadata. Metadata now uses safe code spans, including backticks and line controls; every console line is indented. |
+| P3 | A 33-byte fake PNG with invalid IHDR CRC and no IDAT/IEND was accepted as success. Screenshot validation now checks the full bounded PNG, checksums and end marker. The old fixture is an explicit rejection regression. |
+| P3 | Quoted XDG paths containing escaped quotes/backslashes resolved incorrectly. The parser now decodes those escapes without shell execution, and rejects configuration over 64 KiB into the existing fallback. |
+| P3 | Report text unconditionally called an explicitly selected diagnostic browser Helium. It now names the returned browser product/protocol and describes the headless mode without assuming a browser family. |
+
+`bash scripts/check.sh` passed: formatting, strict Clippy, 1 CLI, 17 core,
+159 engine and 50 desktop tests (54 live tests ignored by default).
+The new screenshot regressions cover stale queued requests, delayed results,
+target/runtime transitions, terminal navigation paths and malformed PNG data.
+The live screenshot test also rejects an old revision after real navigation
+and accepts a new explicit request.
+The full X11 smoke suite passed all 18 scenarios, including report export
+with IPv6, Unicode-host, parenthesized-path, bearer and JWT-path redaction cases.
+No browser process, profile or window remained. The report unit tests were
+also rerun after the browser-label correction (8/8 passed).
+
+The first full Helium run passed 53/54: the unchanged rapid-swipe test's final
+tap report lacked a click. A focused repeat and a genuinely rebuilt `424fd6e`
+baseline reproduced the same assertion. The fixture reported 50 ms after
+`touchend`, which is not a guarantee that a synthesized click has arrived.
+Positive tap checks now await a separate report from the actual click event,
+within the existing 10-second test bound, and verify start/end/click coordinates.
+The final tap uses a different point from the preceding swipe so a delayed old
+click cannot satisfy it. Swipe/cancellation assertions remain in place and
+production touch dispatch is unchanged. Both focused touch tests passed with
+event-based reporting before the complete verification rerun.
+The next complete run exposed the previously observed certificate-reload
+assertion (53/54); that test passed separately on the original and corrected
+code. Its wait now excludes the initial empty/about:blank document, asserts
+the committed error page still carries the certificate error, and requires a
+revision advance after Reload. The existing error-preservation assertion remains.
+After these test-only corrections, `check.sh` passed again and the complete
+Helium suite passed **54/54**, four threads, in 186.5 s.
+
+Real X11 fault injection used a temporary `LD_PRELOAD` shim that held only writes
+to this test's `screenshot.png`. The original PR exited with a 0-byte PNG and no
+`report.md`. With the fix, panel toggles still repainted, repeated Save produced
+one report, browser processes/profiles were cleaned while the window waited,
+and releasing the write produced a complete 390 × 844 PNG and Markdown before
+exit. A separate run held `user-dirs.dirs` as a FIFO: the Console panel opened
+and the window closed with browser/profile cleanup while that read was blocked.
+These fault-injection helpers and screenshots are temporary local artifacts.
+
+Browser tests use Helium 0.18.1.1, private application profiles and the sandbox.
+GUI evidence uses Xvfb 1600 × 1000, Mesa Lavapipe and a debug build. It does not
+qualify Wayland or physical GPUs. Redaction remains limited to documented
+recognizable shapes; screenshots and other free-text secrets require user review.
+
 ## PR #24 review corrections, 28 September 2026 (Linux X11)
 
 Review of `e8969de` found three P2 and three P3 issues, corrected together:
