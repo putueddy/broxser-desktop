@@ -7175,11 +7175,11 @@ fn live_certificate_trust_is_the_browsers_own_not_the_users() {
     live.close();
 }
 
-/// Level, kind, text, location, subframe and repeats of each console entry.
+/// Level, kind, text, location, frame scope and repeats of each console entry.
 fn console_rows(
     live: &LiveSession,
     device: usize,
-) -> Vec<(ConsoleLevel, ConsoleKind, String, String, bool, u32)> {
+) -> Vec<(ConsoleLevel, ConsoleKind, String, String, ConsoleScope, u32)> {
     live.console(device)
         .into_iter()
         .map(|entry| {
@@ -7188,7 +7188,7 @@ fn console_rows(
                 entry.kind,
                 entry.text,
                 entry.location,
-                entry.subframe,
+                entry.scope,
                 entry.repeats,
             )
         })
@@ -7203,6 +7203,7 @@ fn console_rows(
 fn device_consoles_are_bounded_attributed_and_cleared() {
     use ConsoleKind::{Console, Exception, Navigation, Network};
     use ConsoleLevel::{Error, Info, Warning};
+    use ConsoleScope::{MainFrame, Subframe, Unknown};
     let root = profile_root();
     let peer = FakePeer::start(root.path(), |_, _| false);
     let live = fake_live(root.path(), Limits::default());
@@ -7291,13 +7292,20 @@ fn device_consoles_are_bounded_attributed_and_cleared() {
     assert_eq!(
         rows[..4],
         [
-            (Error, Console, "main error".into(), String::new(), false, 2),
+            (
+                Error,
+                Console,
+                "main error".into(),
+                String::new(),
+                MainFrame,
+                2
+            ),
             (
                 Warning,
                 Console,
                 "frame warning".into(),
                 String::new(),
-                true,
+                Subframe,
                 1
             ),
             (
@@ -7305,7 +7313,7 @@ fn device_consoles_are_bounded_attributed_and_cleared() {
                 Exception,
                 "Uncaught Error: boom".into(),
                 "http://127.0.0.1:4173/app.js:2:3".into(),
-                false,
+                MainFrame,
                 1
             ),
             (
@@ -7314,12 +7322,12 @@ fn device_consoles_are_bounded_attributed_and_cleared() {
                 "Failed to load resource: the server responded with a status of 404 (Not Found)"
                     .into(),
                 "http://127.0.0.1:4173/missing.png".into(),
-                false,
+                Unknown,
                 1
             ),
         ]
     );
-    assert_eq!(rows[4].2.chars().count(), MAX_CONSOLE_TEXT + 1);
+    assert_eq!(rows[4].2.chars().count(), MAX_CONSOLE_TEXT);
     assert!(rows[4].2.ends_with("x…"));
     assert_eq!(
         rows[5],
@@ -7328,13 +7336,20 @@ fn device_consoles_are_bounded_attributed_and_cleared() {
             Navigation,
             "Navigated".into(),
             "http://127.0.0.1:4173/next".into(),
-            false,
+            MainFrame,
             1
         )
     );
     assert_eq!(
         console_rows(&live, 1),
-        [(Info, Console, "iframe log".into(), String::new(), true, 1)]
+        [(
+            Info,
+            Console,
+            "iframe log".into(),
+            String::new(),
+            Subframe,
+            1
+        )]
     );
     assert_eq!(
         (
@@ -7361,6 +7376,27 @@ fn device_consoles_are_bounded_attributed_and_cleared() {
     assert!(console_rows(&live, 0).is_empty());
     assert_eq!(console_rows(&live, 1).len(), 1);
 
+    // A same-process frame's failed resource arrives on the page session,
+    // without an execution context, even though its Runtime world is known.
+    // The address alone cannot establish which frame caused the failure.
+    peer.event(phone(
+        "Log.entryAdded",
+        json!({"entry": {"source": "network", "level": "error",
+        "text": "frame resource failed", "url": "http://127.0.0.1:4173/frame/missing.png"}}),
+    ));
+    wait_until_read(&peer);
+    assert_eq!(
+        console_rows(&live, 0),
+        [(
+            Error,
+            Network,
+            "frame resource failed".into(),
+            "http://127.0.0.1:4173/frame/missing.png".into(),
+            Unknown,
+            1
+        )]
+    );
+
     // The desktop keeps the newest entries; its count keeps every error.
     for n in 0..MAX_CONSOLE_ENTRIES + 50 {
         peer.event(call("S2", 1, "error", &format!("error {n}")));
@@ -7369,11 +7405,322 @@ fn device_consoles_are_bounded_attributed_and_cleared() {
     let rows = console_rows(&live, 2);
     assert_eq!(rows.len(), MAX_CONSOLE_ENTRIES);
     assert_eq!(rows[0].2, "error 50");
+    assert!(
+        rows.iter().all(|row| row.4 == Unknown),
+        "no known main context on the desktop"
+    );
     assert_eq!(
         live.status().devices[2].console_errors,
         MAX_CONSOLE_ENTRIES as u32 + 50
     );
     drop(live);
+}
+
+#[test]
+fn console_objects_are_released_in_coalesced_active_session_batches() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, _| {
+        method == "Runtime.releaseObjectGroup"
+    });
+    let live = fake_live(root.path(), Limits::default());
+    let object = |session: &str, context: i64| {
+        json!({"method": "Runtime.consoleAPICalled",
+        "sessionId": session, "params": {"type": "log", "executionContextId": context,
+            "args": [{"type": "object", "objectId": "remote-object", "description": "Object"}]}})
+    };
+    peer.event(phone(
+        "Runtime.consoleAPICalled",
+        json!({"type": "log", "executionContextId": 1,
+        "args": [{"type": "string", "value": "no bound object"}]}),
+    ));
+    peer.event(phone(
+        "Log.entryAdded",
+        json!({"entry": {"source": "network", "level": "error",
+        "text": "plain failed request"}}),
+    ));
+    wait_until_read(&peer);
+    assert_eq!(peer.count("Runtime.releaseObjectGroup", "S0"), 0);
+
+    for _ in 0..100 {
+        peer.event(object("S0", 1));
+    }
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S0", 1);
+    assert_eq!(
+        peer.last_params("Runtime.releaseObjectGroup", "S0"),
+        json!({"objectGroup": "console"})
+    );
+    for _ in 0..100 {
+        peer.event(object("S0", 1));
+    }
+    wait_until_read(&peer);
+    assert_eq!(
+        peer.count("Runtime.releaseObjectGroup", "S0"),
+        1,
+        "one request while its reply is held"
+    );
+
+    // Invisible isolated-world messages still bind objects in Runtime.
+    peer.event(
+        json!({"method": "Runtime.executionContextCreated", "sessionId": "S2",
+        "params": {"context": {"id": 42, "name": LINK_WORLD,
+            "auxData": {"frameId": "T2", "type": "isolated"}}}}),
+    );
+    peer.event(object("S2", 42));
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S2", 1);
+    assert!(live.console(2).is_empty());
+
+    peer.event(iframe_attached("S1", "I1", "F1"));
+    wait_for_requests(&peer, "Runtime.runIfWaitingForDebugger", "I1", 1);
+    peer.event(object("I1", 1));
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "I1", 1);
+    let retired_revision = live.status().devices[1].console_revision;
+    peer.event(
+        json!({"method": "Target.detachedFromTarget", "sessionId": "S1",
+        "params": {"sessionId": "I1", "targetId": "F1"}}),
+    );
+    peer.event(object("I1", 1));
+    wait_until_read(&peer);
+    assert_eq!(live.status().devices[1].console_revision, retired_revision);
+
+    peer.release();
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S0", 2);
+    thread::sleep(CONSOLE_RELEASE_INTERVAL * 2);
+    assert_eq!(
+        peer.count("Runtime.releaseObjectGroup", "S0"),
+        2,
+        "new objects during pending get one more batch"
+    );
+    assert_eq!(
+        peer.count("Runtime.releaseObjectGroup", "I1"),
+        1,
+        "retirement abandons the pending release"
+    );
+    assert_eq!(peer.count("Runtime.discardConsoleEntries", "S0"), 0);
+    assert_eq!(peer.count("Runtime.discardConsoleEntries", "I1"), 0);
+    assert!(running(&live.status()));
+    assert!(live.status().protocol_error.is_none());
+    peer.event(json!({"method": "Target.targetCrashed", "params": {"targetId": "T2"}}));
+    peer.event(object("S2", 42));
+    wait_until_read(&peer);
+    thread::sleep(CONSOLE_RELEASE_INTERVAL * 2);
+    assert_eq!(
+        peer.count("Runtime.releaseObjectGroup", "S2"),
+        1,
+        "late objects from the dead page do not recreate cleanup"
+    );
+    peer.event(
+        json!({"method": "Runtime.executionContextCreated", "sessionId": "S2",
+        "params": {"context": {"id": 55, "auxData": {"frameId": "T2", "isDefault": true}}}}),
+    );
+    peer.event(object("S2", 55));
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S2", 2);
+    assert_eq!(
+        live.console(2)[0].scope,
+        ConsoleScope::MainFrame,
+        "a fresh page context can be observed again"
+    );
+    drop(live);
+}
+
+#[test]
+fn console_release_timeout_retries_without_new_objects_or_runtime_failure() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, _| {
+        method == "Runtime.releaseObjectGroup"
+    });
+    let live = fake_live(
+        root.path(),
+        Limits {
+            command: Duration::from_millis(200),
+            ..Limits::default()
+        },
+    );
+    peer.event(phone(
+        "Runtime.exceptionThrown",
+        json!({"exceptionDetails": {"text": "Uncaught",
+        "exception": {"type": "object", "objectId": "exception", "description": "Error: boom"}}}),
+    ));
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S0", 2);
+    assert!(
+        running(&live.status()),
+        "cleanup timeout does not stop the runtime"
+    );
+    assert!(live.status().protocol_error.is_none());
+    // An ordinary context race is retried without a console event or error UI.
+    peer.event(
+        json!({"id": peer.last_request_id("Runtime.releaseObjectGroup", "S0"),
+        "error": {"code": -32000, "message": "Cannot find context with specified id"}}),
+    );
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S0", 3);
+    assert!(running(&live.status()));
+    assert!(live.status().protocol_error.is_none());
+    peer.release();
+    drop(live);
+}
+
+#[test]
+fn console_objects_are_released_while_another_device_waits_in_setup() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Runtime.enable" && session == Some("S2")
+    });
+    let live = LiveSession::start_with(
+        workspace("http://127.0.0.1:4173/".into()),
+        fake_options(root.path()),
+        Limits::default(),
+        || {},
+    )
+    .unwrap();
+    wait_for_requests(&peer, "Runtime.enable", "S2", 1);
+    peer.event(phone(
+        "Runtime.consoleAPICalled",
+        json!({"type": "log", "executionContextId": 1,
+        "args": [{"type": "object", "objectId": "during-setup", "description": "Object"}]}),
+    ));
+    wait_for_requests(&peer, "Runtime.releaseObjectGroup", "S0", 1);
+    assert_eq!(
+        live.status().runtime,
+        RuntimeState::Starting,
+        "setup is still waiting on the desktop"
+    );
+    peer.release();
+    wait_for(&live, "setup completion", Duration::from_secs(2), running);
+    drop(live);
+}
+
+#[test]
+fn stopped_runtime_console_can_be_cleared_without_browser_commands() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let mut live = fake_live(root.path(), Limits::default());
+    for (session, kind) in [("S0", "error"), ("S1", "warning")] {
+        peer.event(
+            json!({"method": "Runtime.consoleAPICalled", "sessionId": session,
+            "params": {"type": kind, "executionContextId": 1,
+                "args": [{"type": "string", "value": format!("retained {session}")}]}}),
+        );
+    }
+    wait_until_read(&peer);
+    live.cancel.cancel();
+    live.worker.take().unwrap().join().unwrap();
+    let before = live.status();
+    assert_eq!(before.runtime, RuntimeState::Stopped { error: None });
+    assert!(live.is_finished());
+    assert_eq!(live.console(0).len(), 1, "stopping retains the console");
+    assert_eq!(before.devices[0].console_errors, 1);
+    let other = live.console(1);
+    let requests = lock(&peer.received).len();
+    assert!(
+        !live.send(Command::Reload { device: 0 }),
+        "the receiver has exited"
+    );
+
+    assert!(live.send(Command::ClearConsole { device: 0 }));
+
+    let after = live.status();
+    assert_eq!(after.runtime, before.runtime);
+    assert!(live.console(0).is_empty());
+    assert_eq!(
+        (
+            after.devices[0].console_errors,
+            after.devices[0].console_warnings
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        after.devices[0].console_revision,
+        before.devices[0].console_revision + 1
+    );
+    assert_eq!(live.console(1), other);
+    assert_eq!(after.devices[1], before.devices[1]);
+    assert!(!live.send(Command::ClearConsole {
+        device: after.devices.len()
+    }));
+    assert_eq!(live.status(), after, "an invalid device changes nothing");
+    assert_eq!(
+        lock(&peer.received).len(),
+        requests,
+        "Clear sends no CDP command or replay"
+    );
+    drop(live);
+}
+
+#[test]
+fn concurrent_console_clear_and_push_publish_consistent_snapshots() {
+    const ROUNDS: usize = 128;
+    let notified = Arc::new(AtomicUsize::new(0));
+    let shared: Arc<Shared> = Arc::new_cyclic(|weak: &std::sync::Weak<Shared>| {
+        let weak = weak.clone();
+        let notified = Arc::clone(&notified);
+        Shared {
+            frames: Mutex::new(vec![None; 2]),
+            status: Mutex::new(Status {
+                devices: vec![DeviceStatus::default(); 2],
+                ..Status::default()
+            }),
+            console: Mutex::new(vec![ConsoleLog::default(), ConsoleLog::default()]),
+            notify: Box::new(move || {
+                let shared = weak.upgrade().unwrap();
+                // Callbacks can read both snapshots without deadlocking. The
+                // same lock order also observes one complete publication.
+                let logs = lock(&shared.console);
+                let status = lock(&shared.status);
+                for (log, device) in logs.iter().zip(&status.devices) {
+                    assert_eq!(
+                        (log.errors, log.warnings),
+                        (device.console_errors, device.console_warnings)
+                    );
+                }
+                notified.fetch_add(1, Ordering::SeqCst);
+            }),
+        }
+    });
+    let (commands, receiver) = sync_channel(COMMAND_QUEUE);
+    drop(receiver);
+    let live = LiveSession {
+        commands,
+        shared: Arc::clone(&shared),
+        cancel: Cancellation::new(),
+        worker: None,
+    };
+    let entry = |kind: &str| {
+        console::console_call(&json!({"type": kind,
+        "args": [{"type": "string", "value": "message"}]}))
+        .unwrap()
+    };
+    shared.console(1, |log| log.push(entry("warning")));
+    let other = live.console(1);
+    let other_status = live.status().devices[1].clone();
+    let error = entry("error");
+    let barrier = std::sync::Barrier::new(3);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..ROUNDS {
+                barrier.wait();
+                shared.console(0, |log| log.push(error.clone()));
+                barrier.wait();
+            }
+        });
+        scope.spawn(|| {
+            for _ in 0..ROUNDS {
+                barrier.wait();
+                assert!(live.send(Command::ClearConsole { device: 0 }));
+                barrier.wait();
+            }
+        });
+        for round in 0..ROUNDS {
+            barrier.wait();
+            barrier.wait();
+            let logs = lock(&shared.console);
+            let status = live.status();
+            assert_eq!(status.devices[0].console_errors, logs[0].errors);
+            assert_eq!(status.devices[0].console_warnings, logs[0].warnings);
+            assert_eq!(status.devices[0].console_revision, (round as u64 + 1) * 2);
+            assert_eq!(status.devices[1], other_status);
+        }
+    });
+    assert_eq!(live.console(1), other);
+    assert_eq!(notified.load(Ordering::SeqCst), ROUNDS * 2 + 1);
 }
 
 const CONSOLE_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"></head><body>
@@ -7471,8 +7818,12 @@ fn live_console_keeps_each_devices_errors() {
         assert_eq!(entries[0].location, server.url("/console"));
         let boom = find(&format!("boom on {width}"));
         assert_eq!(
-            (boom.level, boom.kind, boom.subframe),
-            (ConsoleLevel::Error, ConsoleKind::Console, false)
+            (boom.level, boom.kind, boom.scope),
+            (
+                ConsoleLevel::Error,
+                ConsoleKind::Console,
+                ConsoleScope::MainFrame
+            )
         );
         assert!(
             boom.location.starts_with(&server.url("/console:")),
@@ -7502,7 +7853,7 @@ fn live_console_keeps_each_devices_errors() {
             format!("Uncaught Error: frame uncaught on {width}"),
         ] {
             let entry = find(&text);
-            assert!(entry.subframe, "{entry:?}");
+            assert_eq!(entry.scope, ConsoleScope::Subframe, "{entry:?}");
             // The frame's address loses its query.
             assert!(
                 entry.location.starts_with(&format!(
@@ -7542,5 +7893,137 @@ fn live_console_keeps_each_devices_errors() {
         left.iter().map(|entry| entry.repeats).sum::<u32>()
     );
     assert!(status.devices[1].console_errors >= 6);
+    live.close();
+}
+
+/// Enabling Runtime binds console RemoteObjects outside the text ring. After
+/// Chromium's own message ring evicts the original object, our observation
+/// must not keep a WeakRef-only object alive in an out-of-process iframe.
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_console_releases_remote_objects_without_clearing_page_history() {
+    const PAGE: &str = r#"<!doctype html><script>
+(() => {
+  const frame = document.createElement('iframe');
+  frame.src = 'http://localhost:' + location.port + '/retention-frame';
+  document.documentElement.appendChild(frame);
+})();
+</script>"#;
+    const FRAME: &str = r#"<!doctype html><script>
+(() => {
+  let value = {payload: new Array(65536).fill(42)};
+  globalThis.retentionProbe = new WeakRef(value);
+  console.log(value);
+})();
+for (let n = 0; n < 1100; n++) console.log('tick' + n);
+console.log('probe-done');
+</script>"#;
+    let server = Fixture::start(|request, _| Reply::Html {
+        body: match request.path.as_str() {
+            "/retention" => PAGE,
+            "/retention-frame" => FRAME,
+            _ => "missing",
+        }
+        .into(),
+        delay: Duration::ZERO,
+        cookie: None,
+    });
+    let mut workspace = workspace(server.url("/retention"));
+    workspace.devices.truncate(1);
+    let live = Live::start(workspace);
+    live.wait(
+        "the iframe's complete console output",
+        Duration::from_secs(30),
+        |_| {
+            live.session()
+                .console(0)
+                .iter()
+                .any(|entry| entry.text == "probe-done" && entry.scope == ConsoleScope::Subframe)
+        },
+    );
+    // Attach a probe to this app-owned browser without Runtime.enable, which
+    // would itself replay and bind all the console's RemoteObjects.
+    let profiles: Vec<_> = fs_entries(live.root.path())
+        .into_iter()
+        .filter(|name| name.starts_with("broxser-cdp-"))
+        .collect();
+    assert_eq!(profiles.len(), 1);
+    let endpoint = std::fs::read_to_string(
+        live.root
+            .path()
+            .join(&profiles[0])
+            .join("DevToolsActivePort"),
+    )
+    .unwrap();
+    let (port, path) = browser::parse_endpoint(&endpoint).unwrap();
+    let mut probe = Cdp::connect(port, &path, Duration::from_secs(5), Cancellation::new()).unwrap();
+    let mut request = |method: &str, params: Value, session: Option<&str>| {
+        let id = probe.send(method, params, session).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(response) = probe.take_response(id) {
+                break parse_response(response, method).unwrap();
+            }
+            assert!(
+                probe.read_until(deadline).unwrap(),
+                "probe {method} timed out"
+            );
+        }
+    };
+    let targets = request("Target.getTargets", json!({}), None);
+    let iframe = targets["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| {
+            target["type"] == "iframe"
+                && target["url"]
+                    .as_str()
+                    .is_some_and(|url| url.ends_with("/retention-frame"))
+        })
+        .expect("owned out-of-process iframe");
+    let attached = request(
+        "Target.attachToTarget",
+        json!({"targetId": iframe["targetId"], "flatten": true}),
+        None,
+    );
+    let session = attached["sessionId"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // Separate protocol calls let WeakRef's per-job keep-alive end.
+        request("HeapProfiler.collectGarbage", json!({}), Some(session));
+        let retained = request(
+            "Runtime.evaluate",
+            json!({
+                "expression": "Boolean(globalThis.retentionProbe.deref())", "returnByValue": true,
+            }),
+            Some(session),
+        );
+        let retained = retained
+            .pointer("/result/value")
+            .and_then(Value::as_bool)
+            .unwrap();
+        if !retained {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "observing console kept the evicted iframe object alive"
+        );
+        thread::sleep(CONSOLE_RELEASE_INTERVAL);
+    }
+    request(
+        "Target.detachFromTarget",
+        json!({"sessionId": session}),
+        None,
+    );
+    drop(probe);
+    assert!(
+        live.session()
+            .console(0)
+            .iter()
+            .any(|entry| entry.text == "probe-done"),
+        "cleanup preserves displayed history"
+    );
     live.close();
 }

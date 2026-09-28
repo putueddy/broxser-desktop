@@ -291,7 +291,11 @@ milik session halaman dan session iframe lintas situsnya, yang kini mengaktifkan
 karakter, satu baris), lokasinya tanpa query, fragment dan user info, dan hanya
 jumlah beserta revisi yang ikut di `Status`; UI membaca entri lewat
 `LiveSession::console` saat panel Console menampilkannya. Tidak ada yang ditulis ke
-log atau disk.
+log atau disk. Scope frame yang tidak diberikan oleh event CDP ditandai sebagai
+tidak diketahui. Clear bekerja lokal walaupun browser sudah berhenti; pembaruan
+entri dan jumlahnya diserialkan agar tidak memulihkan jumlah sebelum Clear.
+Referensi objek debugger dari console dilepas berkala per session agar pesan
+yang sudah keluar dari ring tidak menahan objek halaman tanpa batas.
 Konfigurasi tidak memuat cookies, headers rahasia, token atau profil browser.
 Writer memakai file sementara di direktori yang sama dan rename; import versi baru
 memerlukan migrasi eksplisit dengan backup dan validasi. Saat ini hanya v1 tersedia;

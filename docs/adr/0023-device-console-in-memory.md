@@ -55,25 +55,37 @@ target, recursive iframe auto-attach) measured what the browser reports:
 - Each device has a **console** in the live runtime: the newest 200 entries,
   each with a level (error, warning, info), a kind (console call, uncaught
   error, failed request, other browser message, navigation), one line of text
-  of at most 1000 characters, a location, a subframe flag and a repeat count.
+  of at most 1000 characters including any truncation mark, a location of at
+  most 300 characters including line/column, a frame scope and a repeat count.
   Consecutive identical entries count as one. Error and warning counts keep
   counting when old entries leave. Everything is page text: bounded, put on
-  one line without control characters, shown, and never logged, written to
-  disk, sent anywhere or acted on.
+  one line without control or bidirectional formatting characters (Unicode
+  line/paragraph separators become spaces; script joiners are preserved),
+  shown, and never logged, written to disk, sent anywhere or acted on.
 - Sources: `Runtime.consoleAPICalled` (formatted like DevTools on one line:
   `%s`, `%d`, `%i`, `%f`, `%o`, `%O`, `%c` substitutions and object and array
   previews), `Runtime.exceptionThrown` and `Log.entryAdded` (verbose entries
   left out) of the page session and of the page's out-of-process iframe
   sessions, whose setup now enables `Runtime` and `Log` before the frame may
-  run. Entries from same-process frames and from iframe sessions are marked
-  as subframe entries. Broxser's own isolated worlds never appear. A new main
-  frame document adds a navigation entry. `console.clear()`, `groupEnd` and
+  run. Known Runtime contexts distinguish the main frame from same-process
+  subframes; iframe sessions identify subframes directly. Page-session Log
+  events have no reliable frame identity, so their scope is explicitly unknown
+  (the panel shows "frame unknown"). Broxser's own isolated worlds never appear.
+  A new main frame document adds a navigation entry. `console.clear()`, `groupEnd` and
   profiling calls add nothing.
 - **Locations** keep scheme, host, port and path of hierarchical addresses
   and drop user information, query and fragment, which can carry codes and
   tokens; `data:`, `blob:` and `about:` addresses keep only their scheme.
 - **Retention**: the console lives in memory for the runtime. Clear empties
-  one device; Restart starts every console empty; closing Broxser drops them.
+  one device locally, including after the browser has stopped, without a CDP
+  command or page action. Log mutation and count/revision publication are
+  serialized against incoming messages. Restart starts every console empty;
+  closing Broxser drops them.
+  Remote objects delivered by Runtime are formatted immediately; Broxser never
+  dereferences their object IDs. Their `console` object group is released in
+  bounded batches per active debugger session so evicted messages cannot leave
+  inspector references keeping arbitrary page objects alive. This housekeeping
+  does not clear the browser's own console history or counters.
 - The desktop shows a filled count on a device card when the device has
   errors or warnings ("2 errors · 1 warning · Console"). Clicking it, the
   toolbar toggle "Console" or `Ctrl+Shift+J` (Helium's DevTools key, which
@@ -81,7 +93,8 @@ target, recursive iframe auto-attach) measured what the browser reports:
   for the selected device,
   newest first, with Clear. It shares the panel slot with the Workspace
   panel. Status snapshots carry only counts and a revision; the panel reads
-  the entries when the revision changes.
+  the entries when the revision changes or Hide selects another device, even
+  when hiding an already-paused stream produces no status change.
 
 ## Consequences
 

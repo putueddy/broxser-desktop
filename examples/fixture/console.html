@@ -14,8 +14,15 @@
 <script>
   // Every device reports one error and one warning; the smoke check expects
   // each card to count them and the Console panel to show and clear them.
-  console.error('smoke error on', innerWidth);
-  console.warn('smoke warning on', innerWidth);
+  if (new URLSearchParams(location.search).has('selection')) {
+    // Different levels let the window smoke distinguish a stale phone console
+    // from the tablet's console after Hide changes the selection.
+    if (innerWidth <= 400) console.error('phone console', innerWidth);
+    else console.warn('other device console', innerWidth);
+  } else {
+    console.error('smoke error on', innerWidth);
+    console.warn('smoke warning on', innerWidth);
+  }
   fetch('/console.html?logged');
 </script>
 </body>

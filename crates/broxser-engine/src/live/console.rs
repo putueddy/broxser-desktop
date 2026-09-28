@@ -33,6 +33,15 @@ pub enum ConsoleKind {
     Navigation,
 }
 
+/// Where an entry came from. `Unknown` is used when the CDP event does not
+/// identify a frame well enough to attribute it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleScope {
+    MainFrame,
+    Subframe,
+    Unknown,
+}
+
 /// One line of the device console. `text` is page text; `location` is a
 /// script or resource address reduced to its scheme, host and path, plus the
 /// line and column when the browser reported them.
@@ -42,8 +51,8 @@ pub struct ConsoleEntry {
     pub kind: ConsoleKind,
     pub text: String,
     pub location: String,
-    /// Reported by a frame inside the page rather than the page itself.
-    pub subframe: bool,
+    /// Frame that reported this entry, when the source is known.
+    pub scope: ConsoleScope,
     /// How many times this entry arrived in a row; at least 1.
     pub repeats: u32,
 }
@@ -68,7 +77,7 @@ impl ConsoleLog {
         if let Some(last) = self.entries.back_mut()
             && last.level == entry.level
             && last.kind == entry.kind
-            && last.subframe == entry.subframe
+            && last.scope == entry.scope
             && last.text == entry.text
             && last.location == entry.location
         {
@@ -121,7 +130,7 @@ pub(crate) fn console_call(params: &Value) -> Option<ConsoleEntry> {
         kind: ConsoleKind::Console,
         text: text.finish(),
         location: frame.map(call_frame_location).unwrap_or_default(),
-        subframe: false,
+        scope: ConsoleScope::Unknown,
         repeats: 1,
     })
 }
@@ -161,7 +170,7 @@ pub(crate) fn exception(params: &Value) -> Option<ConsoleEntry> {
         kind: ConsoleKind::Exception,
         text: text.finish(),
         location,
-        subframe: false,
+        scope: ConsoleScope::Unknown,
         repeats: 1,
     })
 }
@@ -197,7 +206,7 @@ pub(crate) fn log_entry(params: &Value) -> Option<ConsoleEntry> {
             entry.get("lineNumber").and_then(Value::as_u64),
             None,
         ),
-        subframe: false,
+        scope: ConsoleScope::Unknown,
         repeats: 1,
     })
 }
@@ -209,7 +218,7 @@ pub(crate) fn navigation(url: &str) -> ConsoleEntry {
         kind: ConsoleKind::Navigation,
         text: "Navigated".into(),
         location: location(url, None, None),
-        subframe: false,
+        scope: ConsoleScope::MainFrame,
         repeats: 1,
     }
 }
@@ -230,9 +239,17 @@ pub(crate) fn location(url: &str, line: Option<u64>, column: Option<u64>) -> Str
     {
         return String::new();
     }
-    let mut shown = String::new();
-    shown.push_str(scheme);
-    shown.push(':');
+    let mut suffix = String::new();
+    if let Some(line) = line {
+        suffix.push_str(&format!(":{}", line.saturating_add(1)));
+        if let Some(column) = column {
+            suffix.push_str(&format!(":{}", column.saturating_add(1)));
+        }
+    }
+    // The line and column are part of the location's total bound too.
+    let mut text = Text::with_limit(MAX_LOCATION.saturating_sub(suffix.chars().count()));
+    text.push(scheme);
+    text.push(":");
     if let Some(rest) = rest.strip_prefix("//") {
         let end = rest.find(['?', '#']).unwrap_or(rest.len());
         let rest = &rest[..end];
@@ -240,19 +257,12 @@ pub(crate) fn location(url: &str, line: Option<u64>, column: Option<u64>) -> Str
         let host = authority
             .rsplit_once('@')
             .map_or(authority, |(_, host)| host);
-        shown.push_str("//");
-        shown.push_str(host);
-        shown.push_str(path);
+        text.push("//");
+        text.push(host);
+        text.push(path);
     }
-    let mut text = Text::with_limit(MAX_LOCATION);
-    text.push(&shown);
     let mut shown = text.finish();
-    if let Some(line) = line {
-        shown.push_str(&format!(":{}", line.saturating_add(1)));
-        if let Some(column) = column {
-            shown.push_str(&format!(":{}", column.saturating_add(1)));
-        }
-    }
+    shown.push_str(&suffix);
     shown
 }
 
@@ -480,12 +490,17 @@ impl Text {
             return;
         }
         let c = match c {
-            '\n' | '\r' | '\t' => ' ',
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => ' ',
+            c if is_bidi_formatting_control(c) => return,
             c if c.is_control() => return,
             c => c,
         };
         if self.chars == self.limit {
             self.cut = true;
+            if self.limit > 0 {
+                self.shown.pop();
+                self.chars -= 1;
+            }
             return;
         }
         self.shown.push(c);
@@ -493,11 +508,25 @@ impl Text {
     }
 
     fn finish(mut self) -> String {
-        if self.cut {
+        if self.cut && self.limit > 0 {
             self.shown.push('…');
         }
         self.shown
     }
+}
+
+/// Strip directional marks, embeddings, overrides and isolates from page
+/// text. Joiners and non-joiners remain so scripts that use them still render
+/// correctly.
+fn is_bidi_formatting_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 #[cfg(test)]
@@ -573,8 +602,21 @@ mod tests {
             "log",
             json!([{"type": "string", "value": "é".repeat(5000)}, {"type": "string", "value": "more"}]),
         );
-        assert_eq!(long.text.chars().count(), MAX_CONSOLE_TEXT + 1);
-        assert!(long.text.ends_with("é…"));
+        assert_eq!(long.text.chars().count(), MAX_CONSOLE_TEXT);
+        assert!(long.text.ends_with("…"));
+        assert!(
+            long.text
+                .chars()
+                .take(MAX_CONSOLE_TEXT - 1)
+                .all(|c| c == 'é')
+        );
+
+        let exact = call(
+            "log",
+            json!([{"type": "string", "value": "x".repeat(MAX_CONSOLE_TEXT)}]),
+        );
+        assert_eq!(exact.text.chars().count(), MAX_CONSOLE_TEXT);
+        assert!(!exact.text.ends_with("…"));
 
         for silent in ["endGroup", "clear", "profile", "profileEnd"] {
             assert!(
@@ -583,6 +625,21 @@ mod tests {
             );
         }
         assert!(console_call(&json!({"args": []})).is_none());
+    }
+
+    #[test]
+    fn unicode_line_separators_are_flattened_and_bidi_controls_removed() {
+        let entry = call(
+            "log",
+            json!([{"type": "string", "value": "left\u{2028}middle\u{2029}right\u{202e}hidden"}]),
+        );
+        assert_eq!(entry.text, "left middle righthidden");
+
+        let joined = call(
+            "log",
+            json!([{"type": "string", "value": "👩\u{200d}👩\u{200d}👧\u{200d}👦"}]),
+        );
+        assert_eq!(joined.text, "👩\u{200d}👩\u{200d}👧\u{200d}👦");
     }
 
     #[test]
@@ -656,7 +713,15 @@ mod tests {
             Some(0),
         );
         assert!(long.ends_with("…:1:1"), "{long}");
-        assert_eq!(long.chars().count(), MAX_LOCATION + 1 + 4);
+        assert_eq!(long.chars().count(), MAX_LOCATION);
+
+        let maximal_coordinates = location(
+            &format!("https://host/{}", "p".repeat(1000)),
+            Some(u64::MAX),
+            Some(u64::MAX),
+        );
+        assert_eq!(maximal_coordinates.chars().count(), MAX_LOCATION);
+        assert!(maximal_coordinates.ends_with(":18446744073709551615:18446744073709551615"));
     }
 
     #[test]
@@ -667,19 +732,24 @@ mod tests {
             kind: ConsoleKind::Console,
             text: text.into(),
             location: String::new(),
-            subframe: false,
+            scope: ConsoleScope::Unknown,
             repeats: 1,
         };
         log.push(error("same"));
         log.push(error("same"));
         log.push(ConsoleEntry {
-            subframe: true,
+            scope: ConsoleScope::Subframe,
             ..error("same")
         });
         assert_eq!(
             log.entries().iter().map(|e| e.repeats).collect::<Vec<_>>(),
             [2, 1]
         );
+        log.push(ConsoleEntry {
+            scope: ConsoleScope::MainFrame,
+            ..error("same")
+        });
+        assert_eq!(log.entries().len(), 3);
         for n in 0..MAX_CONSOLE_ENTRIES + 5 {
             log.push(ConsoleEntry {
                 level: ConsoleLevel::Warning,
@@ -691,7 +761,7 @@ mod tests {
         assert_eq!(entries[0].text, "5");
         assert_eq!(
             (log.errors, log.warnings),
-            (3, MAX_CONSOLE_ENTRIES as u32 + 5)
+            (4, MAX_CONSOLE_ENTRIES as u32 + 5)
         );
         log.clear();
         assert!(log.entries().is_empty());

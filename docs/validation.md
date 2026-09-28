@@ -3,6 +3,39 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #24 review corrections, 28 September 2026 (Linux X11)
+
+Review of `e8969de` found three P2 and three P3 issues, corrected together:
+
+| Finding | Evidence and correction |
+| --- | --- |
+| P2: an off-screen selected device's console stays cached after Hide selects another | In an X11 window, scrolling the phone off screen then hiding it changed the panel heading to Tablet but kept the phone's `390` messages. Hide now refreshes the console when selection changes, without waiting for a changed status. The new smoke regression failed on the original PR and passed with the fix. |
+| P2: Clear fails after the browser exits | The console survived the worker, but Clear went through its disconnected command queue. Clear now updates local memory and publishes counts/revision under the same lock order as incoming entries. Tests cover a stopped worker, concurrent Clear/push, callback reads and preserving other devices. |
+| P2: newly enabled iframe Runtime retains logged objects past both message rings | On pinned Helium, a cross-site iframe logged a WeakRef-only object with a roughly 512 KiB array, then 1,101 strings. Forced GC collected the object before the PR, but the PR retained it until the page cleared its console. Runtime's debugger bindings outlive ring eviction. The fix releases the `console` object group in batches, at most one outstanding request per active session and one per 100 ms. Fake CDP tests cover coalescing, idle startup, timeout retries and retirement; the new live test collects the object without clearing browser history. |
+| P3: missing frame identity looks like a main-frame log | A same-origin iframe's console call was marked as a frame, while its image 404 was not. Page-session Log events lack reliable frame identity. `ConsoleScope::Unknown` and the panel's `frame unknown` tag now expose that limit; Runtime contexts and iframe sessions still identify known scopes. |
+| P3: truncation exceeds the advertised bounds | The ellipsis made text 1,001 characters; line/column suffixes exceeded the location cap. Both now count toward their respective 1,000/300-character limits, including Unicode text and maximal coordinates. |
+| P3: Unicode separators and bidi controls bypass one-line sanitization | U+2028/U+2029 become spaces and directional formatting controls are removed; script joiners remain. Unit tests cover the separators, bidi overrides and a joined emoji. |
+
+The focused engine run passed 11 console tests; both live Helium console tests
+passed, including the new object-retention regression. The new X11 scenario
+passed after failing on the original PR: Hide switches from the phone error to
+the tablet warning, Clear works after browser exit, and another device's retained
+messages remain. It left no browser process, profile or window.
+
+`bash scripts/check.sh` passed: formatting, strict Clippy, 1 CLI, 12 core,
+153 engine and 42 desktop tests (53 live tests ignored by default).
+The complete Helium suite passed 53/53 in 231.9 s with four test threads,
+while the X11 smoke suite ran concurrently.
+The full `scripts/desktop-smoke.sh` passed all 17 scenarios, including the
+new selection/stopped-runtime console regression; no browser process, profile
+or window remained.
+
+All browser tests use application-owned private profiles and the enabled sandbox.
+GUI evidence uses a debug desktop, Xvfb 1600 × 1000 and Mesa Lavapipe. Physical GPU,
+Wayland and full console-panel performance qualification remain outside this run.
+The browser's own console history and the page heap are separate from Broxser's
+bounded text ring; releasing debugger bindings does not erase that history.
+
 ## P2.3 device console, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by `broxsertest`

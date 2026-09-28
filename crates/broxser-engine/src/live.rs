@@ -27,6 +27,8 @@ const COMMAND_QUEUE: usize = 512;
 const COMMANDS_PER_TURN: usize = 64;
 /// Socket read timeout of the live loop; bounds the delay before UI commands run.
 const LIVE_POLL: Duration = Duration::from_millis(8);
+/// Release debugger references in batches rather than once per console call.
+const CONSOLE_RELEASE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Input events, including the coalesced move and wheel in flight, that one
 /// page may leave unanswered before Broxser reports it as not responding.
@@ -94,7 +96,9 @@ mod ime;
 use ime::{IME_BINDING, IME_OBSERVER, IME_WORLD, parse_caret_report, valid_ime_action};
 mod console;
 use console::ConsoleLog;
-pub use console::{ConsoleEntry, ConsoleKind, ConsoleLevel, MAX_CONSOLE_ENTRIES, MAX_CONSOLE_TEXT};
+pub use console::{
+    ConsoleEntry, ConsoleKind, ConsoleLevel, ConsoleScope, MAX_CONSOLE_ENTRIES, MAX_CONSOLE_TEXT,
+};
 const JPEG_QUALITY: u32 = 80;
 /// Largest frame edge requested before the UI reports its display size.
 const DEFAULT_FRAME_EDGE: u32 = 2048;
@@ -111,7 +115,8 @@ pub struct LiveSession {
 impl LiveSession {
     /// Validates the workspace and starts the browser on a worker thread. The
     /// session opens the workspace URL once on every device. `notify` runs on the
-    /// worker after a new frame or status change; keep it cheap and non-blocking.
+    /// thread changing frames or status, including the caller clearing a console;
+    /// keep it cheap and non-blocking.
     pub fn start(
         workspace: Workspace,
         options: BrowserOptions,
@@ -158,9 +163,14 @@ impl LiveSession {
         })
     }
 
-    /// Queues a command. Returns `false` if the runtime stopped or is overloaded;
-    /// the command is then dropped, never replayed later.
+    /// Queues a browser command. Returns `false` if the runtime stopped or is
+    /// overloaded; the command is then dropped, never replayed later.
+    /// `ClearConsole` is local, runs immediately even after the worker stops,
+    /// and returns `false` only when the device does not exist.
     pub fn send(&self, command: Command) -> bool {
+        if let Command::ClearConsole { device } = command {
+            return self.shared.console(device, ConsoleLog::clear);
+        }
         self.commands.try_send(command).is_ok()
     }
 
@@ -426,7 +436,8 @@ pub enum Command {
         height: u32,
     },
     SetSync(SyncSettings),
-    /// Empties the device's console and resets its counts (ADR 0023).
+    /// Empties the device's local console and resets its counts, even after
+    /// the runtime stops. Sends nothing to the browser (ADR 0023).
     ClearConsole {
         device: usize,
     },
@@ -734,19 +745,24 @@ impl Shared {
     }
 
     /// Changes the console of `device` and publishes its counts.
-    fn console(&self, index: usize, change: impl FnOnce(&mut ConsoleLog)) {
-        let counts = {
+    fn console(&self, index: usize, change: impl FnOnce(&mut ConsoleLog)) -> bool {
+        {
             let mut logs = lock(&self.console);
             let Some(log) = logs.get_mut(index) else {
-                return;
+                return false;
             };
             change(log);
-            (log.errors, log.warnings)
-        };
-        self.device(index, |device| {
-            (device.console_errors, device.console_warnings) = counts;
-            device.console_revision = device.console_revision.wrapping_add(1);
-        });
+            // The worker pushes while the caller may clear. Keep mutation and
+            // publication in one order, always console then status, so a late
+            // publication cannot restore counts from before Clear.
+            if let Some(device) = lock(&self.status).devices.get_mut(index) {
+                (device.console_errors, device.console_warnings) = (log.errors, log.warnings);
+                device.console_revision = device.console_revision.wrapping_add(1);
+            }
+        }
+        // A callback may read either snapshot; release both locks first.
+        (self.notify)();
+        true
     }
 }
 
@@ -822,6 +838,15 @@ struct Controller<'a> {
     iframe_sessions: HashMap<String, IframeSession>,
     iframe_pending: HashMap<u64, IframeCommand>,
     iframe_cleanup: HashMap<String, IframeCleanup>,
+    console_releases: HashMap<String, ConsoleRelease>,
+}
+
+/// Runtime's console group holds RemoteObjects independently of our text ring.
+/// One maintenance request per active debugger session, with a bounded cadence.
+struct ConsoleRelease {
+    dirty: bool,
+    next: Instant,
+    pending: Option<(u64, Instant)>,
 }
 
 struct LinkIntent {
@@ -883,6 +908,9 @@ struct LiveDevice {
     /// The page's own main-frame context. Console entries from other
     /// contexts of the page session come from its same-process frames.
     main_context: Option<i64>,
+    /// A detached/crashed page session accepts no late console objects until
+    /// a new main-frame Runtime context proves the renderer is active again.
+    console_active: bool,
     ime_anchor: Option<u64>,
     ime_blocked_anchor: Option<u64>,
     ime_target: Option<u64>,
@@ -1141,16 +1169,26 @@ impl Commands for Controller<'_> {
             if let Some(response) = self.cdp.take_response(id) {
                 return parse_response(response, method);
             }
-            if !self.cdp.read_until(deadline)? {
+            if Instant::now() >= deadline {
                 bail!("CDP {method} response timed out");
             }
+            // Poll maintenance while a setup response is outstanding, even
+            // when no more console or browser events arrive.
+            self.cdp
+                .read_until(deadline.min(Instant::now() + LIVE_POLL))?;
             self.drain()?;
         }
     }
 }
 
 impl<'a> Controller<'a> {
-    fn new(cdp: Cdp, workspace: &'a Workspace, shared: &'a Shared, limits: Limits) -> Result<Self> {
+    fn new(
+        mut cdp: Cdp,
+        workspace: &'a Workspace,
+        shared: &'a Shared,
+        limits: Limits,
+    ) -> Result<Self> {
+        cdp.set_poll_interval(LIVE_POLL)?;
         Ok(Self {
             cdp,
             workspace,
@@ -1168,6 +1206,7 @@ impl<'a> Controller<'a> {
             iframe_sessions: HashMap::new(),
             iframe_pending: HashMap::new(),
             iframe_cleanup: HashMap::new(),
+            console_releases: HashMap::new(),
         })
     }
 
@@ -1189,6 +1228,7 @@ impl<'a> Controller<'a> {
             if self.cdp.read_until(Instant::now() + LIVE_POLL)? {
                 self.drain()?;
             }
+            self.flush_console_releases(Instant::now())?;
             self.expire(Instant::now())?;
             for (index, device) in self.devices.iter().enumerate() {
                 if device.iframe_activity_incomplete
@@ -1273,6 +1313,7 @@ impl<'a> Controller<'a> {
                 visible: true,
                 on_screen: true,
                 streaming: false,
+                console_active: true,
                 limit: (physical(device.width), physical(device.height)),
                 generation: 0,
                 link_context: None,
@@ -1343,7 +1384,6 @@ impl<'a> Controller<'a> {
                 Some(&self.devices.last().unwrap().session.clone()),
             )?;
         }
-        self.cdp.set_poll_interval(LIVE_POLL)?;
         self.shared
             .update(|status| status.runtime = RuntimeState::Running { product, protocol });
         for index in 0..self.devices.len() {
@@ -1493,9 +1533,6 @@ impl<'a> Controller<'a> {
                 }
             }
             Command::SetSync(settings) => self.set_sync(settings)?,
-            Command::ClearConsole { device } if device < count => {
-                self.shared.console(device, ConsoleLog::clear);
-            }
             #[cfg(test)]
             Command::CrashForTest { device } if device < count => {
                 // The crashing renderer may never answer.
@@ -2593,7 +2630,9 @@ impl<'a> Controller<'a> {
                 None => {}
             }
         }
-        Ok(())
+        // Setup's synchronous commands also drain events while another page
+        // is still being configured. Release their references there too.
+        self.flush_console_releases(Instant::now())
     }
 
     fn session_owner(&self, session: Option<&str>) -> Option<(usize, bool)> {
@@ -2763,6 +2802,7 @@ impl<'a> Controller<'a> {
             }
         }
         for session in retired {
+            self.forget_console_release(&session);
             if let Some(iframe) = self.iframe_sessions.remove(&session) {
                 let resume = match resumes.remove(&session) {
                     Some(id) => Some(id),
@@ -3197,6 +3237,49 @@ impl<'a> Controller<'a> {
         Ok(true)
     }
 
+    fn forget_console_release(&mut self, session: &str) {
+        if let Some(release) = self.console_releases.remove(session)
+            && let Some((id, _)) = release.pending
+        {
+            self.cdp.abandon(id);
+        }
+    }
+
+    /// Releases only debugger handles, after formatting the objects into text.
+    /// It never clears the browser's console history or acts on the page.
+    fn flush_console_releases(&mut self, now: Instant) -> Result<()> {
+        for (session, release) in &mut self.console_releases {
+            if let Some((id, deadline)) = release.pending {
+                if let Some(response) = self.cdp.take_response(id) {
+                    // A context or target disappearing is an ordinary race.
+                    // Errors here do not mean that input or rendering failed.
+                    release.pending = None;
+                    if error_message(&response).is_some() {
+                        release.dirty = true;
+                        release.next = now + CONSOLE_RELEASE_INTERVAL;
+                    }
+                } else if now >= deadline {
+                    self.cdp.abandon(id);
+                    release.pending = None;
+                    // Even without another console event, unreleased objects
+                    // still need cleanup. Retry only this debugger operation.
+                    release.dirty = true;
+                }
+            }
+            if release.dirty && release.pending.is_none() && now >= release.next {
+                let id = self.cdp.send(
+                    "Runtime.releaseObjectGroup",
+                    json!({"objectGroup": "console"}),
+                    Some(session),
+                )?;
+                release.dirty = false;
+                release.next = now + CONSOLE_RELEASE_INTERVAL;
+                release.pending = Some((id, now + self.limits.command));
+            }
+        }
+        Ok(())
+    }
+
     /// Adds a console call, an uncaught error or a browser log entry to the
     /// device's console (ADR 0023). Broxser's own isolated worlds are not the
     /// page's, so nothing from them is shown.
@@ -3223,10 +3306,18 @@ impl<'a> Controller<'a> {
         let Some(mut entry) = entry else {
             return;
         };
-        entry.subframe = iframe
-            || (context.is_some()
-                && device.main_context.is_some()
-                && context != device.main_context);
+        entry.scope = if iframe {
+            ConsoleScope::Subframe
+        } else {
+            match (context, device.main_context) {
+                (Some(context), Some(main)) if context == main => ConsoleScope::MainFrame,
+                (Some(_), Some(_)) => ConsoleScope::Subframe,
+                // Page Log events carry no execution context. Their session
+                // may also contain same-process frame activity, so a page
+                // session alone does not prove the main frame produced it.
+                _ => ConsoleScope::Unknown,
+            }
+        };
         self.shared.console(index, |log| log.push(entry));
     }
 
@@ -3304,6 +3395,7 @@ impl<'a> Controller<'a> {
                     Some(device.target_id.as_str()) == text("targetId")
                         || Some(device.session.as_str()) == text("sessionId")
                 }) {
+                    self.forget_console_release(&self.devices[index].session.clone());
                     let crashed = event.method == "Target.targetCrashed";
                     // The renderer or the session that owed these answers is
                     // gone; the error below describes the device instead.
@@ -3312,6 +3404,7 @@ impl<'a> Controller<'a> {
                     self.forget_navigation(index);
                     self.invalidate_ime(index);
                     self.devices[index].streaming = false;
+                    self.devices[index].console_active = false;
                     self.devices[index].dialog = None;
                     self.shared.device(index, |device| {
                         device.loading = false;
@@ -3354,7 +3447,34 @@ impl<'a> Controller<'a> {
             event.method.as_str(),
             "Runtime.consoleAPICalled" | "Runtime.exceptionThrown" | "Log.entryAdded"
         ) {
+            if !iframe && !self.devices[index].console_active {
+                return Ok(());
+            }
             self.observe_console(index, iframe, &event);
+            let args = match event.method.as_str() {
+                "Runtime.consoleAPICalled" => params.get("args"),
+                "Log.entryAdded" => params.pointer("/entry/args"),
+                _ => None,
+            };
+            let bound_objects = args.and_then(Value::as_array).is_some_and(|args| {
+                args.iter()
+                    .any(|arg| arg.get("objectId").and_then(Value::as_str).is_some())
+            }) || params
+                .pointer("/exceptionDetails/exception/objectId")
+                .and_then(Value::as_str)
+                .is_some();
+            // This also releases objects from ignored calls and Broxser's own
+            // isolated worlds; filtering the visible entry leaves CDP bindings.
+            if bound_objects && let Some(session) = &event.session {
+                self.console_releases
+                    .entry(session.clone())
+                    .or_insert_with(|| ConsoleRelease {
+                        dirty: false,
+                        next: Instant::now() + CONSOLE_RELEASE_INTERVAL,
+                        pending: None,
+                    })
+                    .dirty = true;
+            }
             return Ok(());
         }
         if self.observe_frame_lifecycle(index, &event)? || iframe {
@@ -3373,6 +3493,7 @@ impl<'a> Controller<'a> {
                         == Some(true)
                 {
                     self.devices[index].main_context = context.get("id").and_then(Value::as_i64);
+                    self.devices[index].console_active = true;
                 }
                 if let Some(context) = params.get("context")
                     && context.pointer("/auxData/frameId").and_then(Value::as_str)

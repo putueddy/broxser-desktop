@@ -13,8 +13,8 @@ use crate::{
 use anyhow::{Context as _, Result};
 use broxser_core::{AppState, PRESETS, WindowSize, Workspace, validate_url};
 use broxser_engine::{
-    BrowserOptions, Cancellation, Command, ConsoleEntry, ConsoleKind, ConsoleLevel, DeviceStatus,
-    DialogKind, DialogState, DownloadState, Frame, ImeAction, KeyInput, LiveSession,
+    BrowserOptions, Cancellation, Command, ConsoleEntry, ConsoleKind, ConsoleLevel, ConsoleScope,
+    DeviceStatus, DialogKind, DialogState, DownloadState, Frame, ImeAction, KeyInput, LiveSession,
     MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers, PasteRejected, PointerButton, PointerEvent,
     PointerKind, PopupState, RuntimeState, Status, SyncSettings, is_paste_key, paste_text,
     to_viewport,
@@ -809,6 +809,7 @@ impl LiveView {
         let selected = selected_after_visibility_change(self.selected, &hidden);
         if selected != self.selected {
             self.selected = selected;
+            self.read_console();
             if let Some(index) = selected
                 && let Some(url) = self
                     .status
@@ -2990,8 +2991,10 @@ fn console_row(entry: &ConsoleEntry) -> AnyElement {
         ConsoleKind::Network => tags.push("request".into()),
         ConsoleKind::Browser => tags.push("browser".into()),
     }
-    if entry.subframe {
-        tags.push("frame".into());
+    match entry.scope {
+        ConsoleScope::MainFrame => {}
+        ConsoleScope::Subframe => tags.push("frame".into()),
+        ConsoleScope::Unknown => tags.push("frame unknown".into()),
     }
     if entry.repeats > 1 {
         tags.push(format!("×{}", entry.repeats));

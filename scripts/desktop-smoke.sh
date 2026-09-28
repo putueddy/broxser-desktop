@@ -1130,7 +1130,7 @@ console_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/console.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -1190,6 +1190,89 @@ console_run() {
   [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
 }
 
+# The selected phone is off screen before Hide, so its stream is already
+# paused and hiding it need not publish any changed status. The panel must
+# still switch from its error to the tablet's warning. After browser exit,
+# Clear must work locally while the desktop's retained console stays readable.
+console_selection_run() {
+  local label=$1 before app window= failure= browser code=0 left_processes left_profiles
+  before=$(wc -l < "$work/requests")
+  "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/console.html?selection" &
+  app=$!
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
+  if [[ -z $window ]]; then
+    failure="no window within 20 s"
+  else
+    size_window "$window"
+    xdotool mousemove --window "$window" 900 400
+    for _ in $(seq 300); do
+      [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'console.html?logged' || true) -ge 3 ]] && break
+      sleep 0.1
+    done
+    xdotool key ctrl+shift+j
+    if ! find_color "$window" 240 180 310 280 e07a7a 8 10 >/dev/null; then
+      failure="phone error did not appear in its console"
+    else
+      # Wheel over the gap between cards scrolls the host canvas, not a page.
+      xdotool mousemove --window "$window" 824 500 click --repeat 20 --delay 30 5
+      sleep 0.5
+      xdotool mousemove --window "$window" 195 261 click 1
+      if ! find_color "$window" 240 180 310 280 e07a7a 8 5 absent >/dev/null; then
+        failure="Hide changed the selection but kept the phone's console"
+      elif ! find_color "$window" 240 180 310 280 f2b872 8 5 >/dev/null; then
+        failure="Hide did not show the tablet's warning"
+      else
+        browser=$(pgrep -P "$app" -f -- "--user-data-dir=$TMPDIR/broxser-cdp-" || true)
+        if [[ $(wc -w <<< "$browser") -ne 1 ]]; then
+          failure="expected one owned browser before exit"
+        else
+          kill -KILL "$browser"
+          for _ in $(seq 200); do
+            read -r left_processes left_profiles _ < <(leftovers)
+            [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+            sleep 0.05
+          done
+          if [[ $left_processes -ne 0 || $left_profiles -ne 0 ]]; then
+            failure="browser did not finish cleanup"
+          else
+            xdotool mousemove --window "$window" 525 122 click 1
+            if ! find_color "$window" 240 180 310 280 f2b872 8 5 absent >/dev/null; then
+              failure="Clear left retained messages after the browser exited"
+            else
+              # The desktop is still inspectable, and another device is intact.
+              xdotool mousemove --window "$window" 60 385 click 1
+              if ! find_color "$window" 240 180 310 280 f2b872 8 5 >/dev/null; then
+                failure="Clear removed the other device's retained messages"
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+  if kill -0 "$app" 2>/dev/null; then
+    [[ -n $window ]] && xdotool mousemove --window "$window" 900 400 key ctrl+q || true
+    if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
+      failure=${failure:-did not exit within 15 s of Ctrl+Q}
+      kill -TERM "$app" 2>/dev/null || true
+      timeout 5 tail -s 0.05 --pid="$app" -f /dev/null || kill -KILL "$app" 2>/dev/null || true
+    fi
+  fi
+  wait "$app" || code=$?
+  for _ in $(seq 100); do
+    read -r left_processes left_profiles _ < <(leftovers)
+    [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
+    sleep 0.05
+  done
+  echo "$label: ${failure:-followed Hide, cleared after browser exit and kept another device}; exit $code;" \
+    "$left_processes browser processes and $left_profiles profiles left"
+  if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
+    echo "$label: a Broxser window is still open" >&2
+    return 1
+  fi
+  [[ -z $failure && $code -eq 0 && $left_processes -eq 0 && $left_profiles -eq 0 ]]
+}
+
 run "live close" "/live.html" quit --url "http://127.0.0.1:$port/live.html"
 run "static close during held request" "/hang" quit --static --capture-on-start --url "http://127.0.0.1:$port/hang"
 run "live SIGKILL" "/live.html" KILL --url "http://127.0.0.1:$port/live.html"
@@ -1206,4 +1289,5 @@ touch_run "touch cancellation through the canvas"
 workspace_run "workspace panel edits a draft and saves it"
 apply_input_run "input right after Apply removed a device"
 console_run "console panel counts and clears one device"
+console_selection_run "console follows selection and clears after browser exit"
 echo "desktop smoke passed"
