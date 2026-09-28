@@ -3,6 +3,103 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P2.2 persistent session audit, 27 September 2026 (cloud container)
+
+Audit only; nothing is implemented, and the proposal is
+[ADR 0021](adr/0021-persistent-sessions-one-profile-per-session.md) (not
+accepted). Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by
+`broxsertest` with the sandbox enabled and Broxser's launch flags (private
+home, `--password-store=basic`), an on-disk profile as `--user-data-dir`, a
+page in the browser's default context, and a scratch Node fixture on a fixed
+port that sets `persistent` (Max-Age one day), `session` (`HttpOnly`) and
+`visible` cookies, localStorage, sessionStorage and an IndexedDB value.
+Chromium 141 (the Playwright build here) played the older browser. These are
+reported observations from that scratch probe; its script and raw results were
+not committed and have not been rerun in the documentation review below. They
+do not qualify the current Broxser startup, which now uses separate temporary
+discovery, or a persistent-session implementation.
+
+### What the on-disk profile keeps
+
+| Run | Cookies seen after the restart | localStorage / IndexedDB | sessionStorage |
+| --- | --- | --- | --- |
+| Clean close (`Browser.close`), restart | `persistent` only | Kept | Gone |
+| Restart after a SIGKILL of an idle browser (the values had been flushed by the earlier close) | `persistent` only | Kept | Gone |
+| SIGKILL 12 s after the login page set everything, restart | None; `Preferences` `profile.exit_type` was `Crashed` | Kept | Gone |
+| `session.restore_on_startup = 1` seeded before the first run, clean close, restart | `persistent`, `session` (`HttpOnly`) and `visible` | Kept | Gone |
+| The profile opened by Chromium 141, then by Helium again | Chromium answered `Browser.getVersion` and no `Target.getTargets` within 8 s; Helium afterwards saw everything as before | — | — |
+
+Other measurements: an off-the-record context created in the same browser saw
+no cookie, storage or permission of the profile; `Browser.setDownloadBehavior`
+and `Browser.setPermission` sent without `browserContextId` applied to the
+default context (`notifications` `denied` there, `prompt` in the created
+context); the profile held 2.6 MB after one run and 5.0 MB after five; the CDP
+endpoint came up in 150 ms with a warm profile; the previous run's
+`DevToolsActivePort` stays in the directory and must not be trusted as the new
+launch's endpoint. The
+`Default/Cookies` SQLite file holds every cookie, session cookies included,
+with `v10` values that a short script decrypted with the fixed password of
+`--password-store=basic` (PBKDF2 of `peanuts`, 16 space bytes as the IV), so
+at rest the profile is protected by its mode and the disk only.
+
+### Limits
+
+- Measured with one browser, one page and a local fixture; no application
+  under test, no Helium update between runs.
+- The cookie flush interval was not measured beyond "lost after 12 s, kept
+  after a clean close". This establishes neither a maximum loss window nor
+  power-loss durability; the SIGKILL survival case used already-flushed data.
+- Reading `profile.exit_type` right after a close is not reliable (it still
+  read `Crashed` once after a clean close).
+- The downgrade probe changed both product and Chromium major and observed an
+  eight-second target-query timeout. It proves neither categorical profile
+  incompatibility nor corruption, and later Helium readability does not prove
+  every profile file remained compatible or unchanged.
+- Session-cookie survival did not qualify tab/navigation restoration or prove
+  that default-context extensions cannot reload pages. The incognito seed of
+  ADR 0004 leaves the default-context blocker enabled.
+- Not measured: resource cost and disk growth of several persistent browsers,
+  imported/copied workspace profile binding, exclusive ownership, all-path
+  retention/Forget, the workspace UI, and any migration. A 150 ms endpoint and
+  a 2.6–5.0 MB fixture profile are not end-to-end performance or storage bounds.
+
+### PR #22 documentation review, 28 September 2026
+
+Review of `7ab0349` compared the proposal with the current ownership code and
+ADRs 0002–0004, 0007, 0019 and 0020. Corrections keep ADR 0021 **proposed** and
+the runtime **ephemeral**:
+
+- Removed the assumption that the existing incognito blocker seed works in a
+  persistent default context. Qualification must cover the default context and
+  absence of extension-induced reloads before application navigation.
+- Made restore-on-startup a gated candidate, not an unconditional recipe for
+  persistent login. Upstream tab-restore behavior depends on launch arguments;
+  a request trace for the actual launcher is still needed to meet no-replay.
+- Extended retention to owner shutdown, failed startup, Drop, guardian and
+  stale recovery. Current ephemeral cleanup deletes through all these paths.
+  Profile binding, exclusive ownership, fresh endpoints and safe Forget need
+  explicit acceptance evidence before any persistent directory is opened.
+- Replaced a creator-major-only check with full runtime/last-writer compatibility
+  and qualified migration, without delaying browser security updates. Qualified
+  the single downgrade timeout rather than treating it as a universal result.
+- Removed claims of bounded cookie loss, a few-megabyte storage budget and no
+  data outside the profile. Fixed-key durable storage needs separate acceptance;
+  deleting a directory is not secure erasure or deletion of exports/backups.
+- Corrected the cookie-export rationale: CDP can expose `HttpOnly` cookies;
+  portable JSON secrecy and incomplete site storage are the reasons to reject it.
+
+This review changes documentation only. No persistent profile, migration, restore
+feature or gate acceptance has been implemented. No local live Helium or GUI
+rerun is required for these document changes. Existing CI still runs its normal
+checks; those protect the unchanged runtime and do not validate the proposal.
+
+| Documentation-review check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, strict Clippy, 1 CLI, 8 core, 142 engine and 36 desktop tests; 51 live tests ignored by default |
+| Local Markdown links in the four changed documents | 34 links resolve |
+| `git diff --check` and independent design review | Passed; no remaining actionable finding in the revised proposal |
+| Local Helium and desktop smoke | Not rerun: no engine or GUI code changed; persistent-session acceptance remains unvalidated |
+
 ## P2.1 storage and credential boundary, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by the unprivileged

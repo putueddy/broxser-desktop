@@ -415,6 +415,11 @@ yang dihemat dan beban maintenance.
 - Helium filtering/fingerprinting behavior: diukur dan sebagian disamakan di ADR 0019; noise
   canvas/audio per session tetap milik Helium dan blocker tetap mati di session.
 - Bagaimana secret store, persistent session, signed package dan distribusi internal akan dikelola?
+  Persistent session: usulan di ADR 0021 (satu profil on-disk per session persisten,
+  retensi pada semua jalur cleanup, kompatibilitas runtime lengkap/penulis terakhir,
+  tanpa keyring). Gate mencakup binding lokal/ownership, default-context blocker,
+  pencegahan restore navigasi lama dan durabilitas; belum diterima, default tetap
+  ephemeral. Merge audit tidak mengaktifkan atau menyetujui fitur tersebut.
 
 ## 12. Decision and next steps
 
