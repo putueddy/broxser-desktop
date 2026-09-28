@@ -30,8 +30,8 @@ pub use live::{
     CaretRect, Command, ConsoleEntry, ConsoleKind, ConsoleLevel, ConsoleScope, DeviceStatus,
     DialogKind, DialogState, DownloadState, Frame, ImeAction, KeyInput, LiveSession,
     MAX_CONSOLE_ENTRIES, MAX_CONSOLE_TEXT, MAX_DIALOG_CHARS, MAX_PASTE_CHARS, Modifiers,
-    PasteRejected, PointerButton, PointerEvent, PointerKind, PopupState, RuntimeState, Status,
-    SyncSettings, TextInputState, is_paste_key, paste_text, to_viewport,
+    PasteRejected, PointerButton, PointerEvent, PointerKind, PopupState, RuntimeState, Screenshot,
+    ScreenshotResult, Status, SyncSettings, TextInputState, is_paste_key, paste_text, to_viewport,
 };
 
 /// Per-operation deadlines. These are not an SLA for a whole job.

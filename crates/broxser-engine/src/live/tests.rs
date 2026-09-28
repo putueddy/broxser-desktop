@@ -530,6 +530,14 @@ impl FakePeer {
                         result
                     }
                     "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
+                    // A complete 2 × 3 PNG for every device but the tablet,
+                    // whose reply is no PNG.
+                    "Page.captureScreenshot" if session.as_deref() == Some("S1") => {
+                        json!({"data": "bm90IGEgcG5n"})
+                    }
+                    "Page.captureScreenshot" => {
+                        json!({"data": base64::engine::general_purpose::STANDARD.encode(test_screenshot_png())})
+                    }
                     _ => json!({}),
                 };
                 let reply = |result: Value| {
@@ -7138,21 +7146,38 @@ fn live_certificate_trust_is_the_browsers_own_not_the_users() {
         "the browser's error page",
         Duration::from_secs(30),
         |status| {
-            status
-                .devices
-                .iter()
-                .all(|device| !device.loading && device.frames > 0)
+            // A navigation error can arrive while an initial about:blank
+            // screencast frame is still current. Reload that only after an
+            // error-page document has committed, rather than reloading blank.
+            status.devices.iter().all(|device| {
+                !device.loading
+                    && device.frames > 0
+                    && !device.url.is_empty()
+                    && device.url != "about:blank"
+            })
         },
     );
     let error = status.devices[0].error.clone();
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("net::ERR_CERT_AUTHORITY_INVALID")),
+        "the committed error page lost its certificate report: {:?}",
+        status.devices[0]
+    );
     let frames = status.devices[0].frames;
+    let revision = status.devices[0].page_revision;
     live.send(Command::Reload { device: 0 });
     // Wait for another error-page frame after the explicit Reload. Page.reload
     // returns no errorText, so the last confirmed report stays.
     let status = live.wait(
         "the reloaded error page",
         Duration::from_secs(30),
-        |status| status.devices[0].frames > frames && !status.devices[0].loading,
+        |status| {
+            status.devices[0].page_revision > revision
+                && status.devices[0].frames > frames
+                && !status.devices[0].loading
+        },
     );
     assert_eq!(status.devices[0].error, error);
     let fixture = fixture();
@@ -7659,6 +7684,8 @@ fn concurrent_console_clear_and_push_publish_consistent_snapshots() {
                 ..Status::default()
             }),
             console: Mutex::new(vec![ConsoleLog::default(), ConsoleLog::default()]),
+            screenshots: Mutex::new(vec![None, None]),
+            screenshot_requests: Mutex::new(ScreenshotRequests::default()),
             notify: Box::new(move || {
                 let shared = weak.upgrade().unwrap();
                 // Callbacks can read both snapshots without deadlocking. The
@@ -7711,15 +7738,22 @@ fn concurrent_console_clear_and_push_publish_consistent_snapshots() {
         for round in 0..ROUNDS {
             barrier.wait();
             barrier.wait();
-            let logs = lock(&shared.console);
-            let status = live.status();
-            assert_eq!(status.devices[0].console_errors, logs[0].errors);
-            assert_eq!(status.devices[0].console_warnings, logs[0].warnings);
-            assert_eq!(status.devices[0].console_revision, (round as u64 + 1) * 2);
-            assert_eq!(status.devices[1], other_status);
+            let (status, entries) = live.console_snapshot(0).unwrap();
+            assert_eq!(
+                status.console_errors,
+                entries
+                    .iter()
+                    .filter(|entry| entry.level == ConsoleLevel::Error)
+                    .map(|entry| entry.repeats)
+                    .sum::<u32>()
+            );
+            assert_eq!(status.console_warnings, 0);
+            assert_eq!(status.console_revision, (round as u64 + 1) * 2);
+            assert_eq!(live.console_snapshot(1).unwrap().0, other_status);
         }
     });
     assert_eq!(live.console(1), other);
+    assert!(live.console_snapshot(2).is_none());
     assert_eq!(notified.load(Ordering::SeqCst), ROUNDS * 2 + 1);
 }
 
@@ -8024,6 +8058,521 @@ console.log('probe-done');
             .iter()
             .any(|entry| entry.text == "probe-done"),
         "cleanup preserves displayed history"
+    );
+    live.close();
+}
+
+fn test_screenshot_png() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, 2, 3);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[128; 24]).unwrap();
+        writer.finish().unwrap();
+    }
+    bytes
+}
+
+fn settle_screenshot_pages(peer: &FakePeer) {
+    for n in 0..3 {
+        peer.event(json!({"method": "Page.frameNavigated", "sessionId": format!("S{n}"),
+            "params": {"frame": {"id": format!("T{n}"), "url": "http://127.0.0.1:4173/", "loaderId": format!("L{n}")}}}));
+        peer.event(
+            json!({"method": "Page.frameStoppedLoading", "sessionId": format!("S{n}"),
+            "params": {"frameId": format!("T{n}")}}),
+        );
+    }
+    wait_until_read(peer);
+}
+
+/// Waits for the screenshot result of `device`.
+fn screenshot_of(live: &LiveSession, device: usize) -> (u64, ScreenshotResult) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = live.take_screenshot(device) {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no screenshot result for device {device}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn screenshots_require_complete_bounded_png_data() {
+    let parse = |bytes: &[u8]| {
+        parse_screenshot(json!({"id": 1, "result": {
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes)}}))
+    };
+    let good = test_screenshot_png();
+    assert!(parse(&good).is_ok());
+    let header = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAAAAAAA")
+        .unwrap();
+    assert!(
+        parse(&header).is_err(),
+        "a header with no CRC/IDAT/IEND is not an image"
+    );
+    let mut bad_crc = good.clone();
+    bad_crc[29] ^= 1;
+    assert!(parse(&bad_crc).is_err(), "IHDR CRC must be checked");
+    assert!(parse(&good[..good.len() - 12]).is_err(), "IEND is required");
+    assert!(
+        parse(&good[..40]).is_err(),
+        "partial compressed data is rejected"
+    );
+    let mut enormous = header.clone();
+    enormous[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(
+        parse(&enormous).unwrap_err().contains("size limit"),
+        "check dimensions before decoder allocation"
+    );
+    let mut bad_idat = good.clone();
+    let idat = bad_idat
+        .windows(4)
+        .position(|bytes| bytes == b"IDAT")
+        .unwrap();
+    bad_idat[idat + 4] ^= 1;
+    assert!(
+        parse(&bad_idat).is_err(),
+        "compressed image checksum must be checked"
+    );
+}
+
+#[test]
+fn screenshots_are_invalidated_by_page_changes_without_replay() {
+    for transition in [
+        "navigate", "start", "loading", "commit", "within", "crash", "detach", "hide", "dialog",
+    ] {
+        let root = profile_root();
+        let peer = FakePeer::start(root.path(), |method, _| method == "Page.captureScreenshot");
+        let live = fake_live(root.path(), Limits::default());
+        settle_screenshot_pages(&peer);
+        let revision = live.status().devices[0].page_revision;
+        assert!(live.send(Command::Screenshot {
+            device: 0,
+            token: 41,
+            expected_revision: revision
+        }));
+        wait_for_requests(&peer, "Page.captureScreenshot", "S0", 1);
+        match transition {
+            "navigate" => { assert!(live.send(Command::Reload { device: 0 })); }
+            "start" => peer.event(phone("Page.frameStartedNavigating", json!({"frameId": "T0", "navigationType": "differentDocument", "loaderId": "NEXT", "url": "http://127.0.0.1:4173/next"}))),
+            "loading" => peer.event(phone("Page.frameStartedLoading", json!({"frameId": "T0"}))),
+            "commit" => peer.event(commit("NEXT", "http://127.0.0.1:4173/next", json!({}))),
+            "within" => peer.event(phone("Page.navigatedWithinDocument", json!({"frameId": "T0", "url": "http://127.0.0.1:4173/#new"}))),
+            "crash" => peer.event(json!({"method": "Target.targetCrashed", "params": {"targetId": "T0"}})),
+            "detach" => peer.event(json!({"method": "Target.detachedFromTarget", "params": {"sessionId": "S0"}})),
+            "hide" => { assert!(live.send(Command::SetVisible { device: 0, visible: false })); }
+            "dialog" => peer.event(dialog_opening("alert", "wait", "")),
+            _ => unreachable!(),
+        }
+        let (token, result) = screenshot_of(&live, 0);
+        assert_eq!(token, 41, "{transition}");
+        assert!(result.is_err(), "{transition} must retire the capture");
+        assert!(
+            live.status().devices[0].page_revision > revision,
+            "{transition}"
+        );
+        assert_ne!(
+            live.status().devices[0].error.as_deref(),
+            Some(NOT_RESPONDING)
+        );
+        peer.release();
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            live.take_screenshot(0).is_none(),
+            "{transition}: late reply must be discarded"
+        );
+        assert_eq!(
+            peer.count("Page.captureScreenshot", "S0"),
+            1,
+            "{transition}: no replay"
+        );
+        drop(live);
+    }
+}
+
+#[test]
+fn stale_queued_screenshot_revision_is_refused_before_cdp() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |_, _| false);
+    let live = fake_live(root.path(), Limits::default());
+    settle_screenshot_pages(&peer);
+    let revision = live.status().devices[0].page_revision;
+    peer.event(phone(
+        "Page.navigatedWithinDocument",
+        json!({"frameId": "T0", "url": "http://127.0.0.1:4173/#new"}),
+    ));
+    wait_until_read(&peer);
+    assert!(live.send(Command::Screenshot {
+        device: 0,
+        token: 51,
+        expected_revision: revision
+    }));
+    let (token, result) = screenshot_of(&live, 0);
+    assert_eq!(token, 51);
+    assert!(result.unwrap_err().contains("page changed"));
+    assert_eq!(peer.count("Page.captureScreenshot", "S0"), 0);
+    let revision = live.status().devices[0].page_revision;
+    assert!(live.send(Command::Screenshot {
+        device: 0,
+        token: 52,
+        expected_revision: revision
+    }));
+    assert!(
+        screenshot_of(&live, 0).1.is_ok(),
+        "an explicit fresh snapshot works"
+    );
+    drop(live);
+}
+
+#[test]
+fn worker_stop_completes_inflight_and_not_yet_processed_screenshot_tokens() {
+    for queued in [false, true] {
+        let root = profile_root();
+        let peer = FakePeer::start(root.path(), move |method, session| {
+            method == "Page.captureScreenshot"
+                || (queued && method == "Runtime.enable" && session == Some("S2"))
+        });
+        let mut live = if queued {
+            let live = LiveSession::start_with(
+                workspace("http://127.0.0.1:4173/".into()),
+                fake_options(root.path()),
+                Limits::default(),
+                || {},
+            )
+            .unwrap();
+            wait_for_requests(&peer, "Runtime.enable", "S2", 1);
+            live
+        } else {
+            let live = fake_live(root.path(), Limits::default());
+            settle_screenshot_pages(&peer);
+            live
+        };
+        assert!(live.send(Command::Screenshot {
+            device: 0,
+            token: 61,
+            expected_revision: live.status().devices[0].page_revision
+        }));
+        if !queued {
+            wait_for_requests(&peer, "Page.captureScreenshot", "S0", 1);
+        }
+        live.cancel.cancel();
+        live.worker.take().unwrap().join().unwrap();
+        let (token, result) = screenshot_of(&live, 0);
+        assert_eq!(token, 61);
+        assert!(result.unwrap_err().contains("runtime stopped"));
+        assert!(matches!(
+            live.status().runtime,
+            RuntimeState::Stopped { .. }
+        ));
+        assert!(!live.send(Command::Screenshot {
+            device: 0,
+            token: 62,
+            expected_revision: 0
+        }));
+        assert_eq!(
+            peer.count("Page.captureScreenshot", "S0"),
+            usize::from(!queued)
+        );
+        drop(live);
+    }
+}
+
+#[test]
+fn terminal_navigations_allow_fresh_screenshots_without_an_extra_loading_event() {
+    for terminal in [
+        "download",
+        "failure",
+        "timeout",
+        "stay",
+        "stay_reply_first",
+        "page_stay",
+        "reload_failure",
+    ] {
+        let root = profile_root();
+        let peer = if terminal == "download" {
+            FakePeer::start(root.path(), |_, _| false)
+        } else if terminal == "reload_failure" {
+            FakePeer::start(root.path(), |method, session| {
+                method == "Page.reload" && session == Some("S0")
+            })
+        } else {
+            peer_holding_phone_navigations(root.path())
+        };
+        let live = fake_live(
+            root.path(),
+            Limits {
+                load: Duration::from_millis(500),
+                ..Limits::default()
+            },
+        );
+        settle_screenshot_pages(&peer);
+        let before = live.status().devices[0].page_revision;
+        match terminal {
+            "page_stay" => peer.event(phone("Page.frameRequestedNavigation",
+                json!({"frameId": "T0", "disposition": "currentTab", "reason": "scriptInitiated", "url": "http://127.0.0.1:4173/next"}))),
+            "reload_failure" => {
+                assert!(live.send(Command::Reload { device: 0 }));
+                wait_for_requests(&peer, "Page.reload", "S0", 1);
+            }
+            _ => {
+                assert!(live.send(Command::NavigateAll { url: format!("http://127.0.0.1:4173/{terminal}") }));
+                wait_for_requests(&peer, "Page.navigate", "S0", 2);
+            }
+        }
+        match terminal {
+            "failure" => peer.event(failed_navigate_reply(&peer, "net::ERR_CONNECTION_REFUSED")),
+            "reload_failure" => peer.event(json!({"id": peer.last_request_id("Page.reload", "S0"),
+                "result": {"errorText": "net::ERR_ABORTED"}})),
+            "stay" | "stay_reply_first" | "page_stay" => {
+                if terminal == "page_stay" {
+                    peer.event(phone("Page.frameStartedLoading", json!({"frameId": "T0"})));
+                }
+                peer.event(dialog_opening("beforeunload", "", ""));
+                let dialog = phone_dialog(&live);
+                answer_phone(&live, dialog.token, false, None);
+                wait_for_requests(&peer, "Page.handleJavaScriptDialog", "S0", 1);
+                if terminal == "stay_reply_first" {
+                    peer.event(failed_navigate_reply(&peer, "net::ERR_ABORTED"));
+                }
+                peer.event(dialog_closed(false));
+                if terminal == "stay" {
+                    peer.event(failed_navigate_reply(&peer, "net::ERR_ABORTED"));
+                }
+            }
+            _ => {}
+        }
+        wait_for(
+            &live,
+            "the terminal navigation",
+            Duration::from_secs(2),
+            |status| {
+                status.devices[0].page_revision > before
+                    && !status.devices[0].loading
+                    && status.devices[0].dialog.is_none()
+            },
+        );
+        assert!(live.send(Command::Screenshot {
+            device: 0,
+            token: 71,
+            expected_revision: before
+        }));
+        assert!(
+            screenshot_of(&live, 0)
+                .1
+                .unwrap_err()
+                .contains("page changed"),
+            "{terminal}: the old snapshot stays invalid"
+        );
+        let current = live.console_snapshot(0).unwrap().0;
+        assert!(live.send(Command::Screenshot {
+            device: 0,
+            token: 72,
+            expected_revision: current.page_revision
+        }));
+        let (_, result) = screenshot_of(&live, 0);
+        assert!(
+            result.is_ok(),
+            "{terminal}: fresh screenshot must work: {result:?}"
+        );
+        assert_eq!(
+            peer.count("Page.captureScreenshot", "S0"),
+            1,
+            "{terminal}: only the explicit fresh capture"
+        );
+        drop(live);
+    }
+}
+
+/// ADR 0024: a screenshot is taken on request as a checked PNG, with its
+/// token; a reply that is no PNG, no reply within the command limit, a second
+/// request while one is in flight, a hidden device and a page frozen by its
+/// dialog each end with a reason, and none of them counts as unanswered input.
+#[test]
+fn screenshots_are_taken_on_request_checked_and_bounded() {
+    let root = profile_root();
+    let peer = FakePeer::start(root.path(), |method, session| {
+        method == "Page.captureScreenshot" && session == Some("S2")
+    });
+    let live = fake_live(
+        root.path(),
+        Limits {
+            command: Duration::from_secs(1),
+            ..Limits::default()
+        },
+    );
+    settle_screenshot_pages(&peer);
+    assert!(live.send(Command::Screenshot {
+        device: 0,
+        token: 7,
+        expected_revision: live.status().devices[0].page_revision
+    }));
+    let (token, result) = screenshot_of(&live, 0);
+    let screenshot = result.unwrap();
+    assert_eq!((token, screenshot.width, screenshot.height), (7, 2, 3));
+    assert!(screenshot.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        peer.last_params("Page.captureScreenshot", "S0"),
+        json!({"format": "png", "fromSurface": true, "captureBeyondViewport": false})
+    );
+
+    assert!(live.send(Command::Screenshot {
+        device: 1,
+        token: 8,
+        expected_revision: live.status().devices[1].page_revision
+    }));
+    assert_eq!(
+        screenshot_of(&live, 1),
+        (8, Err("The browser's screenshot was not a PNG.".into()))
+    );
+
+    // The desktop's reply is held: a second request is refused at once, the
+    // first ends at the command limit, and the page is not "not responding".
+    assert!(live.send(Command::Screenshot {
+        device: 2,
+        token: 9,
+        expected_revision: live.status().devices[2].page_revision
+    }));
+    wait_for_requests(&peer, "Page.captureScreenshot", "S2", 1);
+    assert!(live.send(Command::Screenshot {
+        device: 2,
+        token: 10,
+        expected_revision: live.status().devices[2].page_revision
+    }));
+    assert_eq!(
+        screenshot_of(&live, 2),
+        (
+            10,
+            Err("A screenshot of this device is already being taken.".into())
+        )
+    );
+    assert_eq!(
+        screenshot_of(&live, 2),
+        (
+            9,
+            Err("The browser returned no screenshot within 1 seconds.".into())
+        )
+    );
+    assert_eq!(live.status().devices[2].error, None);
+    assert_eq!(peer.count("Page.captureScreenshot", "S2"), 1);
+
+    assert!(live.send(Command::SetVisible {
+        device: 0,
+        visible: false
+    }));
+    assert!(live.send(Command::Screenshot {
+        device: 0,
+        token: 11,
+        expected_revision: live.status().devices[0].page_revision
+    }));
+    assert_eq!(
+        screenshot_of(&live, 0),
+        (11, Err("Show the device to take its screenshot.".into()))
+    );
+
+    peer.event(tablet(
+        "Page.javascriptDialogOpening",
+        json!({"type": "alert", "message": "hi", "url": "http://127.0.0.1:4173/"}),
+    ));
+    wait_for(
+        &live,
+        "the tablet's dialog",
+        Duration::from_secs(2),
+        |status| status.devices[1].dialog.is_some(),
+    );
+    assert!(live.send(Command::Screenshot {
+        device: 1,
+        token: 12,
+        expected_revision: live.status().devices[1].page_revision
+    }));
+    assert_eq!(
+        screenshot_of(&live, 1),
+        (
+            12,
+            Err("Answer the page's dialog first; the page is frozen until then.".into())
+        )
+    );
+    assert_eq!(peer.count("Page.captureScreenshot", "S0"), 1);
+    assert_eq!(peer.count("Page.captureScreenshot", "S1"), 1);
+    drop(live);
+}
+
+/// ADR 0024 with Helium: each device's screenshot is its CSS viewport at its
+/// device scale, a PNG that decodes.
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_screenshots_show_each_viewport_at_its_scale() {
+    let server = fixture();
+    let live = Live::start(workspace(server.url("/")));
+    live.wait(
+        "frames on every device",
+        Duration::from_secs(30),
+        |status| {
+            status
+                .devices
+                .iter()
+                .all(|device| device.frames > 0 && !device.loading)
+        },
+    );
+    for (device, token) in [(0, 21), (1, 22), (2, 23)] {
+        assert!(live.session().send(Command::Screenshot {
+            device,
+            token,
+            expected_revision: live.session().status().devices[device].page_revision
+        }));
+    }
+    for (device, token, size) in [
+        (0, 21, (720, 1280)),
+        (1, 22, (600, 800)),
+        (2, 23, (1000, 700)),
+    ] {
+        let (got, result) = screenshot_of(live.session(), device);
+        assert_eq!(got, token);
+        let screenshot = result.unwrap();
+        assert_eq!(
+            (screenshot.width, screenshot.height),
+            size,
+            "device {device}"
+        );
+        let decoder = png::Decoder::new(std::io::Cursor::new(&screenshot.png));
+        let reader = decoder.read_info().expect("a PNG that decodes");
+        assert_eq!((reader.info().width, reader.info().height), size);
+    }
+    let before = live.session().console_snapshot(0).unwrap().0;
+    let next = server.url("/next");
+    live.send(Command::NavigateAll { url: next.clone() });
+    live.wait(
+        "the new page after report snapshot",
+        Duration::from_secs(30),
+        |status| status.devices[0].url == next && !status.devices[0].loading,
+    );
+    assert!(live.session().status().devices[0].page_revision > before.page_revision);
+    live.send(Command::Screenshot {
+        device: 0,
+        token: 31,
+        expected_revision: before.page_revision,
+    });
+    let (token, stale) = screenshot_of(live.session(), 0);
+    assert_eq!(token, 31);
+    assert!(
+        stale.unwrap_err().contains("page changed"),
+        "a new-page PNG must not be paired with the old report snapshot"
+    );
+    let current = live.session().console_snapshot(0).unwrap().0;
+    live.send(Command::Screenshot {
+        device: 0,
+        token: 32,
+        expected_revision: current.page_revision,
+    });
+    assert!(
+        screenshot_of(live.session(), 0).1.is_ok(),
+        "fresh explicit capture after navigation works"
     );
     live.close();
 }

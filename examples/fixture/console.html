@@ -12,8 +12,9 @@
 </head>
 <body>
 <script>
-  // Every device reports one error and one warning; the smoke check expects
-  // each card to count them and the Console panel to show and clear them.
+  // By default every device reports two errors and one warning; the smoke
+  // check expects each card to count them and the Console panel to show and
+  // clear them.
   if (new URLSearchParams(location.search).has('selection')) {
     // Different levels let the window smoke distinguish a stale phone console
     // from the tablet's console after Hide changes the selection.
@@ -22,6 +23,15 @@
   } else {
     console.error('smoke error on', innerWidth);
     console.warn('smoke warning on', innerWidth);
+    // A report must not keep the query or fragment of this address.
+    console.error('failed at', location.href);
+    // These are diagnostic strings only; no request visits these addresses.
+    console.log('redaction cases',
+      'http://[::1]/path?token=ipv6-secret',
+      'http://éxample.test/path?token=unicode-secret',
+      'https://host/photo(1).png?token=paren-secret',
+      'Bearer short-secret',
+      'https://host/reset/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl');
   }
   fetch('/console.html?logged');
 </script>

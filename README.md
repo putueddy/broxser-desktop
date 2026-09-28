@@ -12,7 +12,8 @@ aksesibilitas belum didukung; dialog JavaScript dijawab pengguna di kartu, jende
 yang dibuka halaman ditutup dan dilaporkan, download ditolak dan dilaporkan, dan
 permission yang akan menunggu prompt ditolak (ADR 0014–0017); frame device DPR>1
 tiba pada resolusi CSS. Console, error dan request gagal setiap device terlihat di
-panel Console (ADR 0023). Belum ada persistent login, DevTools panel atau export laporan bug.
+panel Console (ADR 0023), dan **Save report** menyimpan screenshot serta laporan
+yang disunting untuk bug report (ADR 0024). Belum ada persistent login atau DevTools panel.
 IME memakai input handler native untuk preedit, commit dan posisi kandidat pada
 kontrol teks main frame; batas dan kualifikasinya ada di [ADR 0011](docs/adr/0011-native-ime-on-device-canvas.md).
 Ini belum pengganti Sizzy. Mode capture statis tetap tersedia lewat `--static`.
@@ -78,6 +79,7 @@ deterministik untuk capture statis.
 | **Restart runtime** | Muncul setelah browser berhenti dan selama tidak ada restart atau close berjalan; memulai satu runtime, memulihkan konfigurasi, tidak memutar ulang aksi |
 | **Workspace** / `Ctrl+Shift+W` | Panel draft workspace: **Add** menambah device dari preset kelas viewport generik ke session device terpilih, **Remove** menghapus device (bukan yang terakhir), **Apply (restart)** menjalankan ulang runtime dengan draft, **Save** menulis draft dan URL ke file workspace yang dimuat (demo tidak punya file), **Discard** membuang draft. Runtime yang berjalan tidak berubah sebelum Apply (ADR 0022) |
 | **Console** / `Ctrl+Shift+J` / jumlah error di kartu | Console device terpilih, terbaru di atas: panggilan console halaman, error dan rejection yang tidak tertangani, request gagal dan pesan browser lain, termasuk iframe lintas situs (ditandai *frame*; *frame unknown* bila CDP tidak memberi identitas frame); 200 entri terbaru, lokasi tanpa query. Hanya di memori: **Clear** mengosongkan device itu walau browser sudah berhenti, Restart dan menutup Broxser menghapus semuanya. Pesan worker belum tampil (ADR 0023) |
+| **Save report** di panel Console | Screenshot PNG viewport device terpilih pada skalanya dan `report.md` (device, session, halaman, browser, console) ke folder baru di `BROXSER_REPORT_DIR`, atau `Broxser` di direktori unduhan. Alamat tanpa query, fragment dan user info; teks console tanpa token berbentuk JWT dan kredensial bearer, sisanya apa adanya. Hanya ditulis saat diklik dan tidak pernah dihapus atau dikirim Broxser (ADR 0024) |
 | `Ctrl+Q` / tutup window | Menunggu browser berhenti dan profil dihapus; saat restart berjalan, tidak memulai browser baru |
 
 Go, Reload, sync atau membuka workspace yang tidak mendapat respons dalam 30 detik

@@ -16,9 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tungstenite.workspace = true
+png = "0.18"
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
-
-[dev-dependencies]
-png = "0.18"

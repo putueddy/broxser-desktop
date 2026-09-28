@@ -3,8 +3,10 @@
 //! A workspace is untrusted input. Call [`Workspace::validate`] before using a
 //! value built in memory; [`Workspace::load`] and [`Workspace::save`] do this for you.
 
+mod redact;
 mod state;
 
+pub use redact::{redact_text, redact_url};
 pub use state::{AppState, MAX_RECENT_WORKSPACES, STATE_SCHEMA_VERSION, WindowSize};
 
 use serde::{Deserialize, Serialize};

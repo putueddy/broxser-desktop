@@ -1,6 +1,7 @@
 mod ime;
 mod lifecycle;
 mod live_view;
+mod report;
 mod static_view;
 mod url_input;
 

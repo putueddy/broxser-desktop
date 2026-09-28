@@ -117,6 +117,21 @@ also drop them. Inspector references to logged objects are released in bounded
 batches, separately from the browser's own console history. The text is whatever
 the page logged, so a page that prints a token shows it in the panel.
 
+In the live desktop, Save report (ADR 0024) writes page data to disk, and only
+when the user clicks it: a new folder (mode 0700) in `BROXSER_REPORT_DIR`, else
+`Broxser` in the XDG download directory, else `~/Downloads/Broxser`, with the
+device's screenshot and `report.md` (mode 0600). Addresses in the report keep
+only scheme, host and path; console text loses the query, fragment and user
+information of HTTP(S) addresses, JWT-shaped tokens and bearer credentials. That
+redaction is best effort: other secrets a page prints, and anything the
+screenshot shows, stay, and the report says so. Broxser never reads a report
+back, uploads or deletes it.
+Redaction recognizes IPv6/Unicode hosts and JWT-shaped path segments, and
+bearer credentials have no minimum length. Untrusted report metadata and console
+text render as literal code, including embedded Markdown/HTML. Screenshots are
+bound to the page revision behind the report snapshot; stale results are refused.
+Their complete PNG contents are checked within byte and pixel limits before export.
+
 Screenshots may contain private data. CLI exports remain in the specified output
 directory until the developer deletes them. Desktop previews use an owned temporary
 directory. No analytics or application upload endpoint is configured. Website

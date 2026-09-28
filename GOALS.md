@@ -401,7 +401,7 @@ penulis profil terakhir, resource dan migrasi. Profil tidak kompatibel tidak
 boleh menahan update keamanan browser. Default tetap ephemeral; merge dokumen
 audit ini bukan penerimaan desain atau pengiriman persistent login.
 
-**Status P2.3 (27 September 2026, bagian pertama; PR menunggu review):** keputusan ada
+**Status P2.3 (27–28 September 2026, dua bagian; console merged melalui PR #24):** keputusan ada
 di [ADR 0023](docs/adr/0023-device-console-in-memory.md) dan pengukuran di
 `docs/validation.md` (P2.3). Sebelumnya setiap session device sudah
 menjalankan `Runtime.enable`, sehingga browser mengirim setiap panggilan
@@ -420,8 +420,24 @@ device; iframe lintas situs mengaktifkan `Runtime` dan `Log` sebelum boleh
 berjalan. Kartu device menampilkan jumlahnya; panel Console (`Ctrl+Shift+J`)
 menampilkan console device terpilih dengan Clear. Tidak ada yang ditulis ke
 log atau disk; Restart dan menutup Broxser menghapusnya. Belum ada: pesan
-worker, export laporan bug (screenshot, detail device, console) dengan
-redaksi dan retensi, yang menjadi bagian berikutnya.
+worker. Koreksi review di PR #24: Clear bekerja lokal walau browser sudah
+berhenti, entri tanpa identitas frame ditandai *frame unknown*, dan referensi
+objek debugger console dilepas berkala per session.
+
+Bagian kedua P2.3 ([ADR 0024](docs/adr/0024-bug-reports-on-request.md), PR
+menunggu review): sebelumnya desktop live tidak mengekspor apa pun, dan screencast
+phone 390 × 844 pada 50 % hanya sekitar 195 × 422 piksel. Kini **Save report**
+di panel Console mengambil screenshot PNG viewport device pada skalanya
+(`Page.captureScreenshot`; ditolak dengan alasan untuk device tersembunyi,
+dialog terbuka, permintaan ganda, balasan bukan PNG atau tanpa balasan dalam
+batas command) lalu menulis folder baru berisi `screenshot.png` dan
+`report.md` ke `BROXSER_REPORT_DIR`, atau `Broxser` di direktori unduhan XDG,
+atau `~/Downloads/Broxser` (folder 0700, file 0600). Laporan memuat device,
+session, halaman, browser, versi, waktu UTC dan console lama ke baru; alamat
+hanya skema, host dan path, dan teks console kehilangan query, fragment, user
+info, token berbentuk JWT dan kredensial bearer, dengan catatan bahwa sisa teks
+halaman tetap ada. Tidak ada yang ditulis tanpa klik; Broxser tidak pernah
+membaca ulang, mengirim atau menghapus laporan.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -518,6 +534,6 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
   session: audit dan ADR 0021 proposed, merged melalui PR #22; P2.2a panel workspace,
   preset dan file state: ADR 0022, merged melalui PR #23; P2.3a console per device:
-  ADR 0023, PR menunggu review).
+  ADR 0023, merged melalui PR #24; P2.3b laporan bug: ADR 0024, PR menunggu review).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

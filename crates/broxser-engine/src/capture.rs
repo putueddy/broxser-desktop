@@ -599,7 +599,7 @@ fn safe_filename(id: &str) -> String {
     }
 }
 
-fn png_dimensions(png: &[u8]) -> Result<(u32, u32)> {
+pub(crate) fn png_dimensions(png: &[u8]) -> Result<(u32, u32)> {
     if png.len() < 24 || &png[12..16] != b"IHDR" {
         bail!("screenshot PNG is missing IHDR");
     }
