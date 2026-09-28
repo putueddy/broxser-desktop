@@ -3,6 +3,46 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #23 review corrections, 28 September 2026 (Linux X11)
+
+Helium 0.18.1.1 with its sandbox enabled, debug desktop, private Xvfb
+1600 × 1000 and Mesa Lavapipe. The four review findings now have generation
+and index checks before frame delivery, dedicated workers for workspace/state
+I/O, URL validation before Save, and the first unused preset name after Remove.
+
+- `bash scripts/check.sh` passed: formatting, strict Clippy, 1 CLI, 12 core,
+  142 engine and 41 desktop tests. The new regressions cover removed/replaced
+  frame indices, close/restart/save completion orders and preset name gaps.
+- The complete live Helium suite passed 51/51 with four test threads in 91.8 s.
+  An initial run at default concurrency passed 49/51: the certificate reload
+  test saw no retained certificate error, and the rapid-swipe test's fresh tap
+  had no click in its event report. Each passed alone before the full passing
+  rerun; neither test nor engine code was changed for these results.
+- `scripts/desktop-smoke.sh` passed all 14 scenarios, including the extended
+  workspace run: invalid URL Save preserves exact file bytes, followed by a
+  valid URL Save and immediate Ctrl+Q that persists that exact URL before exit.
+  No browser process/profile or window remained. An early smoke stopped on
+  X11 `X_SetInputFocus` / `BadMatch`; the harness now waits for visible windows
+  before resizing and explicitly focusing them. The dialog case passed alone
+  and the complete suite passed afterwards.
+- A scratch `LD_PRELOAD` shim held `fsync` only for the test workspace/state
+  temporary files until explicit release markers appeared. With the desktop
+  and its children pinned to one CPU (`taskset`), the workspace panel still
+  closed/reopened and repainted while Save was held. Repeated Save started
+  one write. Close, repeated twice, cleaned every browser process/profile
+  while both writes were held, and started only one state write. Releasing
+  state alone kept the window open; releasing workspace too allowed exit 0
+  with the requested URL and 1360 × 861 window size persisted.
+- The same real-window run typed `file:///tmp/broxser-invalid-save`, clicked
+  Save and verified an unchanged file plus the visible "Not saved" validation
+  error. Screenshots of rejection, "Saving…" and waiting on close were inspected.
+  The fault-injection shim and screenshots were temporary local test artifacts.
+
+This qualifies the changed paths on X11 with software rendering. It does not
+extend the physical GPU, Wayland or HiDPI qualification. A disk operation that
+never returns can still delay final window closure, while browser cleanup and
+the GUI remain independent of that I/O.
+
 ## P2.2a workspace panel, presets and application state, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 run by `broxsertest` with the sandbox enabled,

@@ -44,12 +44,15 @@ Constraints found while auditing the desktop:
   discard. **Apply** restarts the runtime with the draft, through the
   existing restart; **Save** validates the draft and writes it atomically to
   the file it came from, including the URL bar's address, and never touches
-  the runtime. The demo workspace has no file, and the panel says so.
+  the runtime. An invalid URL reports an error and leaves the file unchanged.
+  Save captures the draft and address at the click, runs file I/O off the GUI
+  thread, and accepts no second Save until the first finishes. The demo
+  workspace has no file, and the panel says so.
 - `broxser-core` offers eight **presets**, generic viewport classes ("Small
   phone" 360 × 640 at 2×, up to "Large desktop" 1920 × 1080 at 1×), and
   `add_device_from_preset` / `remove_device` that keep ids unique, number
-  duplicate names, validate the result and leave the workspace unchanged on
-  failure (the pixel budget of ADR 0002 included).
+  duplicate names using the first unused candidate, validate the result and
+  leave the workspace unchanged on failure (the pixel budget of ADR 0002 included).
 - An **application state** file (`$XDG_STATE_HOME/broxser/state.json`, else
   `~/.local/state/broxser/state.json`; `BROXSER_STATE_FILE` overrides it for
   tests) remembers the recent workspace files, most recent first and at most
@@ -58,6 +61,15 @@ Constraints found while auditing the desktop:
   workspace (schema version, absolute paths, bounded sizes) and replaced
   atomically; an unreadable one is reported on stderr and ignored. It holds no
   page address, cookie, token or profile path.
+- Close reads and saves the window state off the GUI thread and begins browser
+  cleanup independently. The window stays responsive until cleanup and any
+  pending workspace/state saves finish; repeated close requests start no
+  additional writes. Close during Apply still prevents a replacement browser.
+  At most two dedicated save threads run, so slow disk I/O cannot occupy GPUI's
+  finite worker pool used for frame decoding and browser cleanup.
+- A decoded frame checks its runtime generation before looking up its device;
+  a missing index is discarded too. Apply can remove or reorder devices while
+  a previous runtime's decode is still running.
 - Static mode keeps its command line; the panel is part of the live view.
 
 ## Consequences

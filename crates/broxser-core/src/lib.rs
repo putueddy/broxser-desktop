@@ -227,22 +227,12 @@ impl Workspace {
             id = format!("{base}-{next}");
             next += 1;
         }
-        let same_name = self
-            .devices
-            .iter()
-            .filter(|device| {
-                device.name == preset.name
-                    || device
-                        .name
-                        .strip_prefix(preset.name)
-                        .is_some_and(|rest| rest.trim().parse::<u32>().is_ok())
-            })
-            .count();
-        let name = if same_name == 0 {
-            preset.name.to_owned()
-        } else {
-            format!("{} {}", preset.name, same_name + 1)
-        };
+        let mut name = preset.name.to_owned();
+        let mut next = 2;
+        while self.devices.iter().any(|device| device.name == name) {
+            name = format!("{} {next}", preset.name);
+            next += 1;
+        }
         self.devices.push(Device {
             id,
             name,
@@ -619,5 +609,48 @@ impl SyncRouter {
                 }
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PRESETS, Workspace};
+    use std::collections::HashSet;
+
+    #[test]
+    fn preset_names_reuse_the_first_available_number_after_removal() {
+        let mut workspace = Workspace::demo();
+        let phone = &PRESETS[1];
+        let second = workspace.add_device_from_preset(phone, "guest").unwrap();
+        let third = workspace.add_device_from_preset(phone, "guest").unwrap();
+        assert_eq!(workspace.devices[second].name, "Phone 2");
+        assert_eq!(workspace.devices[third].name, "Phone 3");
+
+        workspace.remove_device(second).unwrap();
+        let added = workspace.add_device_from_preset(phone, "guest").unwrap();
+
+        assert_eq!(workspace.devices[added].name, "Phone 2");
+        let names: HashSet<_> = workspace
+            .devices
+            .iter()
+            .map(|device| &device.name)
+            .collect();
+        assert_eq!(names.len(), workspace.devices.len());
+        workspace.validate().unwrap();
+    }
+
+    #[test]
+    fn preset_names_use_the_base_first_and_skip_taken_candidates_in_all_sessions() {
+        let mut workspace = Workspace::demo();
+        workspace.devices[0].name = "Phone 2".into();
+        workspace.devices[1].name = "Phone 3".into();
+        workspace.devices[2].name = "Phone 4".into();
+        let phone = &PRESETS[1];
+
+        let base = workspace.add_device_from_preset(phone, "guest").unwrap();
+        assert_eq!(workspace.devices[base].name, "Phone");
+        let numbered = workspace.add_device_from_preset(phone, "admin").unwrap();
+        assert_eq!(workspace.devices[numbered].name, "Phone 5");
+        workspace.validate().unwrap();
     }
 }

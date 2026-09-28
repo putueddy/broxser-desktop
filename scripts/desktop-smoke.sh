@@ -71,10 +71,13 @@ unset WAYLAND_DISPLAY
 
 # Without a window manager GPUI draws its first frame after a configure event.
 # The desktop reopens at its last size, so one resize to the wanted size can be
-# a no-op; the first resize is always a change.
+# a no-op; the first resize is always a change. Callers wait for a visible
+# window before resizing and focusing it.
 size_window() {
   xdotool windowsize "$1" 1360 860 || true
   xdotool windowsize "$1" 1360 861 || true
+  # Xvfb without a window manager may leave keyboard focus on the root window.
+  xdotool windowfocus "$1" || true
 }
 
 # Browser processes, browser profiles and static preview directories.
@@ -101,7 +104,7 @@ run() {
     "$binary" --workspace examples/workspace.json "$@" &
   fi
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1)
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1)
   size_window "$window"
   for _ in $(seq 300); do
     [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "$wait_for" || true) -gt 0 ]] && break
@@ -176,7 +179,7 @@ restart_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/live.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1)
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1)
   size_window "$window"
   for _ in $(seq 300); do
     [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /live.html || true) -gt 0 ]] && break
@@ -299,7 +302,7 @@ typing_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/$page" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -430,7 +433,7 @@ dialog_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/dialog.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -515,7 +518,7 @@ popup_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/popup.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -581,7 +584,7 @@ download_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/download.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -664,7 +667,7 @@ with open(sys.argv[1], "w") as destination:
 PY
   "$binary" --workspace "$work/download-desktop.json" --url "http://127.0.0.1:$port/download.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -780,7 +783,7 @@ touch_run() {
   before=$(wc -l < "$work/requests")
   "$binary" --workspace examples/workspace.json --url "http://127.0.0.1:$port/touch.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   else
@@ -845,19 +848,23 @@ PY
 # Opens the workspace panel with Ctrl+Shift+W on a copy of the example
 # workspace, adds the first preset device to the draft and applies it (a
 # restart with four devices), removes the first device and applies again
-# (three devices), saves the draft to the copy and closes. The panel edits a
-# draft: the running workspace changes only on Apply (ADR 0022). Afterwards the
-# copy must hold the preset device and not the removed one, and the run's state
-# file must name the copy and the window size and hold no page address.
+# (three devices), and saves the draft to the copy. An invalid URL must leave
+# that file byte-for-byte unchanged; a valid URL is then saved immediately
+# before Ctrl+Q, and the save must finish before exit. The panel edits a draft:
+# the running workspace changes only on Apply (ADR 0022). Afterwards the copy
+# must hold the preset device and not the removed one, and the run's state file
+# must name the copy and the window size and hold no page address.
 workspace_run() {
   local label=$1
-  local before mark app window= failure= found code=0 left_processes left_profiles
+  local before mark app window= failure= found code=0 left_processes left_profiles close_requested=0
   local workspace=$work/workspace.json state=$work/state.json
+  local snapshot=$work/workspace-before-invalid.json
+  local saved_url="http://127.0.0.1:$port/live.html?workspace-save=close"
   cp examples/workspace.json "$workspace"
   before=$(wc -l < "$work/requests")
   BROXSER_STATE_FILE=$state "$binary" --workspace "$workspace" --url "http://127.0.0.1:$port/live.html" &
   app=$!
-  window=$(timeout 20 xdotool search --sync --name '^Broxser$' | head -n 1) || true
+  window=$(timeout 20 xdotool search --sync --onlyvisible --name '^Broxser$' | head -n 1) || true
   # Requests of /live.html since line $1 of the log reach $2 within 30 s.
   loaded() {
     for _ in $(seq 300); do
@@ -919,13 +926,44 @@ workspace_run() {
             failure="Save did not write the preset device"
           elif grep -q '"id": "phone"' "$workspace"; then
             failure="Save kept the removed device"
+          else
+            # Keep valid JSON with distinct bytes, so an invalid Save that
+            # rewrites the old draft is caught even when its contents match.
+            printf '\n' >> "$workspace"
+            cp "$workspace" "$snapshot"
+            xdotool key --clearmodifiers ctrl+l
+            xdotool type --clearmodifiers --delay 0 'file:///tmp/broxser-invalid-save'
+            # Locate Save again after each notice, rather than retaining its
+            # coordinates from the previous action.
+            if ! found=$(panel_button 7ce29b 232 170); then
+              failure="Save was unavailable for the invalid URL"
+            else
+              read -r x y _ < <(echo "$found")
+              xdotool mousemove --window "$window" "$x" "$y" click 1
+              sleep 0.5
+              if ! cmp -s "$snapshot" "$workspace"; then
+                failure="Save changed the file despite the invalid URL"
+              else
+                xdotool key --clearmodifiers ctrl+l
+                xdotool type --clearmodifiers --delay 0 "$saved_url"
+                if ! found=$(panel_button 7ce29b 232 170); then
+                  failure="Save was unavailable after the invalid URL notice"
+                else
+                  read -r x y _ < <(echo "$found")
+                  xdotool mousemove --window "$window" "$x" "$y" click 1 key --delay 0 ctrl+q
+                  close_requested=1
+                fi
+              fi
+            fi
           fi
         fi
       fi
     fi
   fi
   if kill -0 "$app" 2>/dev/null; then
-    [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    if [[ $close_requested -eq 0 ]]; then
+      [[ -n $window ]] && xdotool mousemove --window "$window" 600 400 key ctrl+q || true
+    fi
     if ! timeout 15 tail -s 0.05 --pid="$app" -f /dev/null; then
       failure=${failure:-did not exit within 15 s of Ctrl+Q}
       kill -TERM "$app" 2>/dev/null || true
@@ -933,6 +971,15 @@ workspace_run() {
     fi
   fi
   wait "$app" || code=$?
+  if [[ -z $failure ]] && ! python3 - "$workspace" "$saved_url" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    workspace = json.load(source)
+sys.exit(0 if workspace["url"] == sys.argv[2] else 1)
+PY
+  then
+    failure="Save followed by Ctrl+Q did not persist the requested URL"
+  fi
   if [[ -z $failure ]]; then
     if [[ ! -f $state ]]; then
       failure="no state file was written"
@@ -947,7 +994,7 @@ workspace_run() {
     [[ $left_processes -eq 0 && $left_profiles -eq 0 ]] && break
     sleep 0.05
   done
-  echo "$label: ${failure:-added, applied, removed, applied and saved a draft; state kept}; exit $code;" \
+  echo "$label: ${failure:-draft saved; invalid URL rejected; valid URL saved before close; state kept}; exit $code;" \
     "$left_processes browser processes and $left_profiles profiles left"
   if xdotool search --name '^Broxser$' >/dev/null 2>&1; then
     echo "$label: a Broxser window is still open" >&2

@@ -19,7 +19,7 @@ use broxser_engine::{
     SyncSettings, is_paste_key, paste_text, to_viewport,
 };
 use futures::StreamExt as _;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use gpui::{
     AnyElement, Bounds, Context, Corners, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent,
@@ -52,6 +52,8 @@ pub(crate) struct LiveView {
     panel_open: bool,
     /// The last outcome of a panel action, shown in the panel.
     panel_notice: Option<String>,
+    /// Only one workspace snapshot may be written at a time.
+    saving_workspace: bool,
     browser: Option<PathBuf>,
     session: Option<LiveSession>,
     status: Status,
@@ -293,6 +295,7 @@ impl LiveView {
             state_path,
             panel_open: false,
             panel_notice: None,
+            saving_workspace: false,
             browser,
             session: None,
             status: Status::default(),
@@ -454,18 +457,15 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let device = &mut self.devices[index];
-        if device.decoding == Some(generation) {
-            device.decoding = None;
-        }
-        if !self.lifecycle.accepts(generation) {
+        let Some(device) = frame_device(&mut self.devices, &self.lifecycle, index, generation)
+        else {
             // A frame of a stopped runtime is released unseen and leaves the
-            // newer runtime's decode alone.
+            // newer runtime's decode alone, even if Apply removed its index.
             if let Ok(image) = image {
                 let _ = window.drop_image(image);
             }
             return;
-        }
+        };
         match image {
             // Every frame is a new GPUI image; release the previous atlas texture.
             Ok(image) if !device.hidden => {
@@ -1019,14 +1019,11 @@ impl LiveView {
         match self.lifecycle.stopped() {
             AfterStop::Start => self.start(window, cx),
             AfterStop::Close => window.remove_window(),
+            AfterStop::Wait => {}
         }
         cx.notify();
     }
 
-    /// Returns true if the window may close now. Otherwise stops the runtime, or
-    /// lets a running restart finish stopping the previous one, and removes the
-    /// window once the browser and profile are gone: GPUI ends the process as
-    /// soon as the last window closes.
     /// Whether the panel's draft differs from the running workspace in
     /// anything but the URL, which the URL bar owns.
     fn draft_changed(&self) -> bool {
@@ -1088,50 +1085,96 @@ impl LiveView {
 
     /// Writes the draft to the workspace file it was loaded from. The running
     /// runtime is untouched; Apply is separate and explicit.
-    fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = &self.workspace_path else {
+    fn save_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving_workspace || self.lifecycle.is_closing() {
+            return;
+        }
+        let Some(path) = self.workspace_path.clone() else {
             self.panel_notice =
                 Some("Started without --workspace; there is no file to save to.".into());
             cx.notify();
             return;
         };
         let mut saved = self.draft.clone();
-        let text = self.url.read(cx).text().to_owned();
-        if validate_url(&text).is_ok() {
-            saved.url = text;
+        saved.url = self.url.read(cx).text().to_owned();
+        if let Err(error) = saved.validate() {
+            self.panel_notice = Some(format!("Not saved: {error}"));
+            cx.notify();
+            return;
         }
-        self.panel_notice = Some(match saved.save(path) {
-            Ok(()) => format!("Saved to {}.", path.display()),
+        if !self.lifecycle.begin_save() {
+            return;
+        }
+        self.saving_workspace = true;
+        self.panel_notice = Some("Saving workspace…".into());
+        let saving = save_off_thread(move || match saved.save(&path) {
+            Ok(()) => format!("Saved snapshot to {}.", path.display()),
             Err(error) => format!("Not saved: {error}"),
         });
+        cx.spawn_in(window, async move |this, cx| {
+            let notice = saving
+                .await
+                .unwrap_or_else(|error| format!("Not saved: {error:#}"));
+            this.update_in(cx, |view, window, cx| {
+                view.saving_workspace = false;
+                view.panel_notice = Some(notice);
+                if view.lifecycle.save_finished() {
+                    window.remove_window();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
     /// Remembers the window size for the next start (ADR 0022). Nothing else
     /// of a run is written: no page address, cookie or profile.
-    fn save_window_size(&self, window: &Window) {
-        let Some(path) = &self.state_path else {
+    fn save_window_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.state_path.clone() else {
             return;
         };
+        if !self.lifecycle.begin_save() {
+            return;
+        }
         let size = window.bounds().size;
-        let mut state = AppState::load(path).unwrap_or_default();
-        state.window = Some(WindowSize {
+        let size = WindowSize {
             width: f32::from(size.width).round().max(0.0) as u32,
             height: f32::from(size.height).round().max(0.0) as u32,
+        };
+        let saving = save_off_thread(move || {
+            let mut state = AppState::load(&path).unwrap_or_default();
+            state.window = Some(size);
+            if let Err(error) = state.save(&path) {
+                eprintln!("broxser: could not save {}: {error}", path.display());
+            }
         });
-        if let Err(error) = state.save(path) {
-            eprintln!("broxser: could not save {}: {error}", path.display());
-        }
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = saving.await {
+                eprintln!("broxser: could not save window size: {error:#}");
+            }
+            this.update_in(cx, |view, window, cx| {
+                if view.lifecycle.save_finished() {
+                    window.remove_window();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
+    /// Stops the browser independently of file I/O. GPUI ends the process when
+    /// the last window closes, so keep it until both cleanup and saves finish.
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.invalidate_ime();
-        self.save_window_size(window);
+        self.save_window_size(window, cx);
         let request = self.lifecycle.begin_close(self.session.is_some());
         if request == CloseRequest::Now {
             return true;
         }
-        self.notice = Some("Closing after the live browser stops…".into());
+        self.notice = Some("Closing after the browser stops and saves finish…".into());
         cx.notify();
         if request == CloseRequest::Stop
             && let Some(session) = self.session.take()
@@ -2131,8 +2174,14 @@ impl LiveView {
                         )
                     })
                     .child(
-                        action("save-draft", "Save", !changed && self.workspace_path.is_some())
-                            .on_click(cx.listener(|view, _, _, cx| view.save_draft(cx))),
+                        action(
+                            "save-draft",
+                            if self.saving_workspace { "Saving…" } else { "Save" },
+                            !changed && self.workspace_path.is_some() && !self.saving_workspace,
+                        )
+                        .when(!self.saving_workspace && !self.lifecycle.is_closing(), |button| {
+                            button.on_click(cx.listener(|view, _, window, cx| view.save_draft(window, cx)))
+                        }),
                     ),
             )
             .children(
@@ -2625,6 +2674,43 @@ fn selected_after_visibility_change(selected: Option<usize>, hidden: &[bool]) ->
         .find(|&index| !hidden[index])
 }
 
+/// Resolve a decode only in its own runtime, before inspecting any device slot:
+/// applying a draft can shrink or reorder the list while decoding is in flight.
+fn frame_device<'a>(
+    devices: &'a mut [DeviceView],
+    lifecycle: &Lifecycle,
+    index: usize,
+    generation: u64,
+) -> Option<&'a mut DeviceView> {
+    if !lifecycle.accepts(generation) {
+        return None;
+    }
+    let device = devices.get_mut(index)?;
+    if device.decoding == Some(generation) {
+        device.decoding = None;
+    }
+    Some(device)
+}
+
+/// At most two writes run: one workspace snapshot and the close-time state.
+/// Give blocking filesystem calls their own threads so they cannot occupy
+/// GPUI's finite background pool and delay frame decoding or browser teardown,
+/// even on a single-CPU machine. Spawn failures and panics complete the waiter.
+fn save_off_thread<T: Send + 'static>(
+    save: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = Result<T>> {
+    let (done, result) = oneshot::channel();
+    let started = std::thread::Builder::new()
+        .name("broxser-save".into())
+        .spawn(move || {
+            let _ = done.send(save());
+        });
+    async move {
+        started.context("start save worker")?;
+        result.await.context("save worker stopped before reporting")
+    }
+}
+
 fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
     let mut pixels = image::load_from_memory_with_format(&frame.jpeg, image::ImageFormat::Jpeg)
         .context("decode live frame")?
@@ -2669,10 +2755,11 @@ fn activity_line(status: &DeviceStatus) -> String {
 mod tests {
     use super::{
         CanvasKey, DeviceView, KeyFocus, PressedKeys, activity_line, canvas_key, field_answer,
-        focus_after_prompt_change, key_down_target, key_input, map_caret, open_dialog,
-        prompt_default, selected_after_visibility_change,
+        focus_after_prompt_change, frame_device, key_down_target, key_input, map_caret,
+        open_dialog, prompt_default, selected_after_visibility_change,
     };
     use crate::ime::{ImeBuffer, Origin};
+    use crate::lifecycle::{AfterStop, Lifecycle};
     use crate::url_input::{KeyOutcome, LineEdit, UrlEvent};
     use broxser_engine::{
         CaretRect, Command, DeviceStatus, DialogKind, DialogState, ImeAction, MAX_DIALOG_CHARS,
@@ -2729,6 +2816,35 @@ mod tests {
             } => (device, token, accept, text),
             other => panic!("not a dialog answer: {other:?}"),
         }
+    }
+
+    #[test]
+    fn decoded_frames_cannot_touch_devices_replaced_by_apply() {
+        let mut lifecycle = Lifecycle::default();
+        let old = lifecycle.generation();
+        let mut devices: Vec<_> = (0..3)
+            .map(|_| DeviceView {
+                decoding: Some(old),
+                ..DeviceView::default()
+            })
+            .collect();
+        assert!(lifecycle.begin_restart());
+        // Apply removes a device, leaving callbacks for all three old slots.
+        devices.remove(0);
+        for device in &mut devices {
+            *device = DeviceView::default();
+        }
+        assert!(frame_device(&mut devices, &lifecycle, 2, old).is_none());
+        assert_eq!(lifecycle.stopped(), AfterStop::Start);
+        let current = lifecycle.generation();
+        devices[0].decoding = Some(current);
+        assert!(frame_device(&mut devices, &lifecycle, 2, old).is_none());
+        assert!(frame_device(&mut devices, &lifecycle, 0, old).is_none());
+        assert_eq!(devices[0].decoding, Some(current));
+        // Missing indices are harmless even when tagged with this generation.
+        assert!(frame_device(&mut devices, &lifecycle, 2, current).is_none());
+        assert!(frame_device(&mut devices, &lifecycle, 0, current).is_some());
+        assert_eq!(devices[0].decoding, None);
     }
 
     #[test]
