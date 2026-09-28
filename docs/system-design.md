@@ -320,8 +320,12 @@ berikutnya di root yang sama. Profil dibuat dengan mode 0700; profil pribadi
 pengguna tidak boleh dipakai. Crash dump diarahkan ke profil privat, dan browser
 berjalan dengan `HOME` privat di dalam profil sehingga database sertifikat NSS-nya
 sendiri, bukan `~/.pki/nssdb` pengguna, yang dibuat dan dihapus bersama profil;
-keyring desktop tidak diminta (`--password-store=basic`), dan corporate CA
-dipasang eksplisit lewat policy `CACertificates` (ADR 0020). Core dump kernel dibatasi
+enkripsi profil tidak meminta kunci keyring desktop (`--password-store=basic`), dan corporate CA
+dipasang eksplisit lewat policy `CACertificates` (ADR 0020). Otorisasi display X11
+tetap memakai lokasi asli `XAUTHORITY`; `SSLKEYLOGFILE` tidak diteruskan agar
+rahasia TLS tidak tertinggal setelah profil dihapus. Environment native lainnya
+tetap diwarisi; batas NSS/profil ini tidak mengisolasi seluruh filesystem.
+Core dump kernel dibatasi
 (soft `RLIMIT_CORE` dan `coredump_filter` 0, diwarisi browser): dump tidak memuat
 memori renderer, sehingga cookie dan isi halaman tidak sampai ke systemd-coredump
 atau apport, dan crash renderer tidak tertahan di jalur dump. Jangan menambahkan

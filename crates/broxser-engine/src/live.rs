@@ -1492,6 +1492,18 @@ impl<'a> Controller<'a> {
         let incomplete = self.devices[index].iframe_activity_incomplete;
         self.shared.device(index, |device| {
             device.loading = true;
+            // Reload only acknowledges that it started, so it cannot confirm
+            // recovery from the current error page. Keep the last confirmed
+            // navigation failure until a real document commits (ADR 0020).
+            // A new destination via Page.navigate clears the old report.
+            if method == "Page.reload"
+                && device
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(NAVIGATION_FAILED))
+            {
+                return;
+            }
             device.error = if incomplete {
                 Some(INCOMPLETE_IFRAME_ACTIVITY.into())
             } else {

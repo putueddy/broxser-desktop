@@ -368,22 +368,36 @@ fn create_private_home(profile: &Path) -> Result<PathBuf> {
 /// and offered in Broxser's sessions. `XDG_DATA_HOME` and `XDG_CONFIG_HOME` go
 /// too: Chromium keeps that database under the data directory when one is set.
 /// The user's cache directory stays, so fontconfig reuses its caches of the
-/// system fonts instead of rebuilding them at every browser start.
+/// system fonts instead of rebuilding them at every browser start. X11 still
+/// needs the caller's display authorization: preserve an explicit `XAUTHORITY`
+/// unchanged, or name the original home's `.Xauthority` before replacing HOME.
+/// This passes only its path; no authorization or certificate files are copied.
+/// Disable inherited TLS key logging, which could leave handshake secrets in
+/// an external file after the temporary profile has been removed.
 fn environment(
     home: &Path,
     inherited: impl Fn(&str) -> Option<OsString>,
-) -> [(&'static str, Option<OsString>); 4] {
+) -> [(&'static str, Option<OsString>); 6] {
+    let original_home = inherited("HOME");
     let absolute = |value: &OsString| Path::new(value).is_absolute();
     let cache = inherited("XDG_CACHE_HOME").filter(absolute).or_else(|| {
-        inherited("HOME")
+        original_home
+            .clone()
             .filter(absolute)
             .map(|home| Path::new(&home).join(".cache").into_os_string())
+    });
+    let xauthority = inherited("XAUTHORITY").or_else(|| {
+        original_home
+            .filter(|home| !home.is_empty())
+            .map(|home| Path::new(&home).join(".Xauthority").into_os_string())
     });
     [
         ("HOME", Some(home.as_os_str().to_owned())),
         ("XDG_DATA_HOME", None),
         ("XDG_CONFIG_HOME", None),
         ("XDG_CACHE_HOME", cache),
+        ("XAUTHORITY", xauthority),
+        ("SSLKEYLOGFILE", None),
     ]
 }
 
@@ -878,6 +892,10 @@ pub(crate) mod procfs {
 mod qa_fidelity;
 
 #[cfg(test)]
+#[path = "browser/private_home.rs"]
+mod private_home;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -936,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_keeps_only_the_users_cache_directory() {
+    fn environment_keeps_cache_and_native_display_authorization() {
         let home = Path::new("/tmp/broxser-cdp-test/home");
         let from = |variables: Vec<(&'static str, &'static str)>| {
             move |name: &str| {
@@ -953,6 +971,7 @@ mod tests {
                     ("HOME", "/home/u"),
                     ("XDG_DATA_HOME", "/home/u/.local/share"),
                     ("XDG_CONFIG_HOME", "/home/u/.config"),
+                    ("SSLKEYLOGFILE", "/home/u/tls-secrets"),
                 ])
             ),
             [
@@ -960,6 +979,8 @@ mod tests {
                 ("XDG_DATA_HOME", None),
                 ("XDG_CONFIG_HOME", None),
                 ("XDG_CACHE_HOME", Some("/home/u/.cache".into())),
+                ("XAUTHORITY", Some("/home/u/.Xauthority".into())),
+                ("SSLKEYLOGFILE", None),
             ]
         );
         let explicit = environment(
@@ -997,12 +1018,19 @@ mod tests {
         )
         .unwrap();
         let home = browser.profile.as_ref().unwrap().path().join(PRIVATE_HOME);
-        // The fake browser execs `sleep`; while it does, its environment reads
-        // back empty for a moment.
+        // Around exec, procfs may briefly show the inherited parent environment
+        // or no environment. Wait for this launch's private HOME, not merely
+        // any HOME substring; wrong environment propagation still fails below.
+        let mut expected_home = OsString::from("HOME=");
+        expected_home.push(&home);
         let deadline = Instant::now() + Duration::from_secs(5);
         let environ = loop {
             let environ = fs::read(format!("/proc/{}/environ", browser.child.id())).unwrap();
-            if environ.windows(5).any(|bytes| bytes == b"HOME=") || Instant::now() >= deadline {
+            if environ
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == expected_home.as_bytes())
+                || Instant::now() >= deadline
+            {
                 break environ;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1022,12 +1050,23 @@ mod tests {
             fs::metadata(&home).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        assert!(!home.join(".Xauthority").exists());
         assert_eq!(variable("XDG_DATA_HOME"), None);
         assert_eq!(variable("XDG_CONFIG_HOME"), None);
+        assert_eq!(variable("SSLKEYLOGFILE"), None);
         assert_eq!(
             variable("XDG_CACHE_HOME"),
-            env::var_os("XDG_CACHE_HOME").or_else(|| env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cache").into_os_string()))
+            env::var_os("XDG_CACHE_HOME")
+                .filter(|cache| Path::new(cache).is_absolute())
+                .or_else(|| env::var_os("HOME")
+                    .filter(|home| Path::new(home).is_absolute())
+                    .map(|home| PathBuf::from(home).join(".cache").into_os_string()))
+        );
+        assert_eq!(
+            variable("XAUTHORITY"),
+            env::var_os("XAUTHORITY").or_else(|| env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".Xauthority").into_os_string()))
         );
         assert!(
             variable("BREAKPAD_DUMP_LOCATION")

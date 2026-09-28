@@ -347,15 +347,19 @@ dipercaya, dan database yang sama memuat sertifikat klien beserta kuncinya; di
 luar itu browser hanya membaca cache fontconfig, direktori layer Vulkan, skema
 glib dan `user-dirs.dirs` dari HOME, serta policy `/etc/chromium/policies`.
 Kini browser berjalan dengan `HOME` privat di dalam profil (mode 0700, tanpa
-`XDG_DATA_HOME`/`XDG_CONFIG_HOME`, cache pengguna tetap dipakai sehingga waktu
-start tidak berubah: 7,7 s vs 7,4 s), database NSS-nya dibuat dan dihapus
-bersama profil, `--password-store=basic` mencegah permintaan ke keyring desktop,
+`XDG_DATA_HOME`/`XDG_CONFIG_HOME`, cache pengguna tetap dipakai; pengukuran awal
+7,7 s vs 7,4 s), database NSS-nya dibuat dan dihapus
+bersama profil, `--password-store=basic` mencegah permintaan kunci enkripsi profil
+ke keyring desktop,
 dan corporate CA dipasang eksplisit lewat policy Chromium `CACertificates`, yang
 juga berlaku untuk Helium pengguna; tidak ada yang disalin dari database
 pengguna. Error `ERR_CERT_AUTHORITY_INVALID` membawa catatan apa yang dipercaya
 Broxser. Konsekuensi: CA yang hanya dipercaya di NSS pribadi tidak lagi
 dipercaya di Broxser, sertifikat klien tidak tersedia (keputusan P2.2), dan font
 di bawah HOME pengguna tidak terlihat halaman.
+Autentikasi X11 mempertahankan `XAUTHORITY` asli dan `SSLKEYLOGFILE` dibuang pada
+launch; environment native lainnya tetap diwarisi, jadi batas NSS/profil ini
+tidak menjamin isolasi seluruh akses filesystem.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,

@@ -75,6 +75,57 @@ Afterwards: no profile under `/tmp`, the user's database without the test CA
 - `CACertificates` needs a machine policy file (root); there is no per-user
   route, by decision.
 
+### PR #21 review corrections, 28 September 2026 (local Linux)
+
+Review of `d067235` found three gaps despite the initial passing CI:
+
+- Replacing HOME moved Xlib's implicit `.Xauthority` lookup. On an authenticated
+  disposable Xvfb, headed capture failed before CDP in 0.16 s with `XAUTHORITY`
+  unset; explicitly naming the caller's test authority file succeeded. The
+  launch environment now preserves explicit authorization paths and resolves
+  implicit ones before HOME changes. Independent reruns passed both variants
+  (three frames each), with the authority file unchanged.
+- The new claim that only cache remained shared was too broad. In a disposable
+  caller home, inherited `SSLKEYLOGFILE` left 388 bytes of TLS handshake secrets
+  after certificate rejection and profile cleanup. Every browser launch now
+  removes that variable. The rerun left no key log. Documentation scopes the
+  guarantee to NSS/profile storage and profile-encryption keyring access;
+  native display authorization and other environment integrations remain.
+- Reload cleared a confirmed certificate failure, but `Page.reload` replies
+  without an error even when its error page returns. The fake regression failed
+  before the fix with `None` instead of the previous certificate report. Reload
+  now retains that last confirmed failure until a successful document commits;
+  a new explicit navigation clears/replaces it. Tests cover both response/event
+  orders, successful recovery and exactly the requested navigation commands.
+
+The TLS regression launches capture in a child with disposable legacy and XDG
+NSS stores containing a test CA. NSS validates the imported test certificate,
+but the private browser must reject it, leave the caller database unchanged,
+write no ambient TLS key log and clean its private profiles. `certutil`
+(`libnss3-tools` on Ubuntu) is a test prerequisite only. The OpenSSL fixture owns
+its server before readiness checks so failed startup also cleans up.
+
+The authenticated X11 and key-log reproductions are retained under ignored
+`artifacts/pr21-review/isolation/`, including before/after observations and the
+script. No personal NSS/keyring, user authority file or system CA policy was
+modified. Secret Service/KWallet and other client-certificate providers remain
+unqualified, as noted above.
+The first full check also exposed a test-readiness race: procfs could briefly
+report the inherited parent HOME around exec, not just an empty environment.
+The child-environment test now waits for this launch's exact private HOME before
+checking the remaining fields; a wrong mapping still fails after the deadline.
+
+| Final local check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, strict Clippy, 1 CLI, 8 core, 142 engine and 36 desktop tests; 51 live tests ignored by default |
+| Full pinned Helium 0.18.1.1 suite, sandbox enabled, four threads | 51/51 passed in 90.70 s, including isolated caller NSS/key-log checks and certificate Reload/recovery |
+| Full desktop smoke, Xvfb 1600 × 1000 with Mesa Lavapipe, debug build | 13/13 passed; no browser process, profile or window left |
+| Authenticated disposable Xvfb, headed CLI capture | Implicit and explicit XAUTHORITY both passed, three frames each; authority unchanged and profiles cleaned |
+| Independent launch-isolation review | No remaining actionable finding; no real Secret Service/KWallet qualification claimed |
+
+Final logs are retained in ignored `artifacts/pr21-review/`. Existing vendored
+GPUI and `proc-macro-error2` future-compatibility warnings remain non-failing.
+
 ## P1.7 QA fidelity, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by the unprivileged

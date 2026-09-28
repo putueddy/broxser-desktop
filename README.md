@@ -129,10 +129,13 @@ disesuaikan. Probe tidak memuat URL workspace dan tidak menjalankan subprocess
 `--version`; pembatalan menghentikan startup sebelum tahap berikutnya (ADR 0019).
 Browser berjalan dengan `HOME` privat di dalam profil: database sertifikat NSS-nya
 sendiri dibuat dan dihapus bersama profil, NSS pengguna (`~/.pki/nssdb`) tidak
-dibuka, keyring desktop tidak diminta, dan corporate CA dipasang eksplisit lewat
+dibuka, enkripsi profil tidak meminta kunci keyring desktop, dan corporate CA dipasang eksplisit lewat
 policy Chromium `CACertificates` di `/etc/chromium/policies/managed`; CA yang
-hanya dipercaya di NSS pribadi dan sertifikat klien tidak berlaku di Broxser
-(ADR 0020). Status audit kapabilitas lain ada di `docs/validation.md`.
+hanya dipercaya di NSS pribadi dan sertifikat klien dari database itu tidak
+berlaku di Broxser (ADR 0020). Autentikasi display X11 tetap memakai lokasi
+`XAUTHORITY` asli; `SSLKEYLOGFILE` dibuang agar tidak meninggalkan log rahasia TLS.
+Ini batas penyimpanan NSS/profil, bukan isolasi seluruh filesystem browser.
+Status audit kapabilitas lain ada di `docs/validation.md`.
 Lihat [ADR 0006](docs/adr/0006-trusted-link-intent-and-hidden-input.md).
 
 Helium juga dapat berasal dari instalasi tim: set `BROXSER_HELIUM_BIN` ke executable
@@ -190,6 +193,9 @@ reproduksi, lalu harus diperbarui mengikuti security review. Binary tidak masuk 
 Tidak ada code, aset, atau file DMG Sizzy di repo.
 
 ## Verifikasi
+
+Tes isolasi sertifikat memerlukan `openssl` dan `certutil` (`libnss3-tools`
+pada Ubuntu); database CA dan kunci uji dibuat di direktori sementara.
 
 ```bash
 bash scripts/check.sh

@@ -61,16 +61,26 @@ local HTTPS fixture whose certificate a test CA signed) found:
   and with the user's `XDG_CACHE_HOME` (or `~/.cache`) passed on. NSS creates
   its database under that home, and the database goes with the profile.
   Nothing is read from or copied out of the user's database.
-- Every launch carries `--password-store=basic`: a temporary profile keeps
-  its key in the profile, and the desktop keyring is neither asked nor written.
+- Preserve explicit `XAUTHORITY` unchanged. If it is unset, resolve the caller's
+  original nonempty `HOME/.Xauthority` before replacing HOME, so authenticated
+  X11 headed launches still work. This retains a path for display authorization;
+  no authority file or certificate database is copied into the profile.
+- Remove inherited `SSLKEYLOGFILE` on every launch so ambient TLS debugging
+  cannot leave handshake secrets outside the deleted profile.
+- Every launch carries `--password-store=basic`: profile encryption does not
+  request the desktop's Secret Service or KWallet key. Its fixed-key protection
+  is not a substitute for private directory permissions and ephemeral cleanup.
 - A corporate CA is configured explicitly through the `CACertificates` policy
   in `/etc/chromium/policies/managed`, which applies to Broxser and to the
   user's Helium alike. Broxser appends to `net::ERR_CERT_AUTHORITY_INVALID`
   what it trusts (built-in roots and that policy, not a personal certificate
-  store). In live mode the browser's own error page stays in the frame and the
-  device keeps that report until a document commits.
-- Client certificates are not available in Broxser sessions. Sites that need
-  one are decided with persistent sessions and their secret store (P2.2).
+  store). In live mode the browser's own error page stays in the frame. The last
+  confirmed navigation failure survives a same-page Reload, whose CDP reply
+  need not contain an error; a successful document commit clears it. A new
+  explicit navigation starts a new report rather than carrying the old one.
+- Client certificates from the caller's NSS database are not imported into
+  Broxser sessions. Client-certificate provisioning and other platform providers
+  remain unqualified and are decided with persistent sessions (P2.2).
 
 ## Consequences
 
@@ -80,17 +90,21 @@ local HTTPS fixture whose certificate a test CA signed) found:
 - Fonts under the user's home (`~/.fonts`, `~/.local/share/fonts`) and a user
   `fontconfig` configuration are no longer used by pages in Broxser; system
   fonts and their caches are unchanged. The browser still reads, and fontconfig
-  may write, the user's cache directory, as before; nothing else under the
-  user's home is touched.
-- Browser start time is unchanged: the trusted HTTPS capture took 7.7 s
-  against 7.4 s before, and 10.0 s with a private cache directory.
+  may write, the user's cache directory. X11 authorization remains available,
+  and other native environment overrides can still name external resources,
+  including explicit font configurations. Private HOME isolates the default
+  NSS/data/config locations; it is not a filesystem sandbox for the browser
+  process or a guarantee that only cache files outside the profile are read.
+- In the audited configuration, trusted HTTPS capture took 7.7 s against 7.4 s
+  before, and 10.0 s with a private cache directory. This is not a general startup
+  performance guarantee.
 - Persistent sessions (P2.2) must keep a profile's home and NSS database inside
   Broxser's data directory and decide their own key handling: `basic` means a
   fixed key, adequate only for a 0700 profile deleted at exit.
 
 ## Validation
 
-Unit: `environment_keeps_only_the_users_cache_directory` (the variables set and
+Unit: `environment_keeps_cache_and_native_display_authorization` (the variables set and
 removed, the certificate note), `browser_runs_in_a_private_home` (the fake
 browser's environment and the home's mode) and the launch argument test
 (`--password-store=basic` in both modes). Helium:
@@ -100,3 +114,8 @@ s_server` with a self-signed certificate: every device reports
 the profile's home, and the profile is gone after the session). The traced runs
 before and after the change, with the user database, the policy CA and the
 keyring connects, are in `docs/validation.md` (P2.1).
+Review regressions exercise explicit/implicit/non-UTF8 display authorization,
+cache fallback and the actual child environment. A separate capture subprocess
+inherits disposable legacy and XDG NSS stores containing a test CA and an ambient
+TLS key-log path; it must reject that CA, leave both caller stores untouched,
+write no TLS key log, and remove all private profiles.

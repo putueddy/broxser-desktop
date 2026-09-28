@@ -21,12 +21,18 @@ the crash, but the dump holds only headers and register state, no memory mapping
 with cookies or page content. The browser runs with a private home directory
 inside the profile (ADR 0020): NSS creates the browser's own certificate database
 there, deleted with the profile, and the user's `~/.pki/nssdb`, with its CAs,
-client certificates and keys, is not opened. The desktop keyring is not asked for
-a key (`--password-store=basic`). A corporate CA is installed explicitly through
+client certificates and keys, is not opened. Profile encryption does not request
+the desktop keyring's key (`--password-store=basic`). Inherited `SSLKEYLOGFILE`
+is removed so it cannot leave TLS secrets after profile cleanup. A corporate CA is installed explicitly through
 Chromium's `CACertificates` policy in `/etc/chromium/policies/managed`, which the
 user's own Helium honours too; a CA trusted only in a personal database, and
-client certificates, do not apply in Broxser. Only the user's cache directory
-(fontconfig caches) is still shared with the browser.
+client certificates from that database, do not apply in Broxser. The user's cache
+directory (fontconfig caches) and native X11 display authorization remain shared.
+Explicit `XAUTHORITY` is preserved; otherwise the original HOME's `.Xauthority`
+is referenced before HOME changes, without copying it. Other native environment
+overrides remain inherited. This is an NSS/profile storage boundary, not complete
+filesystem isolation for the browser process. Other client-certificate providers
+have not been qualified.
 
 Cleanup runs on normal close, errors and cancellation. Every cleanup path deletes
 the profile only once no running process names it, so a Helium helper that is
@@ -55,8 +61,9 @@ directory, which also remains after a normal close.
 Live input is forwarded only to the device the user targets. Sync never broadcasts
 typing, form submission, clicks or pointer events, never crosses sessions, and a
 restart restores configuration without replaying user actions. One restart or close
-runs at a time: a restart starts one browser, and none starts once the window is
-closing (ADR 0009). Once a page stops
+runs at a time: a restart starts one runtime; its blank discovery browser is
+cleaned up before the aligned replacement, and cancellation prevents further
+launches (ADRs 0009 and 0019). Once a page stops
 answering, new input for it is dropped, not queued, so those clicks and keys cannot
 reach it seconds later; input already sent (at most 32 events) still arrives if
 the page recovers. A navigation Broxser started that gets no response in 30 seconds

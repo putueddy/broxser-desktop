@@ -19,6 +19,12 @@ mod qa_fidelity;
 #[path = "worker_targets.rs"]
 mod worker_targets;
 
+#[path = "private_home.rs"]
+mod private_home;
+
+#[path = "certificate_errors.rs"]
+mod certificate_errors;
+
 #[test]
 fn keys_map_to_dom_values_and_text() {
     let none = Modifiers::default();
@@ -7026,6 +7032,12 @@ impl SelfSignedServer {
                 "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
             ])
             .args([
+                "-config",
+                "/dev/null",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+            ])
+            .args([
                 "-subj",
                 "/CN=broxser-test",
                 "-addext",
@@ -7057,16 +7069,22 @@ impl SelfSignedServer {
             .stderr(Stdio::null())
             .spawn()
             .expect("start openssl s_server");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "openssl s_server did not listen");
-            thread::sleep(Duration::from_millis(20));
-        }
-        Self {
+        // Own the child before readiness checks, including every failure path.
+        let mut server = Self {
             child,
             port,
             _files: files,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                server.child.try_wait().unwrap().is_none(),
+                "openssl s_server exited before listening"
+            );
+            assert!(Instant::now() < deadline, "openssl s_server did not listen");
+            thread::sleep(Duration::from_millis(20));
         }
+        server
     }
 }
 
@@ -7115,6 +7133,42 @@ fn live_certificate_trust_is_the_browsers_own_not_the_users() {
         database.join("cert9.db").is_file(),
         "no NSS database of the browser's own in {}",
         database.display()
+    );
+    let status = live.wait(
+        "the browser's error page",
+        Duration::from_secs(30),
+        |status| {
+            status
+                .devices
+                .iter()
+                .all(|device| !device.loading && device.frames > 0)
+        },
+    );
+    let error = status.devices[0].error.clone();
+    let frames = status.devices[0].frames;
+    live.send(Command::Reload { device: 0 });
+    // Wait for another error-page frame after the explicit Reload. Page.reload
+    // returns no errorText, so the last confirmed report stays.
+    let status = live.wait(
+        "the reloaded error page",
+        Duration::from_secs(30),
+        |status| status.devices[0].frames > frames && !status.devices[0].loading,
+    );
+    assert_eq!(status.devices[0].error, error);
+    let fixture = fixture();
+    live.send(Command::NavigateAll {
+        url: fixture.url("/"),
+    });
+    let status = live.wait(
+        "a successful document after the certificate failure",
+        Duration::from_secs(30),
+        |status| loaded(status, &fixture, "/"),
+    );
+    assert!(status.devices.iter().all(|device| device.error.is_none()));
+    assert_eq!(
+        count(&fixture, "/"),
+        3,
+        "one explicit navigation per device"
     );
     drop(server);
     // The profile, and the database with it, are gone after the session.
