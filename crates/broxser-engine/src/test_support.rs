@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 const ROLE: &str = "BROXSER_TEST_ROLE";
 /// Teardown point at which an owner-role process aborts; see [`abort_point`].
 pub(crate) const ABORT_AT: &str = "BROXSER_TEST_ABORT_AT";
+static TEARDOWN_ABORT_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// This test binary again, running only [`subprocess_role`] as `role`. libtest
 /// offers no other entry point, so the role travels in the environment and the
@@ -50,9 +51,17 @@ fn subprocess_role() {
 /// Aborts at `point` of browser teardown when an owner-role test asks for it,
 /// as if Broxser crashed halfway through its own cleanup.
 pub(crate) fn abort_point(point: &str) {
-    if std::env::var_os(ABORT_AT).is_some_and(|at| at == point) {
+    if TEARDOWN_ABORT_ARMED.load(Ordering::SeqCst)
+        && std::env::var_os(ABORT_AT).is_some_and(|at| at == point)
+    {
         std::process::abort();
     }
+}
+
+/// Fault injection starts only when the owner receives its explicit close
+/// command, not during the blank discovery browser's startup cleanup.
+pub(crate) fn arm_teardown_abort() {
+    TEARDOWN_ABORT_ARMED.store(true, Ordering::SeqCst);
 }
 
 /// Browser for `#[ignore]` live tests: Helium, or an explicitly chosen Chromium
@@ -154,6 +163,8 @@ impl Drop for HeldProcess {
 #[derive(Clone, Debug)]
 pub(crate) struct Request {
     pub path: String,
+    pub user_agent: Option<String>,
+    pub client_hint_brands: Option<String>,
     /// Value of the `fixture_session` cookie, if sent.
     pub session_cookie: Option<String>,
 }
@@ -172,6 +183,8 @@ pub(crate) enum Reply {
     },
     /// A small text file; with `filename`, an attachment by that name.
     File { filename: Option<String> },
+    /// JavaScript served with a MIME type accepted by service workers.
+    JavaScript(String),
     /// Headers and the start of a body, then hold the connection open.
     Stall,
     /// Hold the request open without any response.
@@ -315,9 +328,17 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         .flat_map(|(_, value)| value.split(';'))
         .find_map(|part| part.trim().strip_prefix("fixture_session="))
         .map(str::to_owned);
+    let header = |wanted: &str| {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.trim().to_owned())
+    };
     let request = Request {
         path,
         session_cookie,
+        user_agent: header("user-agent"),
+        client_hint_brands: header("sec-ch-ua"),
     };
     let sequence = {
         let mut requests = shared.requests.lock().unwrap();
@@ -364,6 +385,13 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             let body = "fixture file\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{disposition}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        Reply::JavaScript(body) => {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());

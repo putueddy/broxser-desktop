@@ -83,6 +83,7 @@ pub(crate) fn owner_role() -> ! {
         match commands.recv_timeout(Duration::from_millis(100)) {
             Ok(command) if command == "crash" => process::abort(),
             Ok(command) if command == "close" => {
+                crate::test_support::arm_teardown_abort();
                 cancel.cancel();
                 drop(live.take());
                 if let Some(capture) = capture.take() {

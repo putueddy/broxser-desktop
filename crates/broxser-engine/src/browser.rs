@@ -3,7 +3,7 @@
 //! the Broxser process itself dies, the profile's guardian does both (ADR 0007).
 
 use crate::Limits;
-use crate::cdp::{Cancellation, Cdp};
+use crate::cdp::{Cancellation, Cdp, parse_response};
 use crate::profile::OwnedProfile;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,14 @@ impl BrowserProcess {
     /// only the reproducer's baseline mode launches an unseeded profile. The
     /// profile's guardian is ready before the browser starts.
     pub(crate) fn start(options: &BrowserOptions, seed: bool) -> Result<Self> {
+        Self::start_with_user_agent(options, seed, None)
+    }
+
+    fn start_with_user_agent(
+        options: &BrowserOptions,
+        seed: bool,
+        user_agent: Option<&str>,
+    ) -> Result<Self> {
         if options.executable.as_os_str().is_empty() {
             bail!("browser executable is empty; install Helium or set BROXSER_HELIUM_BIN");
         }
@@ -108,8 +116,9 @@ impl BrowserProcess {
         if seed {
             seed_profile(profile.path())?;
         }
-        let child = Command::new(&options.executable)
-            .args(launch_args(profile.path(), options.headless))
+        let mut command = Command::new(&options.executable);
+        command
+            .args(launch_args(profile.path(), options.headless, user_agent))
             // Chromium keeps its crash database under the default user data
             // directory (for Helium ~/.config/net.imput.helium), shared with a
             // personal installation. Keep crash data in the private profile.
@@ -119,7 +128,11 @@ impl BrowserProcess {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // Profile creation includes guardian startup. Cancellation during that
+        // work must prevent the browser spawn as well.
+        options.cancel.check()?;
+        let child = command
             .spawn()
             .with_context(|| format!("launch browser {}", options.executable.display()))?;
         let identity = self::identity(child.id());
@@ -135,6 +148,61 @@ impl BrowserProcess {
             profile.watch(identity)?;
         }
         Ok(browser)
+    }
+
+    /// Discovers the native UA only through an owned browser, before workspace
+    /// contexts or navigation exist. A normalized UA needs one replacement
+    /// runtime: the discovery runtime must finish checked cleanup first.
+    pub(crate) fn start_connected(
+        options: &BrowserOptions,
+        seed: bool,
+        limits: &Limits,
+    ) -> Result<(Self, Cdp)> {
+        let mut browser = Self::start(options, seed)?;
+        let discovered = (|| {
+            let mut cdp = browser.connect(limits)?;
+            let user_agent = if options.headless {
+                let id = cdp.send("Browser.getVersion", json!({}), None)?;
+                let deadline = Instant::now() + limits.command;
+                let version = loop {
+                    options.cancel.check()?;
+                    if let Some(response) = cdp.take_response(id) {
+                        break parse_response(response, "Browser.getVersion")?;
+                    }
+                    if !cdp.read_until(deadline)? {
+                        bail!("CDP Browser.getVersion timed out during browser discovery");
+                    }
+                };
+                headed_user_agent(version.get("userAgent").and_then(serde_json::Value::as_str))
+            } else {
+                None
+            };
+            options.cancel.check()?;
+            Ok((cdp, user_agent))
+        })();
+        let (cdp, user_agent) = match discovered {
+            Ok(discovered) => discovered,
+            Err(error) => return Err(startup_failed(browser, error)),
+        };
+        let Some(user_agent) = user_agent else {
+            return Ok((browser, cdp));
+        };
+        drop(cdp);
+        let processes = startup_processes(&browser);
+        browser
+            .shutdown()
+            .context("discovery browser cleanup failed")
+            .with_context(|| StartupDiagnostics(processes.clone()))?;
+        options
+            .cancel
+            .check()
+            .with_context(|| StartupDiagnostics(processes.clone()))?;
+        let mut browser = Self::start_with_user_agent(options, seed, Some(&user_agent))
+            .context(StartupDiagnostics(processes))?;
+        match browser.connect(limits) {
+            Ok(cdp) => Ok((browser, cdp)),
+            Err(error) => Err(startup_failed(browser, error)),
+        }
     }
 
     /// Processes useful for diagnostics, including unrelated profile observers.
@@ -239,7 +307,14 @@ impl Drop for BrowserProcess {
     }
 }
 
-fn launch_args(profile: &Path, headless: bool) -> Vec<OsString> {
+/// Headless Chromium detects no pointing device, so every page would see
+/// `(hover: none)` and `(pointer: none)`. These Blink settings restore a mouse
+/// (fine pointer, hover); touch emulation still overrides them on touch
+/// devices (ADR 0019).
+const POINTER_SETTINGS: &str = "--blink-settings=availablePointerTypes=4,primaryPointerType=4,\
+availableHoverTypes=2,primaryHoverType=2";
+
+fn launch_args(profile: &Path, headless: bool, user_agent: Option<&str>) -> Vec<OsString> {
     let mut user_data_dir = OsString::from("--user-data-dir=");
     user_data_dir.push(profile);
     let mut args: Vec<OsString> = vec![
@@ -252,8 +327,73 @@ fn launch_args(profile: &Path, headless: bool) -> Vec<OsString> {
     ];
     if headless {
         args.push("--headless=new".into());
+        args.push(POINTER_SETTINGS.into());
+        if let Some(user_agent) = user_agent {
+            args.push(format!("--user-agent={user_agent}").into());
+        }
     }
     args
+}
+
+/// Capture diagnostics retain observed identities even when startup fails
+/// before it can return a runtime. An anyhow context preserves the original
+/// error's type (including cancellation).
+#[derive(Debug)]
+pub(crate) struct StartupDiagnostics(pub(crate) Vec<ProcessIdentity>);
+
+impl std::fmt::Display for StartupDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("owned browser startup failed")
+    }
+}
+
+fn startup_processes(browser: &BrowserProcess) -> Vec<ProcessIdentity> {
+    let mut processes = browser.processes();
+    processes.extend(browser.guardian());
+    processes
+}
+
+fn startup_failed(browser: BrowserProcess, error: anyhow::Error) -> anyhow::Error {
+    let processes = startup_processes(&browser);
+    let error = match browser.shutdown() {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("browser cleanup also failed: {cleanup:#}")),
+    };
+    error.context(StartupDiagnostics(processes))
+}
+
+/// Replace only the native headless product token, retaining the browser's
+/// actual platform, full version and every other byte. Invalid or absent UAs
+/// leave the first runtime in use; never synthesize a version or platform.
+fn headed_user_agent(native: Option<&str>) -> Option<String> {
+    const MAX_USER_AGENT: usize = 4096;
+    let native = native?;
+    if native.len() > MAX_USER_AGENT || native.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+        return None;
+    }
+    let mut headless = native
+        .split(' ')
+        .filter(|token| token.starts_with("HeadlessChrome/"));
+    let token = headless.next()?;
+    if headless.next().is_some() {
+        return None;
+    }
+    let version = token.strip_prefix("HeadlessChrome/")?;
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 4
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let offset = native
+        .match_indices(token)
+        .find(|(offset, _)| *offset == 0 || native.as_bytes()[offset - 1] == b' ')?
+        .0;
+    let mut headed = native.to_owned();
+    headed.replace_range(offset..offset + token.len(), &format!("Chrome/{version}"));
+    Some(headed)
 }
 
 /// Keeps browser memory out of kernel core dumps. Renderer memory holds cookies
@@ -670,6 +810,10 @@ pub(crate) mod procfs {
 }
 
 #[cfg(test)]
+#[path = "browser/qa_fidelity.rs"]
+mod qa_fidelity;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -693,12 +837,21 @@ mod tests {
     #[test]
     fn launch_keeps_sandbox_loopback_and_private_state() {
         let profile = Path::new("/tmp/broxser-cdp-test");
-        let args: Vec<String> = launch_args(profile, true)
+        let args: Vec<String> = launch_args(profile, true, Some("UA"))
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect();
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
         assert!(args.contains(&"--user-data-dir=/tmp/broxser-cdp-test".to_owned()));
+        assert!(args.contains(&"--user-agent=UA".to_owned()));
+        assert!(args.contains(&POINTER_SETTINGS.to_owned()));
+        let headed: Vec<String> = launch_args(profile, false, None)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        assert!(!headed.iter().any(|arg| arg.starts_with("--headless")
+            || arg.starts_with("--user-agent")
+            || arg.starts_with("--blink-settings")));
         assert!(
             !args
                 .iter()

@@ -101,14 +101,22 @@ pub(crate) fn setup_target(
         json!({"enabled": true}),
         Some(&session),
     )?;
+    let mut metrics = json!({
+        "width": device.width,
+        "height": device.height,
+        "deviceScaleFactor": device.device_scale_factor,
+        "mobile": device.mobile,
+    });
+    if !device.mobile {
+        // Mobile emulation already sizes the screen to the viewport; a desktop
+        // device would otherwise report the headless browser's 800 × 600
+        // screen behind a larger viewport (ADR 0019).
+        metrics["screenWidth"] = json!(device.width);
+        metrics["screenHeight"] = json!(device.height);
+    }
     commands.command(
         "Emulation.setDeviceMetricsOverride",
-        json!({
-            "width": device.width,
-            "height": device.height,
-            "deviceScaleFactor": device.device_scale_factor,
-            "mobile": device.mobile,
-        }),
+        metrics,
         Some(&session),
     )?;
     let touch = if device.touch {

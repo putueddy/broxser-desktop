@@ -248,9 +248,9 @@ kini punya tes fake CDP atau Helium. Sisa di luar lingkup: `history.back/forward
 navigasi lintas dokumen yang dimulai halaman, form, tab baru dan download, serta
 peer yang memuat route SPA sebagai dokumen penuh dari server.
 
-**Status P1.6 (26–27 September 2026, dipecah per kapabilitas; dialog merged
+**Status P1.6 (26–28 September 2026, dipecah per kapabilitas; dialog merged
 melalui PR #14, popup melalui PR #15, download/pemilih file melalui PR #16,
-permission melalui PR #17; input touch menunggu review):** audit seluruh kapabilitas ada di `docs/validation.md` (P1.6). Probe CDP
+permission melalui PR #17, input touch melalui PR #19):** audit seluruh kapabilitas ada di `docs/validation.md` (P1.6). Probe CDP
 pada Helium 0.18.1.1 dan run `main` `6495c2b` membuktikan bahwa dialog JavaScript
 membekukan halaman dan frame-nya, bahwa Go/Reload/sync membatalkan dialog diam-diam
 (navigasi menutupnya dengan hasil *cancel*), bahwa klik yang membuka dialog dihitung
@@ -300,7 +300,7 @@ saat dibuat, sehingga halaman dijawab `denied` dalam hitungan milidetik dan
 mengubah perilaku salin, wake lock dan font.
 
 Kapabilitas kelima, input touch
-([ADR 0018](docs/adr/0018-touch-input-for-touch-devices.md), PR terpisah):
+([ADR 0018](docs/adr/0018-touch-input-for-touch-devices.md), merged melalui PR #19):
 tes live pada `77a1762` membuktikan bahwa klik pada device `touch: true` tiba
 di halaman sebagai event mouse (`pointerType` `mouse`, tanpa `touchstart`).
 Kini tekan, seret dan lepas tombol kiri pada device touch dikirim sebagai satu
@@ -313,12 +313,30 @@ gestur yang terputus dibatalkan tanpa memutar ulang pelepasannya.
 Batas yang didokumentasikan sebagai penutup P1.6 (`docs/validation.md`): browser
 headless tidak melaporkan perangkat penunjuk, sehingga halaman device mouse
 melihat `(hover: none)` dan `(pointer: none)` walau gaya `:hover` tetap bekerja
-saat pointer di atas elemen (perbedaan fidelitas untuk P1.7); drag and drop HTML5
+saat pointer di atas elemen (perbedaan fidelitas untuk P1.7, yang menutupnya:
+device mouse kini melihat `(hover: hover)` dan `(pointer: fine)`); drag and drop HTML5
 dan seleksi teks bekerja lewat event mouse pada device mouse, sedangkan pada
 device touch seret adalah swipe dan drag and drop berbasis sentuh tidak
 dimodelkan; GPUI 0.2.2 tidak menyediakan pohon aksesibilitas di Linux dan pohon
 aksesibilitas halaman tidak dibaca, jadi QA aksesibilitas memerlukan browser
 dengan screen reader.
+
+**Status P1.7 (27 September 2026, PR menunggu review):** pengukuran dan keputusan ada di
+[ADR 0019](docs/adr/0019-qa-fidelity-headless-differences.md) dan
+`docs/validation.md` (P1.7). Probe pada Helium headless (konfigurasi Broxser),
+Helium headed di Xvfb, dan Chromium 141 membuktikan bahwa halaman di Broxser
+melihat `HeadlessChrome/154` (bukan `Chrome/154`), device mouse melihat
+`(hover: none)` dan `(pointer: none)`, dan device desktop melihat layar 800 × 600
+di balik viewport 1440 × 900; canvas dan audio Helium berubah setiap session
+(noise privasi Helium; Chromium stabil), `hardwareConcurrency` sekali 2 dari 4,
+WebGL memakai SwiftShader tanpa GPU, dan context session tidak memblokir konten
+(ADR 0004). Kini launch headless membawa `--blink-settings` pointer/hover dan
+`--user-agent` dari UA native yang dibaca lewat CDP pada browser discovery
+privat; browser itu dibersihkan sebelum satu pengganti dimulai, tanpa memuat
+URL workspace selama discovery. Tidak ada subprocess `--version`. Device non-mobile
+mendapat layar seukuran viewport, dan sisanya didokumentasikan: hasil mewakili
+pengguna Helium dengan blocker mati di mesin serupa, bukan pengguna Chrome, dan
+perbandingan piksel canvas tidak stabil antar session.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -409,7 +427,8 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   melalui PR #13; P1.6 dialog JavaScript: ADR 0014, merged melalui PR #14; popup:
   ADR 0015, merged melalui PR #15; download/pemilih file: ADR 0016, merged melalui
   PR #16; permission: ADR 0017, merged melalui PR #17; input touch dan batas hover,
-  drag/drop serta aksesibilitas: ADR 0018, PR menunggu review).
+  drag/drop serta aksesibilitas: ADR 0018, merged melalui PR #19; P1.7 fidelitas QA:
+  ADR 0019, PR menunggu review).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian.
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan.
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

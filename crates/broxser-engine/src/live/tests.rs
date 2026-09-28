@@ -13,6 +13,12 @@ mod navigation_deadlines;
 #[path = "touch_input.rs"]
 mod touch_input;
 
+#[path = "qa_fidelity.rs"]
+mod qa_fidelity;
+
+#[path = "worker_targets.rs"]
+mod worker_targets;
+
 #[test]
 fn keys_map_to_dom_values_and_text() {
     let none = Modifiers::default();
@@ -2774,6 +2780,13 @@ for (const type of ['pointerdown', 'pointerup', 'pointermove', 'touchstart', 'to
 addEventListener('scrollend', () => ping('scrollend', Math.round(scrollY)));
 </script></body></html>"#;
 
+/// Reports what a page can tell about the browser it runs in: the user agent,
+/// the pointer and hover media, and the screen the viewport sits on.
+const FIDELITY_PAGE: &str = r#"<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"></head><body><script>
+const q = s => matchMedia(s).matches;
+fetch('/event?' + new URLSearchParams({kind: 'fidelity', w: innerWidth, ua: navigator.userAgent, brands: (navigator.userAgentData ? navigator.userAgentData.brands.map(b => b.brand).join('|') : 'none'), hover: q('(hover: hover)') ? 'hover' : 'none', pointer: q('(pointer: fine)') ? 'fine' : q('(pointer: coarse)') ? 'coarse' : 'none', screen: screen.width + 'x' + screen.height, touch: navigator.maxTouchPoints}));
+</script></body></html>"#;
+
 /// `PAGE` whose link leads to the JavaScript expression `href`, then `script`.
 fn link_page(href: &str, script: &str) -> String {
     PAGE.replace(
@@ -2923,6 +2936,7 @@ fn fixture() -> Fixture {
             "/permissions" => PERMISSION_PAGE.into(),
             "/camera-permissions" => CAMERA_PERMISSION_PAGE.into(),
             "/touch" => TOUCH_PAGE.into(),
+            "/fidelity" => FIDELITY_PAGE.into(),
             "/dirty" => DIRTY_PAGE.into(),
             "/event" => String::new(),
             "/script-key" => PAGE.replace("AUTO", "document.getElementById('field').addEventListener('keydown', () => setTimeout(() => document.getElementById('link').click(), 100));"),
@@ -6940,5 +6954,56 @@ fn live_touch_devices_get_touches_and_mouse_devices_get_a_mouse() {
         .parse()
         .unwrap();
     assert!(scrolled > 0, "{after:?}");
+    live.close();
+}
+
+#[test]
+#[ignore = "requires an installed CDP browser"]
+fn live_pages_see_the_browser_a_user_would_run() {
+    let fixture = fixture();
+    let mut workspace = workspace(fixture.url("/fidelity"));
+    workspace.devices[0].touch = true;
+    workspace.devices[0].mobile = true;
+    let live = Live::start(workspace);
+    live.wait("pages", Duration::from_secs(30), |s| {
+        loaded(s, &fixture, "/fidelity")
+    });
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| events(f, "fidelity").len()
+            == 3)
+    );
+    let report = |width: &str| {
+        events(&fixture, "fidelity")
+            .into_iter()
+            .find(|event| event["w"] == width)
+            .unwrap()
+    };
+    let (phone, tablet, desktop) = (report("360"), report("600"), report("1000"));
+    for device in [&phone, &tablet, &desktop] {
+        // The headless marker would tell pages that no user is there.
+        assert!(
+            device["ua"].contains(" Chrome/") && !device["ua"].contains("HeadlessChrome"),
+            "{device:?}"
+        );
+        assert!(device["brands"].contains("Chromium"), "{device:?}");
+    }
+    // A mouse device hovers with a fine pointer on a screen the size of its
+    // viewport; a touch device keeps its coarse pointer without hover.
+    for device in [&tablet, &desktop] {
+        assert_eq!(
+            (device["hover"].as_str(), device["pointer"].as_str()),
+            ("hover", "fine"),
+            "{device:?}"
+        );
+    }
+    assert_eq!(desktop["screen"], "1000x700", "{desktop:?}");
+    assert_eq!(tablet["screen"], "600x800", "{tablet:?}");
+    assert_eq!(
+        (phone["hover"].as_str(), phone["pointer"].as_str()),
+        ("none", "coarse"),
+        "{phone:?}"
+    );
+    assert_eq!(phone["screen"], "360x640", "{phone:?}");
+    assert_eq!(phone["touch"], "1");
     live.close();
 }

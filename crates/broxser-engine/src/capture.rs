@@ -2,7 +2,7 @@
 //! per device and a PNG per device; afterwards the browser and profile are removed.
 
 use crate::Limits;
-use crate::browser::{BrowserOptions, BrowserProcess, ProcessIdentity};
+use crate::browser::{BrowserOptions, BrowserProcess, ProcessIdentity, StartupDiagnostics};
 use crate::cdp::{Cdp, Event, parse_response, required_str};
 use crate::device::{
     Commands, ExtensionObservations, deny_permission_prompts, extension_in_context, setup_target,
@@ -144,22 +144,28 @@ fn run_with(
         .validate()
         .map_err(|error| anyhow!("invalid workspace: {error}"))?;
     fs::create_dir_all(output_dir).with_context(|| format!("create {}", output_dir.display()))?;
-    let mut browser = BrowserProcess::start(options, plan.extension_guard)?;
-    let captured = match browser.connect(&plan.limits) {
-        Ok(cdp) => Capture {
-            cdp,
-            workspace,
-            limits: plan.limits,
-            extension_guard: plan.extension_guard,
-            diagnostics: &mut *diagnostics,
-            contexts: HashSet::new(),
-            extensions: ExtensionObservations::default(),
-            targets: Vec::new(),
-            loaded: HashSet::new(),
-        }
-        .run(output_dir, plan.order),
-        Err(error) => Err(error),
-    };
+    let (browser, cdp) =
+        match BrowserProcess::start_connected(options, plan.extension_guard, &plan.limits) {
+            Ok(connected) => connected,
+            Err(error) => {
+                if let Some(observed) = error.downcast_ref::<StartupDiagnostics>() {
+                    diagnostics.processes = observed.0.clone();
+                }
+                return Err(error);
+            }
+        };
+    let captured = Capture {
+        cdp,
+        workspace,
+        limits: plan.limits,
+        extension_guard: plan.extension_guard,
+        diagnostics: &mut *diagnostics,
+        contexts: HashSet::new(),
+        extensions: ExtensionObservations::default(),
+        targets: Vec::new(),
+        loaded: HashSet::new(),
+    }
+    .run(output_dir, plan.order);
     diagnostics.processes = browser.processes();
     diagnostics.processes.extend(browser.guardian());
     let cleanup = browser.shutdown();

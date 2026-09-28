@@ -3,6 +3,148 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P1.7 QA fidelity, 27 September 2026 (cloud container)
+
+Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by the unprivileged
+user `broxsertest` with the sandbox enabled, Xvfb 1600 × 1000 for the headed
+runs, Chromium 141.0.7390.37 (the Playwright build installed here) as the plain
+Chromium comparison, no GPU. Decisions are in
+[ADR 0019](adr/0019-qa-fidelity-headless-differences.md).
+
+### Probe: what a page sees in each browser configuration
+
+A scratch Node script, not committed, served one page that reports about 80
+properties (user agent and client hints, navigator fields, screen and viewport,
+media queries, WebGL, canvas and audio fingerprints, fonts, storage, permissions,
+subresource headers, whether scripts under `/ads/` and `/tracker/` ran) and
+loaded it with Broxser's device setup for a touch phone (390 × 844, mobile) and a
+mouse desktop (1440 × 900). Configurations: Helium headless (Broxser's, five
+runs), Helium headed on Xvfb, Chromium headless (two runs) and headed, and
+Helium headless without the ADR 0004 preference.
+
+| Property | Helium headless (Broxser before) | Helium headed | Chromium 141 |
+| --- | --- | --- | --- |
+| User agent | `HeadlessChrome/154.0.0.0` | `Chrome/154.0.0.0` | `HeadlessChrome/141` headless, `Chrome/141` headed |
+| Client-hint brands | Chromium, Google Chrome, greased | Same | Chromium, greased (no Google Chrome) |
+| Desktop device: `(hover: hover)`, `(pointer: fine)` | false, false (`hover: none`, `pointer: none`) | true, true | Same split as Helium |
+| Phone device: `(hover: none)`, `(pointer: coarse)` | true, true | true, true | Same |
+| Desktop device: `screen` | 800 × 600 | 1600 × 1000 (the X screen) | Same split as Helium |
+| Phone device: `screen` | 390 × 844 | 390 × 844 | Same |
+| WebGL renderer | ANGLE, SwiftShader | none (no GL on this display) | Same split |
+| Canvas fingerprint | Different in each of five runs | Different again | Identical in every run |
+| Audio fingerprint | Different in each run | Different | Identical |
+| `hardwareConcurrency` | 2 once, 4 in four runs | 4 | 4 always |
+| `deviceMemory` | 16 | 16 | 8 |
+| Storage quota | 10 GB | 10 GB | about 1 GB |
+| `webdriver`, plugins (5), `chrome` object, `Accept-Language` (`en-US,en;q=0.9`), time zone, locale, six fonts, permissions | Same in every configuration | | |
+| `/ads/banner.js`, `/tracker/analytics.js` | Requested and run | Requested and run | Requested and run |
+
+Attempts to align the first three rows: `Emulation.setEmulatedMedia` with
+`hover` and `pointer` features changed nothing; `Emulation.setUserAgentOverride`
+with a user agent alone removed every `Sec-CH-UA` header and emptied
+`userAgentData`, and with metadata reproduced the headed headers exactly but
+needs the brand list, which CDP does not expose. The launch flags
+`--blink-settings=availablePointerTypes=4,primaryPointerType=4,availableHoverTypes=2,primaryHoverType=2`
+and `--user-agent=<headed string>` gave the mouse device `hover: hover` and
+`pointer: fine`, left the touch phone at `coarse` and `none`, and kept the
+brands, with `Sec-CH-UA-Arch` and `Sec-CH-UA-Full-Version-List` blank.
+`screenWidth`/`screenHeight` in the device metrics sized the desktop screen to
+its viewport.
+
+### Before and after
+
+`live_pages_see_the_browser_a_user_would_run` at `c731d67` (before) and after
+the change, a page reporting its user agent, brands, hover and pointer media,
+screen and touch points on a touch phone, a mouse tablet and a mouse desktop:
+
+| Device | Before | After |
+| --- | --- | --- |
+| Phone (touch) | `HeadlessChrome/154`, hover none, pointer coarse, screen 360 × 640, 1 touch point | `Chrome/154`, brands present, otherwise unchanged |
+| Tablet and desktop (mouse) | `HeadlessChrome/154`, hover none, pointer none, screen 800 × 600 | `Chrome/154`, hover, fine pointer, screen 600 × 800 and 1000 × 700 |
+
+| Check | Result |
+| --- | --- |
+| `headed_user_agent_comes_from_the_browsers_version` (unit) | Passed: `Helium 0.18.1.1 (Chromium 154.0.8037.57)` → 154, `Chromium 141.0.7390.37` → 141, no version → none; the fake browser answers `--version`; a missing executable gives none. A first version took the first four-part version and read Helium's own `0.18.1.1` |
+| `live_pages_see_the_browser_a_user_would_run` (Helium) | Failed before the change as above; passed after (1.0 s) |
+| `bash scripts/check.sh` with the fidelity change | Passed: 1 CLI, 8 core, 71 engine and 25 desktop tests; 41 live tests ignored by default; fmt and strict Clippy clean (two Clippy rounds over the version search, now `rfind`) |
+| Live Helium suite (`--ignored`, 4 threads) | 41 of 41 passed in 80.6 s |
+| Full `scripts/desktop-smoke.sh` (debug build) | 11 of 11 runs passed with the new launch flags; no browser process, profile or window left |
+| Rerun after the cherry-pick onto `main` (`133ce2b`, PR #19 merged with the owner's touch fix; no conflicts) | `check.sh` passed: 1 CLI, 8 core, 119 engine and 36 desktop tests, 47 live tests ignored by default. Live Helium suite 47 of 47 in 73.3 s; full smoke 13 of 13 runs in 1 m 18 s, including touch cancellation through the canvas; no browser process, profile or window left |
+
+### Limits
+
+- The user agent preserves the browser's native platform and version, changing
+  only its headless product marker. Two high-entropy client hints stay blank.
+  An absent or unsupported native UA keeps the original owned browser; a
+  discovery error stops startup instead of launching a fallback.
+- WebGL is SwiftShader without a GPU, canvas and audio output carry Helium's
+  per-session noise, `hardwareConcurrency` varied once, and session contexts
+  have no content blocking (ADR 0004): representative of a Helium user with
+  the blocker off on a similar machine, not of a Chrome user.
+- Headed Helium was measured on Xvfb without a GPU; a user's machine differs
+  in WebGL and screen.
+
+### PR #20 ownership and startup review, 28 September 2026 (local Linux)
+
+Review of `ca46c52` found that the new CLI version probe bypassed the established
+browser ownership path. A successful wrapper that retained stdout in a helper
+made the nominal three-second probe wait 6.020 s. A 64 MiB version response
+raised the probe caller's peak RSS to 68,152 KiB. Through the capture API,
+cancellation after 100 ms returned after 3.050 s and still launched the normal
+browser; killing the owner left the unregistered version child alive after
+5.2 s while the guardian and profile had already gone.
+
+The replacement removes the CLI probe and its stdout reader. Live and capture
+now share an owned discovery path: query `Browser.getVersion` in a private,
+guarded browser on `about:blank`, normalize only the native headless UA token,
+then require checked cleanup before one replacement launch. Discovery creates
+no workspace contexts or targets and never loads a workspace URL. An ordinary
+or unsupported UA uses the first runtime; errors and cancellation stop startup
+without another launch. All spawns check cancellation again after profile and
+guardian setup. Endpoint waits and commands retain their existing per-operation
+deadlines; startup may include two sequential browser launches, not a global
+three-second probe deadline.
+
+A separate sandboxed Helium probe corrected the initial metadata assumption:
+omitting optional brands/full versions from CDP UA metadata preserves native
+defaults. A per-target override, however, normalized the page and dedicated
+worker while service-worker JavaScript and requests still exposed
+`HeadlessChrome`. The browser-wide launch override is retained to keep those
+surfaces consistent. The new live regression checks page, dedicated-worker,
+shared-worker and service-worker UA against their HTTP request headers; a capture regression checks
+its headers and that the workspace is requested once per device. Measurements
+and final logs are retained locally in ignored `artifacts/pr20-review/`.
+
+That regression also exposed an existing iframe auto-attach interaction:
+`waitForDebuggerOnStart: true` plus an iframe-only filter fetched a dedicated
+worker script but never ran it, with no attachment event available to resume
+it. A raw pinned-Helium probe reproduced the stall; the same worker ran with
+the wait disabled. The fix explicitly includes worker types, validates their
+ownership and immediately resumes them through the bounded cleanup path,
+waiting for acknowledgement before detaching. Iframe interception stays paused
+until configured; workers receive no Page setup or page input privileges.
+The header probe also verified that worker-origin fetches omit `Sec-CH-UA`
+both with the default headless UA and with the launch override. The regression
+therefore checks client hints on page-origin requests and UA agreement on all
+worker requests, preserving the browser's own client-hint policy.
+The first complete live rerun passed 48/49 tests: the existing teardown-crash
+test armed its fault at process start, so it aborted discovery cleanup before
+the live-frame phase it intended to test. Fault injection is now armed only by
+the owner test's explicit close command. The targeted rerun passed both teardown
+points, with processes, endpoint and profile gone after 205 ms and 145 ms.
+
+| Final local check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: fmt, strict Clippy, 1 CLI, 8 core, 135 engine and 36 desktop tests; 49 live tests ignored by default |
+| Full pinned Helium 0.18.1.1 suite, sandbox enabled, four threads | 49/49 passed in 68.52 s after correcting the teardown fault-injection phase |
+| Full X11 desktop smoke, Xvfb 1600 × 1000 with Mesa Lavapipe, debug build | 13/13 passed; restart observed the two sequential discovery/runtime profiles, immediate close started none, and no browser process/profile/window remained |
+| Independent ownership and worker review | No remaining actionable blocker; discovery, worker and existing iframe regressions passed |
+
+Final logs are in `artifacts/pr20-review/` (ignored). The existing vendored GPUI
+and `proc-macro-error2` future-compatibility warnings remain non-failing. Native
+validation here covers X11; Wayland, a physical IME and company GPU hardware
+qualification are not implied.
+
 ## P0 follow-up: survivors of the browser's exit wait, 27 September 2026 (cloud container)
 
 Same container: Helium 0.18.1.1 run by `broxsertest` with the sandbox enabled.
@@ -492,6 +634,8 @@ changed:
   apply when the mouse device's pointer is over an element, since mouse moves
   are sent; only the media queries misreport. This is a fidelity difference
   for P1.7 (comparison with the user's browser), not something a card can fix.
+  P1.7 closed it with launch flags (ADR 0019): mouse devices now see
+  `(hover: hover)` and `(pointer: fine)`, touch devices keep `coarse` and `none`.
 - **Drag and drop.** HTML5 drag and drop (`dragstart`, `dragenter`, `drop`
   with data, `dragend`) and text selection by dragging work through mouse
   events on mouse devices. On touch devices a drag is a swipe (ADR 0018);
