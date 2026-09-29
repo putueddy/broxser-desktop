@@ -375,7 +375,7 @@ masih ada. Tidak ada alamat halaman, cookie atau kredensial di state. Belum ada:
 edit nama/ukuran/session di panel, dialog buka file (portal desktop tidak
 tersedia di container), panel di mode statis.
 
-**Status P2.2 (27–29 September 2026, audit merged melalui PR #22; keputusan produk 29 September, PR menunggu review; belum ada implementasi):** pengukuran
+**Status P2.2 (27–29 September 2026, audit merged melalui PR #22; keputusan produk merged melalui PR #28; belum ada implementasi):** pengukuran
 ada di `docs/validation.md` (P2.2) dan desainnya di
 [ADR 0021](docs/adr/0021-persistent-sessions-one-profile-per-session.md),
 diterima pada 29 September atas delegasi pemilik bersama keputusan produknya.
@@ -456,7 +456,7 @@ satu, screenshot terikat revisi halaman sehingga hasil basi dibatalkan, redaksi
 juga mencakup alamat IPv6, host Unicode, bearer pendek dan JWT di path, metadata
 ditulis sebagai kode literal, dan PNG divalidasi utuh.
 
-**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik 29 September, PR menunggu review):** audit dan
+**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik merged melalui PR #28; workflow kualifikasi PR menunggu review):** audit dan
 keputusan ada di [ADR 0025](docs/adr/0025-linux-release-archive-and-sbom.md) dan
 `docs/validation.md` (P3.1). Sebelumnya tidak ada build release, arsip, SBOM,
 checksum artefak Broxser atau signature; Helium sudah dipin dengan checksum dan
@@ -493,8 +493,9 @@ untuk update berikutnya adalah pin sekarang; rollback engine saja ke 0.17.2.1
 akan membawa regresi itu. Pergantian pin bolak-balik di clone berjalan dalam 10
 detik dan kembali dengan rename.
 
-Keputusan pemilik (29 September 2026, diambil atas delegasi pemilik, PR menunggu
-review; belum ada implementasi): menurut ADR 0025, kode Broxser tetap tanpa
+Keputusan pemilik (29 September 2026, diambil atas delegasi pemilik, merged
+melalui PR #28; implementasi pertama, workflow kualifikasi, PR menunggu review):
+menurut ADR 0025, kode Broxser tetap tanpa
 lisensi (all rights reserved; Apache-2.0 disarankan bila perusahaan membukanya)
 dan arsip hanya untuk pengguna pilot perusahaan. Review lisensi pihak ketiga
 menemukan bahwa arsip sekarang hanya membawa teks lisensi GPUI, dan bahwa GPUI
@@ -509,14 +510,27 @@ diunggah sebagai artefak workflow, yang di repo publik ini dapat diunduh siapa
 pun yang login. Format pengguna tetap arsip, ditambah `install.sh` per user
 tanpa root dan penemuan Helium di samping binary; AppImage, Flatpak dan paket
 distro tidak sekarang. Owner utama engine dan rilis adalah pemilik repo;
-cadangan harus ditunjuk perusahaan. Menurut ADR 0026, kunci Helium tetap:
-salinan di `keyserver.ubuntu.com` identik per paket OpenPGP, sedangkan
-`helium.computer` dan `keys.openpgp.org` ditolak kebijakan jaringan lingkungan
-ini. Rotasi kunci lewat satu PR yang di-review, dengan dua sumber, dan di-merge
-pemilik repo. Workflow GitHub Actions mingguan dan on-demand mengualifikasi pin
-dan rilis baru tanpa mengubah pin; record disimpan sebagai artefak workflow 90
-hari dan ringkasannya di `docs/validation.md`. Pin Helium yang lebih lama hanya
-dengan record `qualified`, bukti regresi dan batas paling lama 14 hari.
+cadangan harus ditunjuk perusahaan. Menurut ADR 0026, kunci Helium tetap. Tiga
+sumber di luar repo Helium cocok dengannya: `keys.openpgp.org` (user ID
+`helium@imput.net` terverifikasi lewat email), repo apt Helium sendiri
+`pkg.helium.computer` (ditandatangani kunci itu) dan `keyserver.ubuntu.com`;
+situs `helium.computer` tidak memuat kunci sendiri dan merujuk ke `pubkey.asc`
+yang sama. Rotasi kunci lewat satu PR yang di-review, dengan dua sumber, dan
+di-merge pemilik repo. Pin Helium yang lebih lama hanya dengan record
+`qualified`, bukti regresi dan batas paling lama 14 hari.
+
+Workflow kualifikasi (ADR 0026 keputusan 2, PR menunggu review): sebelumnya
+kualifikasi hanya manual dan tidak ada yang mencari rilis Helium baru atau
+membandingkan kunci. Kini `.github/workflows/qualify-helium.yml` menjalankan
+`qualify-helium.py scheduled` setiap Senin 03:23 UTC, on demand (opsional
+dengan versi) dan pada PR yang mengubah pin, kunci, skrip atau workflow itu:
+kunci dibandingkan dengan `pubkey.asc` Helium, tag rilis terbaru dicari lewat
+`git ls-remote`, pin dikualifikasi ulang dan rilis yang lebih baru (atau yang
+disebut) di-propose lalu dikualifikasi, dengan sandbox tetap aktif dan smoke di
+Xvfb. Job gagal kecuali kunci cocok dan setiap run `qualified`; tabel hasil ada
+di ringkasan run dan record di artefak 90 hari. Workflow tidak pernah mengubah
+pin. Uji lokal sebagai user biasa: pin qualified (54/54, smoke lulus) dalam
+3 m 15 s.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -612,12 +626,13 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian
   (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
   session: audit merged melalui PR #22, ADR 0021 diterima dengan keputusan produk
-  (PR menunggu review), implementasi lima tahap belum dimulai; P2.2a panel workspace,
+  (merged melalui PR #28), implementasi lima tahap belum dimulai; P2.2a panel workspace,
   preset dan file state: ADR 0022, merged melalui PR #23; P2.3a console per device:
   ADR 0023, merged melalui PR #24; P2.3b laporan bug: ADR 0024, merged melalui PR #25).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan (P3.1 arsip
   rilis tanpa signature dan SBOM: ADR 0025, merged melalui PR #26; kualifikasi
   update Helium dan latihan rollback: ADR 0026, merged melalui PR #27; keputusan
   lisensi, signing, kanal rilis, format, owner dan kualifikasi terjadwal: ADR
-  0025/0026, PR menunggu review; implementasinya menyusul).
+  0025/0026, merged melalui PR #28; workflow kualifikasi mingguan: PR menunggu
+  review; teks lisensi di arsip, workflow rilis dan installer menyusul).
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

@@ -153,10 +153,13 @@ customer screenshots, or full sensitive URLs to public issues.
 
 Operating targets (ADR 0003, accepted 2026-09-29): triage browser advisories
 within one business day; qualify critical updates within 72 hours of a usable
-upstream release; review other updates weekly. The primary owner is the
-repository owner; no backup is named yet, and the scheduled qualification
-workflow that ADR 0026 decides is not built yet, so these are targets, not current
-service guarantees. An incompatible upstream release blocks promotion until
+upstream release; review other updates weekly. The weekly qualification
+(`.github/workflows/qualify-helium.yml`, ADR 0026) requalifies the pin every
+Monday, qualifies a newer Helium release in the first weekly run after it is
+tagged (a critical one is started by hand), and fails when the pinned signing
+key differs from the one Helium publishes. The primary
+owner is the repository owner and no backup is named yet, so these are targets,
+not service guarantees. An incompatible upstream release blocks promotion until
 contract tests pass. Security response takes precedence over UI feature work.
 
 Release archives from `scripts/package.sh` are unsigned: only a `.sha256`

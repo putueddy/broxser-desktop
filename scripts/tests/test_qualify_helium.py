@@ -4,7 +4,9 @@ the signature tests sign with throwaway keys in a private GnuPG home.
     python3 -m unittest discover -s scripts/tests
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -12,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "qualify-helium.py"
 spec = importlib.util.spec_from_file_location("qualify_helium", SCRIPT)
@@ -63,6 +66,104 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(qualify.verdict([passed, passed]), "qualified")
         self.assertEqual(qualify.verdict([passed, {"result": "skipped"}]), "incomplete")
         self.assertEqual(qualify.verdict([{"result": "failed"}, {"result": "skipped"}]), "not qualified")
+
+    def test_the_newest_release_is_ordered_by_number(self):
+        refs = ("a1\trefs/tags/0.9.4.1\n"
+                "b2\trefs/tags/0.18.1.1\n"
+                "c3\trefs/tags/0.6.1.1^{}\n"
+                "d4\trefs/tags/0.18.10.2\n"
+                "e5\trefs/tags/nightly\n")
+        self.assertEqual(qualify.newest_release(refs), "0.18.10.2")
+        with self.assertRaisesRegex(qualify.Refused, "no release tags"):
+            qualify.newest_release("e5\trefs/tags/nightly\n")
+        failed = subprocess.CompletedProcess([], 128, "", "fatal: unable to access\n")
+        with mock.patch.object(qualify.subprocess, "run", return_value=failed), \
+                self.assertRaisesRegex(qualify.Refused, "failed: fatal: unable to access"):
+            qualify.latest()
+
+
+class KeyCheckTests(unittest.TestCase):
+    def check(self, published):
+        def download(url, path):
+            self.assertEqual(url, qualify.PUBLISHED_KEY)
+            Path(path).write_bytes(published)
+        with mock.patch.object(qualify, "keyring"), mock.patch.object(qualify, "download", download):
+            return qualify.check_key()
+
+    def test_the_published_key_must_equal_the_pinned_one(self):
+        self.assertIn("equals", self.check(qualify.SIGNING_KEY.read_bytes()))
+        with self.assertRaisesRegex(qualify.Refused, "key rotation"):
+            self.check(qualify.SIGNING_KEY.read_bytes() + b"\n")
+
+
+class ScheduledTests(unittest.TestCase):
+    """What the weekly workflow qualifies, with runs, downloads and the key
+    check replaced."""
+
+    PIN = json.loads(qualify.PINNED.read_text())["version"]
+
+    def setUp(self):
+        self.runs, self.proposed = [], []
+        self.verdicts = {}
+        self.summary = Path(tempfile.mkdtemp()) / "summary.md"
+        self.addCleanup(shutil.rmtree, self.summary.parent)
+
+    def fake_run(self, manifest):
+        version = self.PIN if manifest == qualify.PINNED else Path(manifest).name
+        self.runs.append(version)
+        record = {"verdict": self.verdicts.get(version, "qualified"),
+                  "steps": [{"name": "prepare", "result": "passed", "detail": "downloaded"},
+                            {"name": "live Helium suite", "result": "passed", "detail": "54 passed"}]}
+        return record, qualify.RECORDS / f"helium-{version}.json"
+
+    def fake_propose(self, version, output):
+        self.proposed.append(version)
+        return Path(f"/nonexistent/{version}")
+
+    def scheduled(self, newest=None, version=None, key_error=None):
+        def check_key():
+            if key_error:
+                raise qualify.Refused(key_error)
+            return "the key equals the published one"
+        def latest():
+            if newest is None:
+                raise subprocess.CalledProcessError(128, ["git", "ls-remote"])
+            return newest
+        with mock.patch.object(qualify, "run", self.fake_run), \
+                mock.patch.object(qualify, "propose", self.fake_propose), \
+                mock.patch.object(qualify, "check_key", check_key), \
+                mock.patch.object(qualify, "latest", latest), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return qualify.scheduled(version, self.summary)
+
+    def test_a_current_pin_is_requalified_alone(self):
+        self.assertTrue(self.scheduled(newest=self.PIN))
+        self.assertEqual((self.runs, self.proposed), ([self.PIN], []))
+        table = self.summary.read_text()
+        self.assertIn("the pin is current", table)
+        self.assertIn(f"| Helium {self.PIN} (pin) | **qualified**. live Helium suite passed: 54 passed.",
+                      table)
+
+    def test_a_newer_release_is_proposed_and_its_verdict_decides(self):
+        self.verdicts["99.0.0.1"] = "not qualified"
+        self.assertFalse(self.scheduled(newest="99.0.0.1"))
+        self.assertEqual((self.runs, self.proposed), ([self.PIN, "99.0.0.1"], ["99.0.0.1"]))
+        self.assertIn("newer than the pin", self.summary.read_text())
+        self.assertIn("**not qualified**", self.summary.read_text())
+
+    def test_a_named_release_is_qualified_even_when_older(self):
+        self.assertTrue(self.scheduled(version="0.17.2.1"))
+        self.assertEqual((self.runs, self.proposed), ([self.PIN, "0.17.2.1"], ["0.17.2.1"]))
+        with self.assertRaisesRegex(qualify.Refused, "not a Helium release version"):
+            self.scheduled(version="latest")
+
+    def test_a_changed_key_or_unknown_release_fails_but_the_pin_still_runs(self):
+        self.assertFalse(self.scheduled(newest=self.PIN, key_error="pubkey.asc differs"))
+        self.assertIn("**refused**: pubkey.asc differs", self.summary.read_text())
+        self.runs.clear()
+        self.assertFalse(self.scheduled(newest=None))
+        self.assertEqual(self.runs, [self.PIN])
+        self.assertIn("**unknown**", self.summary.read_text())
 
 
 @unittest.skipUnless(HAS_GPG, "gpg and gpgv are required")

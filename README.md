@@ -234,9 +234,14 @@ mengganti `runtime/helium-linux-x86_64.json` dengan ringkasan record di
 `docs/validation.md`; tanpa display verdict-nya `incomplete`. Rollback memakai
 jalur yang sama: rilis sebelumnya, 0.17.2.1, tidak lulus untuk commit ini.
 `fetch-helium.sh` tidak menghapus versi lain di `.local/helium`, jadi kembali
-ke versi sebelumnya cukup dengan rename. Kualifikasi mingguan dan on-demand di
-GitHub Actions sudah diputuskan (ADR 0026) tetapi belum dibuat; sampai itu
-kualifikasi dijalankan manual seperti di atas.
+ke versi sebelumnya cukup dengan rename. Workflow **Qualify Helium**
+(`.github/workflows/qualify-helium.yml`, ADR 0026) menjalankan
+`python3 scripts/qualify-helium.py scheduled` setiap Senin 03:23 UTC, on demand
+dari tab Actions (opsional dengan versi rilis, misalnya target rollback) dan
+pada PR yang mengubah pin, kunci, skrip atau workflow itu: kunci yang dipin
+dibandingkan dengan `pubkey.asc` Helium, pin dikualifikasi ulang, lalu rilis
+yang lebih baru (atau yang disebut) di-propose dan dikualifikasi. Hasilnya ada
+di ringkasan run dan di artefak 90 hari; workflow tidak pernah mengubah pin.
 
 ## Verifikasi
 
