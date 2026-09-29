@@ -456,7 +456,7 @@ satu, screenshot terikat revisi halaman sehingga hasil basi dibatalkan, redaksi
 juga mencakup alamat IPv6, host Unicode, bearer pendek dan JWT di path, metadata
 ditulis sebagai kode literal, dan PNG divalidasi utuh.
 
-**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik merged melalui PR #28; workflow kualifikasi PR menunggu review):** audit dan
+**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik merged melalui PR #28; workflow kualifikasi merged melalui PR #29; teks lisensi di arsip PR menunggu review):** audit dan
 keputusan ada di [ADR 0025](docs/adr/0025-linux-release-archive-and-sbom.md) dan
 `docs/validation.md` (P3.1). Sebelumnya tidak ada build release, arsip, SBOM,
 checksum artefak Broxser atau signature; Helium sudah dipin dengan checksum dan
@@ -494,11 +494,12 @@ akan membawa regresi itu. Pergantian pin bolak-balik di clone berjalan dalam 10
 detik dan kembali dengan rename.
 
 Keputusan pemilik (29 September 2026, diambil atas delegasi pemilik, merged
-melalui PR #28; implementasi pertama, workflow kualifikasi, PR menunggu review):
+melalui PR #28; implementasi pertama, workflow kualifikasi, merged melalui PR #29;
+kedua, teks lisensi di arsip, PR menunggu review):
 menurut ADR 0025, kode Broxser tetap tanpa
 lisensi (all rights reserved; Apache-2.0 disarankan bila perusahaan membukanya)
 dan arsip hanya untuk pengguna pilot perusahaan. Review lisensi pihak ketiga
-menemukan bahwa arsip sekarang hanya membawa teks lisensi GPUI, dan bahwa GPUI
+menemukan bahwa arsip saat itu hanya membawa teks lisensi GPUI, dan bahwa GPUI
 mengompilasi protokol blur KDE yang deskripsinya LGPL-2.1-or-later, walau
 Broxser tidak memakainya. Karena itu arsip tidak diberikan kepada siapa pun
 sebelum membawa file lisensi dan notice setiap crate, dan sebelum patch GPUI
@@ -519,7 +520,7 @@ yang sama. Rotasi kunci lewat satu PR yang di-review, dengan dua sumber, dan
 di-merge pemilik repo. Pin Helium yang lebih lama hanya dengan record
 `qualified`, bukti regresi dan batas paling lama 14 hari.
 
-Workflow kualifikasi (ADR 0026 keputusan 2, PR menunggu review): sebelumnya
+Workflow kualifikasi (ADR 0026 keputusan 2, merged melalui PR #29): sebelumnya
 kualifikasi hanya manual dan tidak ada yang mencari rilis Helium baru atau
 membandingkan kunci. Kini `.github/workflows/qualify-helium.yml` menjalankan
 `qualify-helium.py scheduled` setiap Senin 03:23 UTC, on demand (opsional
@@ -530,7 +531,26 @@ disebut) di-propose lalu dikualifikasi, dengan sandbox tetap aktif dan smoke di
 Xvfb. Job gagal kecuali kunci cocok dan setiap run `qualified`; tabel hasil ada
 di ringkasan run dan record di artefak 90 hari. Workflow tidak pernah mengubah
 pin. Uji lokal sebagai user biasa: pin qualified (54/54, smoke lulus) dalam
-3 m 15 s.
+3 m 15 s. Run GitHub pertama (manual, 29 September) lulus dalam 6 m 57 s: kunci
+sama, rilis terbaru adalah pin, pin qualified (live 54/54 dalam 93,3 s, smoke
+108,4 s).
+
+Teks lisensi di arsip (ADR 0025 keputusan 1, PR menunggu review): sebelumnya
+arsip mendaftar lisensi 525 crate tetapi hanya membawa teks lisensi GPUI, dan
+GPUI mengompilasi protokol blur KDE (LGPL-2.1-or-later) dari
+`wayland-protocols-plasma`. Kini `sbom.py --licenses` menulis
+`THIRD-PARTY-LICENSES.txt` ke arsip: file lisensi dan notice setiap komponen
+pihak ketiga, termasuk kode yang dibundel crate, dikelompokkan per teks yang
+sama (337 teks berbeda, 1,0 MB), teks standar SPDX (`scripts/licenses`) untuk
+31 crate tanpa file lisensi, serta catatan pilihan Apache-2.0 `self_cell`,
+source form `option-ext` (MPL-2.0) dan perubahan GPUI. `sbom.py --check` di
+`check.sh` dan CI gagal bila crate hanya menawarkan lisensi di luar himpunan
+permisif dan MPL-2.0, bila kode MPL-2.0 tidak utuh dari crates.io, atau bila
+crate tanpa file lisensi mendeklarasikan lisensi yang teksnya tidak ada. Patch
+GPUI keempat membuang protokol blur KDE dan dependensinya (graph turun ke 524
+crate); file GPUI yang diubah kini menyatakannya (Apache-2.0 4(b)). Window
+Broxser tetap `Opaque`, jadi perilakunya tidak berubah; diverifikasi di window
+X11 (smoke) dan sebagai klien Wayland Weston.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -633,6 +653,7 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   rilis tanpa signature dan SBOM: ADR 0025, merged melalui PR #26; kualifikasi
   update Helium dan latihan rollback: ADR 0026, merged melalui PR #27; keputusan
   lisensi, signing, kanal rilis, format, owner dan kualifikasi terjadwal: ADR
-  0025/0026, merged melalui PR #28; workflow kualifikasi mingguan: PR menunggu
-  review; teks lisensi di arsip, workflow rilis dan installer menyusul).
+  0025/0026, merged melalui PR #28; workflow kualifikasi mingguan: merged melalui
+  PR #29; teks lisensi di arsip dan patch GPUI keempat: PR menunggu review;
+  workflow rilis dan installer menyusul).
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

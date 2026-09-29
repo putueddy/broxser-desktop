@@ -1,4 +1,4 @@
-# GPUI 0.2.2: native IME integration and atlas fix
+# GPUI 0.2.2: native IME integration, atlas fix and no KDE blur protocol
 
 This directory contains the published `gpui` 0.2.2 crate, unpacked from
 `https://static.crates.io/crates/gpui/gpui-0.2.2.crate`.
@@ -31,9 +31,23 @@ texture that reuses the index. Broxser replaces every device frame with a new
 image, so typing while pages animate reached this within about a hundred key
 presses in a release build (P1.4 in `docs/validation.md`).
 
-No other upstream behavior is intentionally changed. `Cargo.toml` patches the
-same exact version to this source; transitive versions remain locked. The vendor
-directory is excluded from the Broxser workspace's formatting and lint targets.
+The Wayland backend no longer uses KDE's blur protocol (`org_kde_kwin_blur`):
+`src/platform/linux/wayland/client.rs` does not bind the blur manager,
+`src/platform/linux/wayland/window.rs` neither requests nor clears a blur, and
+`Cargo.toml` drops the `wayland-protocols-plasma` dependency that generated its
+client code (ADR 0025, decision 1). That crate declares MIT, but the protocol
+description it compiles is LGPL-2.1-or-later. Upstream used the protocol only
+for `WindowBackgroundAppearance::Blurred` and otherwise unset the blur of a
+window that never had one; Broxser's window keeps the `Opaque` default, so its
+behavior does not change. A `Blurred` window on KDE Plasma now draws like a
+`Transparent` one. `Cargo.toml.orig` and the crate's own `Cargo.lock` still name
+the dependency: they stay as published, and Cargo reads neither for this build.
+
+Each changed file starts with a notice that Broxser changed it (Apache-2.0,
+section 4(b)). No other upstream behavior is intentionally changed. The
+workspace's `Cargo.toml` patches the same exact version to this source;
+transitive versions remain locked. The vendor directory is excluded from the
+Broxser workspace's formatting and lint targets.
 
 Upstream status, checked on 2026-09-26 against `zed-industries/zed` `main` at
 `933d8d9` and crates.io, where 0.2.2 is still the newest `gpui` release:
@@ -51,9 +65,13 @@ Upstream status, checked on 2026-09-26 against `zed-industries/zed` `main` at
 - Wayland: `main` still turns a single-byte commit into a synthetic key-down, on
   purpose, for modal key bindings. What Broxser needs there is an API change, such
   as an origin for those events, rather than a bug fix.
+- KDE blur: a licensing choice for Broxser's distribution, not an upstream bug;
+  nothing to report.
 
 Requalification: compare this directory with the checksum-verified archive,
 repeat the real IME, normal-keyboard and typing-during-animation checks in
-`docs/validation.md`, and drop the override once an upstream release supplies a
-suitable text-commit path and atlas fix. See ADR 0011 for the canvas contract and
-remaining platform limits, and ADR 0012 for the atlas fix.
+`docs/validation.md`, check that no `wayland-protocols-plasma` or
+`org_kde_kwin_blur` reaches the binary, and drop the override once an upstream
+release supplies a suitable text-commit path and atlas fix without the blur
+protocol. See ADR 0011 for the canvas contract and remaining platform limits,
+ADR 0012 for the atlas fix and ADR 0025 for the blur protocol.
