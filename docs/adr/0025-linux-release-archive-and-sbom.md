@@ -78,10 +78,10 @@ backup owner. An audit of the repository on 2026-09-27 found:
    packages), a desktop entry and the Helium discovery it needs
    (`BROXSER_HELIUM_BIN` or `PATH` today).
 5. Primary and backup owners for engine updates and releases (ADR 0003).
-6. Next part of P3.1 in code: a Helium qualification script that fetches a
-   candidate manifest beside the pinned engine, runs the live suite and the
-   smoke against it and writes a record (version, digest, results); rollback is
-   the same run for the previous manifest.
+6. Done in [ADR 0026](0026-helium-qualification-and-rollback.md) (2026-09-28):
+   `scripts/qualify-helium.py` qualifies a signature-verified candidate beside
+   the pinned engine with the live suite and the smoke and writes a record;
+   rollback is the same run for the previous manifest, rehearsed once.
 
 ## Consequences
 

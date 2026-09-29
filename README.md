@@ -193,9 +193,9 @@ menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 | `crates/broxser-desktop` | Shell GPUI: frame live, URL bar, input, sync, status; mode capture statis |
 | `crates/broxser-cli` | Init, validate, doctor dan export capture |
 | `examples/` | Workspace contoh, fixture responsif (`index.html`) dan fixture live (`live.html`) |
-| `runtime/` | Baseline Helium resmi beserta checksum |
+| `runtime/` | Baseline Helium resmi beserta checksum dan kunci signing rilis Helium |
 | `docs/` | System Design, ADR, roadmap dan catatan verifikasi |
-| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`) dan arsip rilis (`package.sh`) |
+| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`), arsip rilis (`package.sh`) dan kualifikasi update Helium (`qualify-helium.py`) |
 
 GPUI dipin ke `0.2.2` dengan source dan patch commit IME yang dicatat di
 [`vendor/gpui-0.2.2/BROXSER-PATCH.md`](vendor/gpui-0.2.2/BROXSER-PATCH.md);
@@ -214,6 +214,24 @@ waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
 `scripts/sbom.py` memerlukan Python 3.11+ (`tomllib`) dan dijalankan
 `scripts/check.sh` serta CI. Format pengguna, signing, lisensi dan owner rilis
 masih keputusan pemilik (ADR 0025).
+
+Update atau rollback Helium melewati kualifikasi (ADR 0026):
+
+```bash
+VERSION=0.18.1.1  # tag rilis imputnet/helium-linux
+# Manifest kandidat hanya dari tarball yang ditandatangani kunci rilis Helium.
+python3 scripts/qualify-helium.py propose "$VERSION"
+# Sebagai user biasa dengan display X11: browser kandidat di
+# .local/helium-candidates/$VERSION, live suite, smoke, record di artifacts/qualification/.
+python3 scripts/qualify-helium.py run "artifacts/helium/helium-linux-x86_64-$VERSION.json"
+```
+
+Hanya verdict `qualified` yang dipromosikan, lewat commit yang di-review yang
+mengganti `runtime/helium-linux-x86_64.json` dengan ringkasan record di
+`docs/validation.md`; tanpa display verdict-nya `incomplete`. Rollback memakai
+jalur yang sama: rilis sebelumnya, 0.17.2.1, tidak lulus untuk commit ini.
+`fetch-helium.sh` tidak menghapus versi lain di `.local/helium`, jadi kembali
+ke versi sebelumnya cukup dengan rename.
 
 ## Verifikasi
 

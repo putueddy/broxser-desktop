@@ -443,7 +443,7 @@ satu, screenshot terikat revisi halaman sehingga hasil basi dibatalkan, redaksi
 juga mencakup alamat IPv6, host Unicode, bearer pendek dan JWT di path, metadata
 ditulis sebagai kode literal, dan PNG divalidasi utuh.
 
-**Status P3.1 (27–28 September 2026, bagian pertama; PR menunggu review):** audit dan
+**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua PR menunggu review):** audit dan
 keputusan ada di [ADR 0025](docs/adr/0025-linux-release-archive-and-sbom.md) dan
 `docs/validation.md` (P3.1). Sebelumnya tidak ada build release, arsip, SBOM,
 checksum artefak Broxser atau signature; Helium sudah dipin dengan checksum dan
@@ -456,8 +456,31 @@ SBOM, inventory lisensi, manifest dan skrip unduh Helium serta `SHA256SUMS`.
 Arsip itu diverifikasi, dibongkar, mengunduh Helium sendiri dan lulus seluruh
 smoke di window X11 nyata (18/18 pada rerun terakhir). Menunggu pemilik: lisensi kode Broxser, identitas
 signing, kanal rilis, format pengguna (AppImage atau paket distro) dan owner
-utama serta cadangan. Bagian berikutnya: skrip kualifikasi update Helium dan
-latihan rollback.
+utama serta cadangan. Koreksi review di PR #26: `created` SBOM kini waktu UTC
+dari epoch commit (sebelumnya waktu lokal berlabel UTC), nama crate berawalan
+digit terurai benar, stderr cargo ditampilkan dan Python < 3.11 mendapat pesan
+jelas. PR #26 juga memperbaiki empat race di tes engine yang membuat CI merah,
+tanpa perubahan produk.
+
+Bagian kedua (28 September 2026, PR menunggu review;
+[ADR 0026](docs/adr/0026-helium-qualification-and-rollback.md)): sebelumnya pin
+Helium hanya dicek dengan SHA-256 yang asal-usulnya tidak tercatat, kualifikasi
+versi lain manual tanpa catatan dan rollback belum pernah dicoba. Kini
+`scripts/qualify-helium.py` membuat manifest kandidat hanya dari tarball yang
+signature OpenPGP-nya dibuat oleh kunci rilis Helium (dipin di
+`runtime/helium-signing-key.asc` dan lewat fingerprint), menyiapkan browser
+kandidat di samping engine yang dipin, lalu menjalankan live suite dan smoke X11
+terhadapnya dan menulis record dengan verdict `qualified`, `not qualified` atau
+`incomplete` (smoke tidak jalan tanpa display); CI mengecek signature pin
+setiap run. Latihan rollback: 0.18.1.1 lulus (48/48, smoke 15/15), sedangkan
+rilis sebelumnya 0.17.2.1 (Chromium 153) *tidak lulus*: selama alert terbuka,
+`Page.stopScreencast` tidak dijawab sehingga hide, scroll keluar atau resize
+device menghentikan seluruh runtime live (6 dari 6 run). Jadi target rollback
+untuk update berikutnya adalah pin sekarang; rollback engine saja ke 0.17.2.1
+akan membawa regresi itu. Pergantian pin bolak-balik di clone berjalan dalam 10
+detik dan kembali dengan rename. Menunggu pemilik: konfirmasi fingerprint lewat
+kanal kedua, jadwal dan pelaksana kualifikasi, tempat record dan wewenang pin
+Chromium lama.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -556,5 +579,6 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   preset dan file state: ADR 0022, merged melalui PR #23; P2.3a console per device:
   ADR 0023, merged melalui PR #24; P2.3b laporan bug: ADR 0024, merged melalui PR #25).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan (P3.1 arsip
-  rilis tanpa signature dan SBOM: ADR 0025, PR menunggu review).
+  rilis tanpa signature dan SBOM: ADR 0025, merged melalui PR #26; kualifikasi
+  update Helium dan latihan rollback: ADR 0026, PR menunggu review).
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

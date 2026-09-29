@@ -24,12 +24,16 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
       - name: SBOM of the shipped graph (ADR 0025)
         run: python3 scripts/sbom.py --check
+      - name: Helium update tooling (ADR 0026)
+        run: python3 -m unittest discover -s scripts/tests -v
       - name: Check GPUI desktop and input regression tests
         run: |
           cargo clippy --locked -p broxser-desktop --all-targets -j 2 -- -D warnings
           cargo test --locked -p broxser-desktop -j 2
       - name: Pinned Helium integration
         run: |
+          # The pinned tarball must carry Helium's release signature (ADR 0026).
+          python3 scripts/qualify-helium.py verify runtime/helium-linux-x86_64.json
           bash scripts/fetch-helium.sh
           # Permit this exact downloaded binary to create its normal sandbox.
           printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile broxser-helium-ci "%s" flags=(unconfined) {\n  userns,\n}\n' "$PWD/.local/helium/helium" > "$RUNNER_TEMP/broxser-helium.apparmor"

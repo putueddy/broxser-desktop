@@ -10,6 +10,8 @@ should choose its intended distribution policy before a public release.
 - Helium: its original code and patches use GPL-3.0; imported Chromium and other
   upstream components retain their respective licenses. The engine is obtained
   separately from the official release, is not vendored, and is not included in Git.
+  `runtime/helium-signing-key.asc` is Helium's public release signing key, copied
+  unchanged from `imputnet/helium-linux` (`pubkey.asc`) to verify its signatures.
 - Rust transitive dependencies retain their own licenses. `scripts/sbom.py`
   writes an SPDX SBOM of the crates the Linux binaries link and a list by
   declared license (`THIRD-PARTY.md` in the release archive, ADR 0025); it is an
