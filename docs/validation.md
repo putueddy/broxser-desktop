@@ -3,6 +3,79 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P3.1 license texts in the archive, GPUI without KDE's blur, 29 September 2026 (cloud container)
+
+ADR 0025, decision 1. Same container; the smoke, the Wayland check and the
+archive checks ran as `broxsertest` with the sandbox enabled. The archive was
+built from `20fec97`, the change without this section.
+
+### Before the change
+
+- The archive carried one license text, GPUI's (`licenses/gpui-LICENSE-APACHE`),
+  beside `THIRD-PARTY.md`, the list of 525 crates by declared license; 32 of
+  those crates ship no license file.
+- GPUI compiled KDE's blur protocol from `wayland-protocols-plasma`, whose
+  protocol description is LGPL-2.1-or-later: the release desktop of `5d3887e`
+  held its client code (`org_kde_kwin_blur_manager`, `org_kde_kwin_blur`).
+  GPUI's three patched files carried no notice of the change.
+- `sbom.py --check` validated the SPDX document, not whether a dependency's
+  license allowed shipping it.
+
+### After the change
+
+- `sbom.py --check`: "SBOM ok: 530 components (524 crates.io crates), 1382
+  relationships; 337 distinct license texts". `Cargo.lock` loses only
+  `wayland-protocols-plasma` 0.2.0 and GPUI's dependency on it (14 lines).
+- `THIRD-PARTY-LICENSES.txt` (1,004,844 bytes) holds 337 distinct texts for
+  921 license and notice files, standard texts included. Parsed back from the
+  archive, every one of the SBOM's 525 third-party components (524 crates and
+  GPUI) has at least one text. The 31 crates that ship no license file get the
+  SPDX standard text: 20 Apache-2.0, 10 MIT naming the crate's authors, 1
+  CC0-1.0. The notes name GPUI's changes, `option-ext`'s source form with its
+  SHA-256, and `self_cell` used under Apache-2.0. Files of bundled code are
+  kept: the Unicode data license in `regex-syntax`, fiat-crypto and BoringSSL
+  in `ring`, the Wayland protocol authors in `wayland-protocols`, and FreeType
+  in `freetype-sys`, which is not built (the header says that a file does not
+  mean its code is built in).
+- Compared with the published `gpui-0.2.2.crate` (SHA-256 `979b45cf…bee707`
+  checked), the vendored GPUI differs in five files (`Cargo.toml`,
+  `wayland/client.rs`, `wayland/window.rs`, `x11/xim_handler.rs`,
+  `blade/blade_atlas.rs`) and adds `BROXSER-PATCH.md`; each of the five starts
+  with the notice that Broxser changed it.
+- The release desktop contains no `org_kde_kwin_blur` string (the text input
+  protocol and `xdg_toplevel` still do) and needs the same seven libraries as
+  before.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `python3 -m unittest discover -s scripts/tests` | 23 tests passed. The 9 new ones: a permissive choice is taken by preference (`self_cell`'s Apache-2.0, never GPL-2.0-only; `ring`'s Apache-2.0 and ISC); MPL-2.0 only without a permissive alternative; copyleft-only and malformed expressions are refused; license files of bundled code are found, those of tests, examples and sources are not; the MIT text names the authors; identical texts are grouped; copyleft, modified MPL-2.0, a missing standard text, a malformed expression and a license file that is not UTF-8 are reported as problems; every standard text file is described |
+| `bash scripts/check.sh` | Passed in 45 s with this section (1 m 52 s on the first run after the GPUI change, which rebuilt GPUI): the SBOM and license check, the script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Archive reproducibility | Two `package.sh` runs of `20fec97`, the first with the release build (5 m 12 s), the second in 18 s with `TZ=Asia/Jakarta`: identical SHA-256 `64f44461…af3c8a6`, 6.3 MB. `THIRD-PARTY-LICENSES.txt` replaces `licenses/`; `SHA256SUMS` lists 11 files |
+| Archive as the unprivileged user | The `.sha256` checked OK; unpacked; `SHA256SUMS` all OK; `bin/broxser --version`: `broxser 0.1.0`; `COMMIT` is `20fec97`. The packaged fetch script prepared Helium 0.18.1.1 in 12 s as this user (earlier runs needed root for the proxy's CA bundle); `doctor` found it; `validate` accepted the example workspace |
+| Full `scripts/desktop-smoke.sh`, X11 (Xvfb 1600 × 1000) | 18 of 18 scenarios with the debug build (110 s), and 18 of 18 with the packaged release desktop and the packaged Helium (102 s); no browser process, profile or window left, and the known preview directory after SIGTERM |
+| Wayland: the desktop as a client of Weston 13.0.0 (X11 backend inside Xvfb, pixman renderer), three devices on the animation fixture | Debug build and packaged release desktop: the window drew the workspace and the device frames streamed (9,456 and 9,558 of 292,400 sampled pixels changed within one second); after SIGTERM no browser process or profile was left; Weston logged no protocol error |
+| `git diff --check` | Clean |
+
+### Limits
+
+- KDE Plasma was not tried; no KDE compositor is available here. There, a GPUI
+  window that asks for `Blurred` now draws like `Transparent`; Broxser's window
+  does not ask.
+- Weston's headless backend offers no `wl_seat`, and GPUI 0.2.2 then panics at
+  startup (upstream, unchanged), so the Wayland check ran Weston's X11 backend
+  inside Xvfb. No physical GPU and no other compositor. The screenshots show a
+  console error badge on the devices, which the check did not open; the
+  fixture folder has no favicon.
+- The file carries the license files of bundled code whether or not that code
+  is built. The standard texts name the authors from Cargo's metadata, without
+  years. A technical reading, not legal advice.
+- A license file that is not UTF-8 fails the check, naming the file, rather
+  than being transcoded.
+- The archive is still unsigned; the release workflow with attestations and
+  the installer are the next changes.
+
 ## P3.1 scheduled Helium qualification, 29 September 2026 (cloud container)
 
 ADR 0026, decision 2: `.github/workflows/qualify-helium.yml` runs
@@ -68,9 +141,16 @@ workflows disabled after 60 days without activity in public repositories.
 | `apparmor_parser` 4.0.1 (`-Q -K`, not loaded: this kernel has no AppArmor) | The workflow's profile, with the runner's workspace path, parses; a truncated profile is refused |
 | `bash scripts/check.sh` | Passed in 45 s: the SBOM check, the 14 tooling tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
 
+### First run on GitHub (recorded by the next change)
+
+| Run | Result |
+| --- | --- |
+| [Qualify Helium run 1](https://github.com/putueddy/broxser-desktop/actions/runs/36558890390), `pull_request` for PR #29 at `8c54fc6`, 29 September 10:58 UTC | Succeeded; the job took 6 m 57 s. The key equals the published one; the newest release is the pin; the pin, downloaded and signature-verified on the runner, is **qualified** (live suite 54 of 54 in 93.3 s, smoke 108.4 s). Artifact `helium-qualification-36558890390-1`: 3 files, 3,814 bytes, kept 90 days |
+
 ### Limits
 
-- The workflow runs only on GitHub; its first run is this pull request's own.
+- The workflow runs only on GitHub; its first run was this pull request's own
+  (above).
   The runner, like this container, draws the window with Xvfb and Lavapipe; no
   physical GPU or Wayland.
 - `propose` never overwrites a prepared candidate, so a second local
