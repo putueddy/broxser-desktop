@@ -45,6 +45,30 @@ to the parent frame, and Broxser repeats neither. The fake-CDP test
 `hiding_cancels_touch_before_ignoring_input_and_show_does_not_replay_release`
 still checks that hide sends the cancel before it ignores input.
 
+### Capture cancellation during startup (CI on `e167e79`)
+
+The pull-request run of the commit above failed another unit test,
+`capture::tests::cancellation_during_startup_is_prompt_and_cleans_up`, with "no
+browser process was observed". The test cancelled 300 ms after the capture
+began. When the profile and its guardian (a re-executed test binary) take longer
+than that, the start stops before the browser exists; the cancellation is
+correct and prompt, but there is no browser whose cleanup the test can check.
+The test now cancels once the profile's lease names the browser, which the start
+records right after spawning it, and measures promptness from the cancellation
+rather than from the start of the capture.
+
+| Runs of this test | Before | After |
+| --- | --- | --- |
+| Unloaded | 40/40, four copies at once on one CPU | 30/30 |
+| One CPU, `nice 19` beside two busy loops | 18 of 20 failed as on CI | 20/20 |
+| One CPU, `nice 19` beside four busy loops | 10 of 10 failed as on CI | 9 of 10 |
+
+The failing run under the heaviest load returned `Cancelled` but took more than
+the 3 s bound after the cancellation (33 s in all). The endpoint wait checks for
+cancellation every 50 ms, so that time went to the browser and guardian cleanup,
+whose waits are bounded. With this change, `bash scripts/check.sh` passed in
+56 s and the live Helium suite passed 54/54 in 81.1 s.
+
 ## PR #26 review corrections, 29 September 2026 (Linux X11)
 
 Review of `5c8ae74` found the SBOM `created` timestamp was local time labeled
