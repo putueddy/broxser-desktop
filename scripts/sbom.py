@@ -7,7 +7,8 @@ dependencies only; build tools are not shipped), with its version, declared
 license, crates.io download location and the SHA-256 that Cargo.lock pins,
 the vendored GPUI, and Helium as a runtime dependency that is fetched and
 verified separately and not contained in the package. Output is deterministic
-for a commit: packages are sorted and the creation time is the commit's.
+for a commit: packages are sorted and the creation time is the commit's, in
+UTC regardless of the machine's timezone. Requires Python 3.11+ (tomllib).
 
     python3 scripts/sbom.py --output sbom.spdx.json [--summary licenses.md]
     python3 scripts/sbom.py --check   # validate without writing
@@ -19,8 +20,12 @@ import json
 import re
 import subprocess
 import sys
-import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
+
+if sys.version_info < (3, 11):
+    sys.exit(f"scripts/sbom.py needs Python 3.11 or newer (tomllib); found {sys.version.split()[0]}")
+import tomllib  # noqa: E402  (import guarded by the version check above)
 
 TARGET = "x86_64-unknown-linux-gnu"
 ROOTS = ("broxser-desktop", "broxser-cli")
@@ -28,7 +33,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def run(*command):
-    return subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True).stdout
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"`{' '.join(command)}` failed with {result.returncode}:\n{result.stderr.strip()}"
+        )
+    return result.stdout
 
 
 def spdx_id(kind, name, version=""):
@@ -78,10 +88,25 @@ def build_document():
         match = re.match(r"^(\d+)(\S+) v(\S+)", line)
         if not match:
             continue
-        depth, key = int(match.group(1)), (match.group(2), match.group(3))
-        if key not in by_name_version:
-            raise SystemExit(f"cargo tree lists {key}, which cargo metadata does not know")
-        package = by_name_version[key]
+        digits, name, version = match.group(1), match.group(2), match.group(3)
+        # The depth prefix is concatenated to the package without a separator,
+        # so a name that starts with a digit makes the greedy digit match
+        # ambiguous. Try the longest depth first and give digits back to the
+        # name until the package is one cargo metadata knows at a depth the
+        # tree allows (a child is at most one deeper than the current stack).
+        package, depth = None, 0
+        for split in range(len(digits), 0, -1):
+            candidate_depth = int(digits[:split])
+            if candidate_depth > len(stack):
+                continue
+            if (digits[split:] + name, version) in by_name_version:
+                package = by_name_version[(digits[split:] + name, version)]
+                depth = candidate_depth
+                break
+        if package is None:
+            raise SystemExit(
+                f"cargo tree lists `{line}`; no split of it is a package cargo metadata knows"
+            )
         shipped[package["id"]] = package
         del stack[depth:]
         if stack:
@@ -94,7 +119,11 @@ def build_document():
         raise SystemExit(f"expected the workspace crates {ROOTS}, found {len(roots)}")
 
     commit = run("git", "rev-parse", "HEAD").strip()
-    created = run("git", "log", "-1", "--format=%cd", "--date=format-local:%Y-%m-%dT%H:%M:%SZ").strip()
+    # SPDX 2.3 requires `created` in UTC. Git's format-local renders in the
+    # machine's timezone, so derive the timestamp from the commit epoch
+    # instead; this also keeps the SBOM byte-identical across timezones.
+    epoch = int(run("git", "log", "-1", "--format=%ct").strip())
+    created = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     workspace_version = packages[roots[0]]["version"]
 
     ids, spdx_packages = {}, []
@@ -204,7 +233,10 @@ def check(document):
         if not re.fullmatch(r"SPDXRef-[A-Za-z0-9.-]+", package["SPDXID"]):
             problems.append(f"invalid SPDXID {package['SPDXID']}")
         if not valid_expression(package["licenseDeclared"]):
-            problems.append(f"{package['name']}: license {package['licenseDeclared']!r} is no SPDX expression")
+            problems.append(
+                f"{package['name']}: license {package['licenseDeclared']!r} is no SPDX expression; "
+                "map it to SPDX identifiers in license_expression() in scripts/sbom.py"
+            )
         if package["downloadLocation"].startswith("https://crates.io/") and not package.get("checksums"):
             problems.append(f"{package['name']}: no checksum")
     return problems

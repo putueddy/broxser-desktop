@@ -210,8 +210,10 @@ release, notices, SBOM SPDX (`sbom.spdx.json`), inventory lisensi
 `SHA256SUMS`. Helium tidak ikut; sesudah membongkar arsip, jalankan
 `scripts/fetch-helium.sh`, lalu `BROXSER_HELIUM_BIN=$PWD/.local/helium/helium
 bin/broxser-desktop`. Arsip deterministik untuk satu commit dan binary-nya;
-format pengguna, signing, lisensi dan owner rilis masih keputusan pemilik
-(ADR 0025).
+waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
+`scripts/sbom.py` memerlukan Python 3.11+ (`tomllib`) dan dijalankan
+`scripts/check.sh` serta CI. Format pengguna, signing, lisensi dan owner rilis
+masih keputusan pemilik (ADR 0025).
 
 ## Verifikasi
 
