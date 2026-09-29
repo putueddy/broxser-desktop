@@ -2,7 +2,7 @@
 
 Status: accepted for P2.2 (first part), 2026-09-27. Builds on ADR 0002
 (portable workspace) and ADR 0009 (one restart at a time). Persistent sessions
-are ADR 0021, proposed and separate.
+are ADR 0021, separate and not implemented.
 
 ## Context
 

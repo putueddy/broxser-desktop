@@ -1,8 +1,11 @@
 # ADR 0025 Linux distribution: a reproducible unsigned archive with an SBOM first
 
 Status: first part accepted for P3.1, 2026-09-27 (archive, SBOM, checksums);
-the decisions listed under "Proposed" wait for the owner. Builds on ADR 0003
-(engine update ownership), ADR 0001 (external Helium) and `NOTICE.md`.
+the open decisions were taken on 2026-09-29, on the owner's delegation (see
+"Decisions, 2026-09-29"). Their implementation comes in separate changes: the
+license texts with a fourth GPUI patch, then the release workflow, then the
+installer. Builds on ADR 0003 (engine update ownership), ADR 0001 (external
+Helium) and `NOTICE.md`.
 
 ## Context
 
@@ -64,20 +67,85 @@ backup owner. An audit of the repository on 2026-09-27 found:
 - The archive is **unsigned**. Its integrity rests on the `.sha256` obtained
   through a trusted channel until signing is decided.
 
-## Proposed (needs the owner)
+## Decisions, 2026-09-29
 
-1. A distribution license for Broxser's own code (`NOTICE.md`), and the license
-   owner's review of `THIRD-PARTY.md`, including the MPL-2.0 and the dual
-   GPL/Apache crate.
-2. A signing identity and method: for example a detached signature with a key
-   the company holds, or keyless signing from CI; plus where public keys live.
-3. The release channel: where archives are published (an internal artifact
-   store or GitHub releases of a private repository) and a release workflow on
-   tags that builds with `scripts/package.sh`.
-4. The user-facing format on top of the archive (AppImage or distribution
-   packages), a desktop entry and the Helium discovery it needs
-   (`BROXSER_HELIUM_BIN` or `PATH` today).
-5. Primary and backup owners for engine updates and releases (ADR 0003).
+The owner delegated these decisions. The repository is public, which settles
+some of them: GitHub releases would be public once published, and keyless
+signing of a public repository reveals nothing that is not already public.
+
+1. **Broxser's own code stays unlicensed: all rights reserved.** The repository
+   being public grants no license beyond what GitHub's terms allow on GitHub
+   itself. Choosing a license is an irrevocable grant for every version
+   published under it, and `NOTICE.md` leaves it to the company that holds the
+   rights, so it is not taken here. If the company opens the code, Apache-2.0 is
+   the recommended license: it is GPUI's, it has a patent grant, and every
+   license in the shipped graph allows it. Until then, archives go to the
+   company's pilot users, not to the public (decision 3).
+   The third-party review of 2026-09-29 (`docs/validation.md`) found that every
+   shipped component allows redistribution in binary form on the terms below,
+   after one change to GPUI. The current archive does not meet them yet: it
+   lists licenses but carries only GPUI's text. No archive is given to anyone
+   before it does, so that change comes before the release workflow.
+   - Each archive carries every license and notice file of every shipped
+     crate, including those of code a crate bundles (the Unicode data license
+     in `regex-syntax`, the Wayland protocol authors' notice in
+     `wayland-protocols`, fiat-crypto's license in `ring`), and, for the 32
+     crates that ship none, the standard text of the license they declare with
+     their authors. No shipped crate, and not GPUI, has an Apache-2.0 `NOTICE`
+     file.
+   - Where a crate offers a choice, Broxser takes the permissive one:
+     `self_cell` under Apache-2.0, never GPL-2.0-only; `ring` is Apache-2.0 and
+     ISC together.
+   - `option-ext` 0.2.0 (MPL-2.0) is used unmodified. The archive says so and
+     where its source form is available: crates.io, with the SHA-256 in the SBOM
+     (MPL-2.0 section 3.2).
+   - GPUI's patched files carry a notice at the top that Broxser changed them
+     (Apache-2.0 section 4(b)), beside `BROXSER-PATCH.md`. Its X11 clipboard,
+     adapted from arboard, keeps that project's notice.
+   - `wayland-protocols-plasma` declares MIT, but GPUI compiles one protocol
+     from it, KDE's blur, whose description is LGPL-2.1-or-later. GPUI uses it
+     only to unset the blur of windows that do not ask for one, and Broxser's
+     window never does (it keeps GPUI's opaque default). Rather than rely on a
+     reading of LGPL-2.1 for generated protocol code, the vendored GPUI drops
+     that protocol and the crate: a fourth patch, with no change for Broxser.
+   - FreeType, bundled inside `freetype-sys`, is not shipped: the build links
+     the system library, and the desktop calls none of it.
+   This is a technical review, not legal advice.
+2. **Signing is keyless build provenance.** The release workflow attests each
+   archive with GitHub artifact attestations, signed through Sigstore's public
+   instance with the workflow's short-lived identity, so there is no long-lived
+   private key to guard. With the GitHub CLI, anyone verifies an archive with
+   `gh attestation verify <archive> --repo putueddy/broxser-desktop`; the
+   attestation names this repository, the release workflow, the tag and the
+   commit. The attestation is in Sigstore's public transparency log from the
+   moment the draft is built. The `.sha256` remains a quick integrity check, not
+   an authenticity check.
+3. **Releases are drafts on this repository's GitHub releases.** A workflow on
+   tags `v<workspace version>` builds with `scripts/package.sh` on Ubuntu 24.04
+   and attaches the archive, its `.sha256`, the SBOM and the attestation to a
+   **draft** release. A draft is visible only to people with write access to the
+   repository; the owner downloads it for the pilot, or publishes it once
+   decision 1 allows public distribution. Nothing is published automatically.
+   The archive is never uploaded as a workflow artifact, which any signed-in
+   GitHub user could download from this public repository.
+4. **The user-facing format is the archive with an installer.** The archive
+   gains `install.sh`, which installs it for the current user without root:
+   the files under `~/.local/opt/broxser/<version>`, `broxser` and
+   `broxser-desktop` linked from `~/.local/bin`, a desktop entry in
+   `~/.local/share/applications` without Broxser artwork, and the pinned Helium
+   prepared beside the binaries by the bundled `fetch-helium.sh`. Broxser then
+   finds that Helium itself: after `BROXSER_HELIUM_BIN` and before `PATH`. Not
+   now: an AppImage (Helium would still be a separate download), Flatpak (its
+   sandbox conflicts with Helium's own) and distribution packages (they need
+   target distributions and a package repository; revisit for fleet
+   deployment).
+5. **Owners.** The primary owner of engine updates and releases is the
+   repository owner (@putueddy), on 2026-09-29 the repository's only
+   collaborator and so the one person who can merge pins and publish releases.
+   A backup must be a person the company names, which this repository cannot
+   do. The weekly qualification (ADR 0026) and the release workflow run on
+   GitHub rather than on the owner's machine, so a backup needs only write
+   access to take over both.
 6. Done in [ADR 0026](0026-helium-qualification-and-rollback.md) (2026-09-28):
    `scripts/qualify-helium.py` qualifies a signature-verified candidate beside
    the pinned engine with the live suite and the smoke and writes a record;
@@ -93,7 +161,9 @@ backup owner. An audit of the repository on 2026-09-27 found:
 - The archive depends on the system's X11/Wayland, Vulkan and font libraries;
   they are not bundled.
 - Without signatures an attacker who can replace both the archive and its
-  `.sha256` goes unnoticed; this is the first gap the owner's decisions close.
+  `.sha256` goes unnoticed; the provenance attestation of decision 2 closes this
+  gap once the release workflow lands. Archives built by hand with
+  `scripts/package.sh` stay unsigned.
 
 ## Validation
 

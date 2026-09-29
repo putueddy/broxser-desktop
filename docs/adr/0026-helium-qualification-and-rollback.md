@@ -1,8 +1,10 @@
 # ADR 0026 Qualifying Helium releases by signature, suites and smoke; rehearsed rollback
 
-Status: accepted for P3.1, 2026-09-28 (tooling and procedure); the decisions
-listed under "Proposed" wait for the owner. Builds on ADR 0003 (engine update
-lifecycle), ADR 0001 (external Helium) and ADR 0025 (release archive).
+Status: accepted for P3.1, 2026-09-28 (tooling and procedure); the four open
+decisions were taken on 2026-09-29, on the owner's delegation (see "Decisions,
+2026-09-29"). The scheduled qualification workflow they call for is a separate
+change. Builds on ADR 0003 (engine update lifecycle), ADR 0001 (external Helium)
+and ADR 0025 (release archive).
 
 ## Context
 
@@ -95,22 +97,60 @@ lifecycle), ADR 0001 (external Helium) and ADR 0025 (release archive).
   exemption. Profiles are ephemeral today; once P2.2 keeps profiles (ADR 0021),
   a rollback must also not open a profile that a newer Helium wrote.
 - Trust in the key rests on GitHub serving `imputnet/helium-linux` over HTTPS
-  (here through the environment's TLS-inspecting proxy). `gpgv` checks neither
-  expiry nor revocation; the key expires 2028-10-10, so expect a rotation before
-  then.
-- Nothing runs on a schedule: the cadence and owners of ADR 0003 are still
-  unassigned.
+  (here through the environment's TLS-inspecting proxy), corroborated only by a
+  keyserver copy (decision 1). `gpgv` checks neither expiry nor revocation; the
+  key expires 2028-10-10, so expect a rotation before then.
+- Until the workflow of decision 2 lands, nothing runs on a schedule. The
+  primary owner is the repository owner; a backup is still unnamed (ADR 0025,
+  decision 5).
 
-## Proposed (needs the owner)
+## Decisions, 2026-09-29
 
-1. Confirm the key fingerprint through a second channel (for example
-   helium.computer) and name who approves a key rotation.
-2. Who runs qualification and when (ADR 0003: weekly review, critical updates
-   within 72 hours), and whether a manually triggered CI workflow with a display
-   runs `propose` and `run`.
-3. Where records are kept beyond `docs/validation.md` (for example with the
-   release artifacts of ADR 0025).
-4. Who may pin an older Chromium, and for how long.
+The owner delegated these decisions. The repository owner (ADR 0025, decision
+5) is the person named below as the approver.
+
+1. **Key evidence and rotation.** The pinned key is kept. Besides the copy in
+   `imputnet/helium-linux` (`pubkey.asc` and the README), `keyserver.ubuntu.com`
+   returns for the pinned fingerprint a key whose OpenPGP packets, the
+   self-signatures included, are byte-identical to the pinned file's: user ID
+   `Helium signing key (https://helium.computer/) <helium@imput.net>`, created
+   2025-10-11, expiring 2028-10-10. That keyserver accepts uploads from anyone,
+   so the copy shows only that the same key has been public outside GitHub
+   under that identity. `helium.computer` and `keys.openpgp.org` were refused
+   by the network policy of the environment used; checking the website remains
+   open.
+   A rotation is one reviewed pull request that replaces
+   `runtime/helium-signing-key.asc` and the pinned fingerprint together, cites
+   two sources for the new key (the Helium repository and one more: its
+   website, a keyserver copy or an announcement signed by the old key), and is
+   merged only by the repository owner. Nothing updates the key automatically.
+   The qualification workflow compares the pinned key with the `pubkey.asc`
+   Helium currently publishes and fails when they differ, so an upstream
+   rotation or re-signing is noticed rather than trusted.
+2. **Who qualifies, and when.** A GitHub Actions workflow on Ubuntu 24.04
+   qualifies instead of a person's machine: every week, and on demand for a
+   named version. The weekly run requalifies the pin against `main` and, when
+   `imputnet/helium-linux` has a newer release, proposes and qualifies it. It
+   runs as the runner's non-root user with the browser sandbox enabled and the
+   smoke under Xvfb, and it never changes the pin. The repository owner reads
+   the weekly result (ADR 0003's weekly review), starts the on-demand run for a
+   critical update within 72 hours of a usable release, and promotes a
+   `qualified` release through a reviewed commit of the manifest. GitHub
+   disables a public repository's scheduled workflows after 60 days without
+   repository activity; the weekly review includes checking that the last
+   weekly run exists.
+3. **Records.** Each run uploads its record, logs and proposed manifest as
+   workflow artifacts; GitHub keeps them 90 days. In this public repository any
+   signed-in GitHub user can download them; they hold test output against local
+   fixtures and no secrets. The durable record is the summary in
+   `docs/validation.md` that every promotion or rollback commit carries.
+4. **Older Chromium.** Pinning an older Helium than the current pin needs a
+   reviewed pull request merged by the repository owner, with a `qualified`
+   record for that Broxser commit and Helium version, the reason (evidence of a
+   regression in the newer release that Broxser cannot work around), and an end
+   date at most 14 days after the merge, stated in the manifest's `purpose` and
+   in `docs/validation.md`. By that date a newer release or a Broxser fix is
+   qualified; extending the pin is another reviewed pull request.
 
 ## Validation
 

@@ -3,6 +3,69 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## Owner decisions for ADRs 0021, 0025 and 0026, 29 September 2026 (cloud container)
+
+The owner delegated the open decisions of ADR 0021 (persistent sessions), ADR
+0025 (license, signing, release channel, format, owners) and ADR 0026 (key
+evidence, schedule, records, older Chromium); ADR 0003 is accepted with them.
+This change is documentation only. No product, engine, GUI, script or workflow
+code changed, and nothing the decisions call for is implemented yet. Evidence
+gathered on `main` `5d3887e`, whose CI passed (run 152):
+
+- The repository is public, and its only collaborator is the owner (GitHub
+  API).
+- Broxser's window never sets a background appearance: the desktop opens it
+  with GPUI's `WindowOptions` defaults, whose `window_background` is `Opaque`.
+
+### Helium signing key, second source (ADR 0026, decision 1)
+
+| Source | Result |
+| --- | --- |
+| `keyserver.ubuntu.com`, `/pks/lookup?op=get&options=mr&search=0xBE677C1989D35EAB2C5F26C9351601AD01D6378E`, fetched at 08:08 and 10:03 UTC | The same 749-byte key both times: primary key `BE677C1989D35EAB2C5F26C9351601AD01D6378E` (ed25519, sign and certify) and subkey `1E4F1AD1286C31EEA101AC1FCCB6CCE66AAD96D4` (cv25519, encrypt), both created 2025-10-11T18:25:20Z and expiring 2028-10-10T18:25:20Z, user ID `Helium signing key (https://helium.computer/) <helium@imput.net>`. Decoded packet by packet, all five OpenPGP packets (primary key, user ID, its self-signature, subkey, binding signature) are byte-identical to `runtime/helium-signing-key.asc`; only the ASCII-armor header lines differ |
+| `helium.computer`, `keys.openpgp.org` | Not checked: the environment's network policy refused both (HTTP 403 to `CONNECT`) |
+
+GnuPG ran in a temporary home, and `gpg --show-keys` listed both files alike.
+
+### Third-party license review (ADR 0025, decision 1)
+
+Inputs: the SBOM of `5d3887e` (531 components, 525 crates.io crates, 1388
+relationships); the unpacked source of each of the 525 crates in the Cargo
+registry, which Cargo checked against the `Cargo.lock` SHA-256 when it
+downloaded it; `vendor/gpui-0.2.2`; and the release desktop built from
+`5d3887e` as `package.sh` builds it (2 m 50 s), read with `readelf -d`, `nm`
+and `strings`. A technical reading of the files, not legal advice.
+
+| Question | Finding |
+| --- | --- |
+| Declared licenses | All permit redistribution in binary form: 243 `MIT OR Apache-2.0`, 123 `MIT`, 64 `Apache-2.0 OR MIT`, 18 `Apache-2.0`, 18 `Unicode-3.0`, and BSD, ISC, Zlib, CC0, Unlicense, BSL-1.0, MIT-0 and 0BSD options for the rest; `ring` 0.17.14 is `Apache-2.0 AND ISC`, `option-ext` 0.2.0 `MPL-2.0`, `self_cell` 1.3.0 `Apache-2.0 OR GPL-2.0-only` |
+| License files | 493 crates ship one at the top of the crate. These 32 ship none: `blade-graphics`, `blade-macros`, `blade-util`, `convert_case` 0.4.0, `dtor`, `dtor-proc-macro`, `gpu-alloc`, `gpu-alloc-ash`, `gpu-alloc-types`, `hexf-parse`, `lyon`, `lyon_algorithms`, `lyon_geom`, `lyon_path`, `lyon_tessellation`, `naga`, `pathfinder_geometry`, `pathfinder_simd`, `profiling`, `profiling-procmacros`, `pulp-wasm-simd-flag`, `seahash`, `simd_helpers`, `spirv`, `stacksafe`, `stacksafe-macro`, `svg_fmt`, `taffy`, `wayland-protocols-plasma`, `xim-ctext`, `xim-parser`, `zune-inflate` |
+| Code a crate bundles | Nine crate versions carry license files deeper in the crate for code they bundle: `regex-syntax` (Unicode data), `ring` (fiat-crypto, a `once_cell` polyfill), `tracing-core` (spin), `wayland-protocols` 0.31.2 and 0.32.13 (the Wayland protocol authors), `rustybuzz` 0.14.1 and 0.20.1 (Microsoft's USE data, MIT), `freetype-sys` (FreeType) and `wayland-protocols-plasma` (KDE's protocols). The permissive ones must travel with the archive; the last two follow |
+| `NOTICE` files | None in any shipped crate or in GPUI |
+| `wayland-protocols-plasma` 0.2.0 | Declares MIT, but 17 of its 28 bundled KDE protocol descriptions are `LGPL-2.1-or-later` (the rest MIT-CMU, BSD-3-Clause or MIT). GPUI compiles one of them, `blur` (© 2015 Martin Gräßlin, Marco Martin; LGPL-2.1-or-later): the release desktop holds its generated client code (`org_kde_kwin_blur_manager`, `org_kde_kwin_blur`). GPUI binds the blur manager when a compositor offers it and, for a window that is not `Blurred`, sends `unset`; for Broxser's opaque window that is all it does |
+| FreeType | `freetype-sys` 0.20.1 builds its bundled FreeType only when `pkg-config` finds no `freetype2` of at least 24.3.18. Here it found 26.1.20 (Ubuntu 24.04's FreeType 2.13.2, which CI's `libfontconfig1-dev` pulls in) and linked the system library. The release desktop needs only `libxcb`, `libxkbcommon`, `libxkbcommon-x11`, `libgcc_s`, `libm`, `libc` and the dynamic loader: it calls no FreeType function, so no FreeType code ships |
+| GPUI | Apache-2.0 with its `LICENSE-APACHE`. Its X11 clipboard is adapted from arboard (© 2022 The Arboard contributors, Apache-2.0 OR MIT) and says so in the file. The three patched files (`wayland/client.rs`, `x11/xim_handler.rs`, `blade/blade_atlas.rs`) carry no notice of the change; only `BROXSER-PATCH.md` describes it |
+| The archive today | `package.sh` adds GPUI's `LICENSE-APACHE` and `THIRD-PARTY.md` (components by declared license), and no other license text |
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` on this change | Passed in 46 s: the SBOM check (531 components, 525 crates.io crates, 1388 relationships), the 8 tooling tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy for the workspace and the desktop crate |
+| Local Markdown links in the 11 changed documents | 63 links resolve |
+| `git diff --check` | Clean |
+| Live Helium suite, desktop smoke | Not rerun: no engine, GUI or script code changed |
+
+### Limits
+
+- The Helium website and a second keyserver that verifies email addresses
+  (`keys.openpgp.org`) remain unchecked.
+- The license review read the declared licenses and the license files each
+  crate ships. It did not trace the origin of every source file; generated
+  protocol bindings were judged by the protocol files their crates bundle.
+- Nothing decided here is implemented: persistent sessions stay unavailable and
+  every session ephemeral; the archive stays unsigned, without the license texts
+  and with the blur protocol; no qualification runs on a schedule.
+
 ## P3.1 Helium qualification and rollback rehearsal, 28 September 2026 (cloud container)
 
 Same container; the live suite and the smoke run as the unprivileged user
@@ -629,7 +692,8 @@ Two smoke findings on the way: with the fixture's default caching, two devices o
 
 Audit only; nothing is implemented, and the proposal is
 [ADR 0021](adr/0021-persistent-sessions-one-profile-per-session.md) (not
-accepted). Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by
+accepted then; accepted with the product decisions of 29 September, see the
+first section). Same container: Helium 0.18.1.1 (Chrome/154.0.8037.57) run by
 `broxsertest` with the sandbox enabled and Broxser's launch flags (private
 home, `--password-store=basic`), an on-disk profile as `--user-data-dir`, a
 page in the browser's default context, and a scratch Node fixture on a fixed

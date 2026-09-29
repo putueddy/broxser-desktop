@@ -390,7 +390,12 @@ dengan `scripts/qualify-helium.py` (ADR 0026): pin baru hanya dari tarball yang
 ditandatangani kunci rilis Helium, lalu live suite dan smoke dijalankan terhadap
 browser kandidat di samping engine yang dipin dan hasilnya dicatat per pasangan
 commit Broxser dan versi Helium. Rollback memakai jalur yang sama; rilis
-sebelumnya (0.17.2.1) tidak lulus untuk commit ini.
+sebelumnya (0.17.2.1) tidak lulus untuk commit ini. Keputusan 29 September
+(ADR 0025/0026), belum diimplementasikan: kode Broxser tanpa lisensi dan arsip
+hanya untuk pilot, setelah membawa teks lisensi setiap crate dan tanpa protokol
+blur KDE (LGPL-2.1-or-later) di GPUI; attestation provenance GitHub sebagai
+signing; draft GitHub release; `install.sh` per user; kualifikasi mingguan dan
+on-demand di GitHub Actions yang tidak pernah mengubah pin.
 
 ## 9. Operational readiness and ten year stewardship
 
@@ -417,7 +422,9 @@ masih diperlukan sebelum 8 device dipakai sebagai fitur production.
 
 Cargo.lock, Rust toolchain, GPUI exact version dan checksum Helium memberi baseline
 yang dapat direproduksi. Dependabot membantu Rust/action; pembaruan browser tetap
-pekerjaan owner dengan contract test (`scripts/qualify-helium.py`, ADR 0026). CI memeriksa compile dan headless integration;
+pekerjaan owner dengan contract test (`scripts/qualify-helium.py`, ADR 0026). Owner
+utama engine dan rilis adalah pemilik repo; cadangan belum ditunjuk (ADR 0025,
+keputusan 5). CI memeriksa compile dan headless integration;
 matrix GPU Wayland/X11, fractional scale, IME dan accessibility memerlukan test
 desktop nyata sebelum rilis.
 
@@ -452,18 +459,22 @@ yang dihemat dan beban maintenance.
 
 ## 11. Open questions
 
-- Siapa primary/backup owner dengan kapasitas maintenance nyata, dan berapa seat tim?
+- Siapa backup owner dengan kapasitas maintenance nyata (primary: pemilik repo,
+  ADR 0025), dan berapa seat tim?
 - Distro, GPU, fractional scaling, accessibility dan aplikasi perusahaan apa yang wajib lulus?
 - Apakah kebutuhan utama preview responsif atau interaksi web lengkap? Gate ini
   menentukan apakah CDP cukup atau perlu investasi embedding terpisah.
 - Helium filtering/fingerprinting behavior: diukur dan sebagian disamakan di ADR 0019; noise
   canvas/audio per session tetap milik Helium dan blocker tetap mati di session.
-- Bagaimana secret store, persistent session, signed package dan distribusi internal akan dikelola?
-  Persistent session: usulan di ADR 0021 (satu profil on-disk per session persisten,
-  retensi pada semua jalur cleanup, kompatibilitas runtime lengkap/penulis terakhir,
-  tanpa keyring). Gate mencakup binding lokal/ownership, default-context blocker,
-  pencegahan restore navigasi lama dan durabilitas; belum diterima, default tetap
-  ephemeral. Merge audit tidak mengaktifkan atau menyetujui fitur tersebut.
+- Secret store, persistent session, signed package dan distribusi internal:
+  diputuskan 29 September, belum diimplementasikan. Persistent session: ADR 0021
+  diterima dengan keputusan produk (satu profil on-disk per session persisten,
+  akun developer sendiri, opt-in lokal eksplisit, kunci tetap tanpa keyring atau
+  secret store, binding lokal, retensi sampai Forget, profil dari Helium lebih
+  baru tidak dibuka). Lima tahap gate (penyimpanan dan ownership, default context
+  dan no-replay, identitas runtime dan upgrade, UI, resource dan durabilitas)
+  harus punya bukti sebelum UI menawarkannya; default tetap ephemeral. Paket:
+  attestation provenance GitHub dan draft release untuk pilot (ADR 0025).
 
 ## 12. Decision and next steps
 

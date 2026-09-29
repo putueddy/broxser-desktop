@@ -151,8 +151,16 @@ Report problems through the company's established private security channel. An
 actual team/contact must be assigned before rollout; do not attach cookies, tokens,
 customer screenshots, or full sensitive URLs to public issues.
 
-Proposed operating targets: triage browser advisories within one business day;
-qualify critical updates within 72 hours of a usable upstream release; review other
-updates weekly. These are targets needing assigned maintainers, not current service
-guarantees. An incompatible upstream release blocks promotion until contract tests
-pass. Security response takes precedence over UI feature work.
+Operating targets (ADR 0003, accepted 2026-09-29): triage browser advisories
+within one business day; qualify critical updates within 72 hours of a usable
+upstream release; review other updates weekly. The primary owner is the
+repository owner; no backup is named yet, and the scheduled qualification
+workflow that ADR 0026 decides is not built yet, so these are targets, not current
+service guarantees. An incompatible upstream release blocks promotion until
+contract tests pass. Security response takes precedence over UI feature work.
+
+Release archives from `scripts/package.sh` are unsigned: only a `.sha256`
+obtained through a trusted channel protects them. Releases are to carry GitHub
+artifact attestations, keyless build provenance checked with
+`gh attestation verify` (ADR 0025, decision 2); the release workflow that
+creates them is not built yet.
