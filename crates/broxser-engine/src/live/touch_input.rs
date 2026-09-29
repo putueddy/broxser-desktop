@@ -601,7 +601,10 @@ const report = (kind = 'touch-regression', delay = 50) => {
 };
 for (const type of ['pointerdown','pointermove','pointerup','pointercancel','touchstart','touchmove','touchend','touchcancel','click']) {
   t.addEventListener(type, e => {
-    if (type === 'pointerdown') { gesture++; log = []; }
+    if (type === 'pointerdown') {
+      gesture++; log = [];
+      fetch('/event?' + new URLSearchParams({kind:'touch-regression-press',w:innerWidth,path:location.pathname,n:gesture}));
+    }
     const point = e.changedTouches ? e.changedTouches[0] : e;
     log.push({type, x:Math.round(point.clientX), y:Math.round(point.clientY)});
     if (type === 'touchend' || type === 'touchcancel') report();
@@ -666,6 +669,18 @@ fn wait_gesture_report(fixture: &Fixture, path: &str, gesture: u32, kind: &str) 
         regression_reports(fixture)
     );
     report(fixture).unwrap()
+}
+
+fn wait_regression_press(fixture: &Fixture, path: &str, gesture: u32) {
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| {
+            events(f, "touch-regression-press").iter().any(|event| {
+                event["w"] == "360" && event["path"] == path && event["n"] == gesture.to_string()
+            })
+        }),
+        "missing {path} press {gesture}: {:?}",
+        regression_reports(fixture)
+    );
 }
 
 fn fresh_tap(report: &Value, x: u32, y: u32) -> bool {
@@ -740,6 +755,10 @@ fn live_abandoned_touch_is_canceled_after_hide_dialog_and_navigation() {
     let fixture = regression_fixture();
     let live = live_touch_regression(&fixture, "/touch");
     live.send(pointer(PointerKind::Down, 100.0, 200.0));
+    // Hide once the page has the press. A press still on its way when the
+    // page stops taking input can be dropped together with its cancel, which
+    // leaves the page consistent but nothing to cancel.
+    wait_regression_press(&fixture, "/touch", 1);
     live.send(Command::SetVisible {
         device: 0,
         visible: false,

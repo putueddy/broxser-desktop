@@ -3651,6 +3651,35 @@ fn click(live: &Live, device: usize, x: f64, y: f64) {
     }
 }
 
+/// Moves the mouse at `(x, y)` until the page frame `frame` reports it with
+/// `/event?hover=<frame>`. Only for pages where moves have no effect; they
+/// may repeat, alternating by one pixel so that each changes the position.
+fn hover_until(live: &Live, fixture: &Fixture, device: usize, x: f64, y: f64, frame: &str) {
+    let report = format!("/event?hover={frame}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step = 0_u32;
+    while count(fixture, &report) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the {frame} frame never received the mouse"
+        );
+        live.send(Command::Pointer {
+            device,
+            event: PointerEvent {
+                kind: PointerKind::Move,
+                x: x + f64::from(step % 2),
+                y,
+                button: PointerButton::None,
+                buttons: 0,
+                click_count: 0,
+                modifiers: Modifiers::default(),
+            },
+        });
+        step += 1;
+        fixture.wait_for(Duration::from_millis(100), |f| count(f, &report) > 0);
+    }
+}
+
 fn jpeg_size(data: &[u8]) -> Option<(u32, u32)> {
     if !data.starts_with(&[0xFF, 0xD8]) {
         return None;
@@ -6357,7 +6386,11 @@ fn live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device() {
                 "<input id=file type=file style='top:0'><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}&files='+file.files.length));</script>"
             )
         };
-        let ready = |name: &str| format!("<script>fetch('/event?ready={name}')</script>");
+        let ready = |name: &str| {
+            format!(
+                "<script>addEventListener('pointermove',()=>fetch('/event?hover={name}'),{{once:true}});fetch('/event?ready={name}')</script>"
+            )
+        };
         match request.path.as_str() {
             "/nested-main" => html(format!(
                 "{style}<iframe id=outer style='top:0'></iframe><a style='top:520px' href='/download?top'>top download</a><script>outer.src=location.origin.replace('127.0.0.1','localhost')+'/nested-outer';</script>"
@@ -6395,6 +6428,10 @@ fn live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device() {
     );
     // Each chooser fires one cancel event; neither frame ever receives files.
     for (device, y, source) in [(0, 20.0, "outer"), (1, 80.0, "inner")] {
+        // A cross-site frame can run scripts before the browser routes input
+        // to it; a click sent then reaches the parent frame's iframe element
+        // instead. Click once the frame has received the mouse.
+        hover_until(&live, &fixture, device, 100.0, y, source);
         click(&live, device, 100.0, y);
         live.wait(source, Duration::from_secs(10), |s| {
             s.devices[device].file_choosers == 1

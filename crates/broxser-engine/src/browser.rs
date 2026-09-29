@@ -1004,6 +1004,7 @@ mod tests {
     #[test]
     fn browser_runs_in_a_private_home() {
         use crate::test_support::{FakeBrowser, fake_browser, profile_root};
+        use std::io::Read;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
         let root = profile_root();
@@ -1025,7 +1026,15 @@ mod tests {
         expected_home.push(&home);
         let deadline = Instant::now() + Duration::from_secs(5);
         let environ = loop {
-            let environ = fs::read(format!("/proc/{}/environ", browser.child.id())).unwrap();
+            // Take each snapshot with one read: the fake browser's shell execs
+            // sleep, and the reads after that exec return nothing, so a
+            // multi-read file read can end after HOME without later variables.
+            let mut environ = vec![0; 1 << 20];
+            let length = fs::File::open(format!("/proc/{}/environ", browser.child.id()))
+                .and_then(|mut file| file.read(&mut environ))
+                .unwrap();
+            assert!(length < environ.len(), "environment larger than one read");
+            environ.truncate(length);
             if environ
                 .split(|byte| *byte == 0)
                 .any(|entry| entry == expected_home.as_bytes())

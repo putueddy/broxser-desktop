@@ -3,6 +3,48 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #26 CI: three engine test races, 29 September 2026 (cloud container)
+
+CI on `e37328e` failed three engine tests that the PR's diff (scripts, CI and
+documentation) does not touch; the same engine code passed on `5c8ae74` and on
+`main` `3c01ad5`. The one re-run passed the pull-request run and failed the push
+run again on the nested chooser test, so that test failed in 2 of 3 live-suite
+runs of the commit. All three were races in the tests; no product code changed.
+
+| Test and CI symptom | Cause | Change |
+| --- | --- | --- |
+| `browser_runs_in_a_private_home` (run by `private_home_launch_preserves_display_auth_and_validates_cache_paths`): `XDG_CACHE_HOME` was `None` | `fs::read` of `/proc/<pid>/environ` takes several `read()` calls. Once the fake browser's shell execs `sleep`, the remaining ones return nothing, so a snapshot could hold the private `HOME` that ends the wait, without the variables sorted after it | One `read()` per snapshot |
+| `live_abandoned_touch_is_canceled_after_hide_dialog_and_navigation`: no report for gesture 1 | A press still on its way when hide stops page input is dropped together with its cancel (PR #24) | Hide once the page reports the press |
+| `live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device`: no chooser in the inner frame | The click came once the nested cross-site iframe had run its scripts, but before the browser routed input to it, and reached the parent frame's `<iframe>` element | Move the mouse until the target frame reports it, then click once |
+
+Evidence, as `broxsertest` with the sandbox enabled:
+
+- Environment reads: a reproducer reading `never-ready`'s environment the way
+  `fs::read` does got 85 truncated snapshots out of 300 (`HOME` present, the
+  last variable missing), and 0 out of 300 with one `read()` per snapshot. The
+  test itself did not fail here in 700 runs before the change.
+- Nested routing: one failing run, caught with `pointerdown` listeners in every
+  frame, showed device 1's click at (100, 80) in the outer frame on its
+  `IFRAME`, nothing in the inner frame and no `cancel=inner`: the CI pattern.
+  Clicking the inner iframe of all three devices right after `ready=inner`,
+  with four test processes on two CPUs, 11 of 96 clicks reached the wrong frame
+  (10 the outer, 1 the main frame); after moving the mouse first, 0 of 96.
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` on this commit | Passed in 59 s |
+| Live Helium suite (`--ignored`, four threads) on this commit | 54/54 in 83.8 s; the same patch in a scratch tree, 3 more runs of 54/54 |
+| Nested test, four processes on two CPUs | 32/32, and 64/64 with the same fix plus one log line |
+| `browser::` unit tests, 40 runs with eight threads | 40/40 |
+| The failing CI case run directly, 200 runs with 100 extra variables | 200/200 |
+
+The touch and nested tests now wait for the page before the hide or the click.
+They no longer cover a press still in flight at hide, or a click that arrives
+before the frame takes input: the browser drops the first and sends the second
+to the parent frame, and Broxser repeats neither. The fake-CDP test
+`hiding_cancels_touch_before_ignoring_input_and_show_does_not_replay_release`
+still checks that hide sends the cancel before it ignores input.
+
 ## PR #26 review corrections, 29 September 2026 (Linux X11)
 
 Review of `5c8ae74` found the SBOM `created` timestamp was local time labeled
