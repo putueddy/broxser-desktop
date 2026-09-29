@@ -2,9 +2,9 @@
 
 Status: accepted for P3.1, 2026-09-28 (tooling and procedure); the four open
 decisions were taken on 2026-09-29, on the owner's delegation (see "Decisions,
-2026-09-29"). The scheduled qualification workflow they call for is a separate
-change. Builds on ADR 0003 (engine update lifecycle), ADR 0001 (external Helium)
-and ADR 0025 (release archive).
+2026-09-29"), and decision 2's workflow is
+`.github/workflows/qualify-helium.yml`. Builds on ADR 0003 (engine update
+lifecycle), ADR 0001 (external Helium) and ADR 0025 (release archive).
 
 ## Context
 
@@ -97,12 +97,11 @@ and ADR 0025 (release archive).
   exemption. Profiles are ephemeral today; once P2.2 keeps profiles (ADR 0021),
   a rollback must also not open a profile that a newer Helium wrote.
 - Trust in the key rests on GitHub serving `imputnet/helium-linux` over HTTPS
-  (here through the environment's TLS-inspecting proxy), corroborated only by a
-  keyserver copy (decision 1). `gpgv` checks neither expiry nor revocation; the
-  key expires 2028-10-10, so expect a rotation before then.
-- Until the workflow of decision 2 lands, nothing runs on a schedule. The
-  primary owner is the repository owner; a backup is still unnamed (ADR 0025,
-  decision 5).
+  (here through the environment's TLS-inspecting proxy), corroborated by the
+  sources of decision 1. `gpgv` checks neither expiry nor revocation; the key
+  expires 2028-10-10, so expect a rotation before then.
+- The primary owner is the repository owner; a backup is still unnamed (ADR
+  0025, decision 5).
 
 ## Decisions, 2026-09-29
 
@@ -110,15 +109,20 @@ The owner delegated these decisions. The repository owner (ADR 0025, decision
 5) is the person named below as the approver.
 
 1. **Key evidence and rotation.** The pinned key is kept. Besides the copy in
-   `imputnet/helium-linux` (`pubkey.asc` and the README), `keyserver.ubuntu.com`
-   returns for the pinned fingerprint a key whose OpenPGP packets, the
-   self-signatures included, are byte-identical to the pinned file's: user ID
-   `Helium signing key (https://helium.computer/) <helium@imput.net>`, created
-   2025-10-11, expiring 2028-10-10. That keyserver accepts uploads from anyone,
-   so the copy shows only that the same key has been public outside GitHub
-   under that identity. `helium.computer` and `keys.openpgp.org` were refused
-   by the network policy of the environment used; checking the website remains
-   open.
+   `imputnet/helium-linux` (`pubkey.asc` and the README), three sources outside
+   that repository agree with it, checked on 2026-09-29:
+   - `keys.openpgp.org` serves it for the fingerprint and for the address
+     `helium@imput.net`. That server publishes a user ID only after its owner
+     confirms it by email, so whoever controls that mailbox confirmed this key.
+   - Helium's own apt repository, `pkg.helium.computer/deb` (its `InRelease`
+     of 2026-09-24), carries a good signature by the pinned key. Helium's
+     website publishes no key or fingerprint itself: its download page fetches
+     the same `pubkey.asc` from `imputnet/helium-linux`.
+   - `keyserver.ubuntu.com` serves it too; it accepts uploads from anyone.
+   The OpenPGP packets of both keyserver copies, the self-signatures included,
+   are byte-identical to the pinned file's: user ID `Helium signing key
+   (https://helium.computer/) <helium@imput.net>`, created 2025-10-11,
+   expiring 2028-10-10. `imput.net` publishes no Web Key Directory.
    A rotation is one reviewed pull request that replaces
    `runtime/helium-signing-key.asc` and the pinned fingerprint together, cites
    two sources for the new key (the Helium repository and one more: its
@@ -139,6 +143,19 @@ The owner delegated these decisions. The repository owner (ADR 0025, decision
    disables a public repository's scheduled workflows after 60 days without
    repository activity; the weekly review includes checking that the last
    weekly run exists.
+
+   Implemented as `.github/workflows/qualify-helium.yml`, which runs
+   `qualify-helium.py scheduled`: Mondays at 03:23 UTC; on demand from the
+   Actions tab, optionally naming a release (an update or a rollback target);
+   and on pull requests that change the pin, the key, the script or the
+   workflow, so a promotion carries its record. The job checks the key, asks
+   `git ls-remote` for the newest release tag, requalifies the pin and, when
+   the newest release is newer than the pin or the run names another release,
+   proposes and qualifies that one. It fails unless the key matches and every
+   run is `qualified`, and writes a table of the results to the run's summary.
+   Only the browsers the script unpacks under `.local/helium-candidates/` may
+   create the user namespaces of Chromium's own sandbox (an AppArmor profile,
+   as in CI).
 3. **Records.** Each run uploads its record, logs and proposed manifest as
    workflow artifacts; GitHub keeps them 90 days. In this public repository any
    signed-in GitHub user can download them; they hold test output against local
@@ -156,4 +173,7 @@ The owner delegated these decisions. The repository owner (ADR 0025, decision
 
 `docs/validation.md` (P3.1 Helium qualification and rollback rehearsal): unit
 tests of the tooling, the signature check of the pin, records for 0.18.1.1 and
-0.17.2.1, reruns of the failing tests, and the pin switch in a clone.
+0.17.2.1, reruns of the failing tests, and the pin switch in a clone. The
+scheduled qualification (P3.1 scheduled Helium qualification): its tests, the
+checks of the workflow and its AppArmor profile, local runs as an unprivileged
+user, and the key sources of decision 1.

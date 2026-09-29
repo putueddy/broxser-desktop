@@ -390,12 +390,15 @@ dengan `scripts/qualify-helium.py` (ADR 0026): pin baru hanya dari tarball yang
 ditandatangani kunci rilis Helium, lalu live suite dan smoke dijalankan terhadap
 browser kandidat di samping engine yang dipin dan hasilnya dicatat per pasangan
 commit Broxser dan versi Helium. Rollback memakai jalur yang sama; rilis
-sebelumnya (0.17.2.1) tidak lulus untuk commit ini. Keputusan 29 September
-(ADR 0025/0026), belum diimplementasikan: kode Broxser tanpa lisensi dan arsip
-hanya untuk pilot, setelah membawa teks lisensi setiap crate dan tanpa protokol
-blur KDE (LGPL-2.1-or-later) di GPUI; attestation provenance GitHub sebagai
-signing; draft GitHub release; `install.sh` per user; kualifikasi mingguan dan
-on-demand di GitHub Actions yang tidak pernah mengubah pin.
+sebelumnya (0.17.2.1) tidak lulus untuk commit ini. Workflow **Qualify Helium**
+(ADR 0026) menjalankan kualifikasi itu setiap minggu, on demand dan pada PR yang
+mengubah pin: kunci dibandingkan dengan yang diterbitkan Helium, pin
+dikualifikasi ulang dan rilis yang lebih baru dikualifikasi, tanpa pernah
+mengubah pin. Keputusan 29 September (ADR 0025), belum diimplementasikan: kode
+Broxser tanpa lisensi dan arsip hanya untuk pilot, setelah membawa teks lisensi
+setiap crate dan tanpa protokol blur KDE (LGPL-2.1-or-later) di GPUI;
+attestation provenance GitHub sebagai signing; draft GitHub release;
+`install.sh` per user.
 
 ## 9. Operational readiness and ten year stewardship
 

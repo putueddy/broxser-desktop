@@ -3,6 +3,82 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P3.1 scheduled Helium qualification, 29 September 2026 (cloud container)
+
+ADR 0026, decision 2: `.github/workflows/qualify-helium.yml` runs
+`scripts/qualify-helium.py scheduled`. Same container, now with unrestricted
+network access; qualification ran as `broxsertest` against Xvfb `:99` with the
+sandbox enabled, using the debug binaries of `main` `c1db07a` (this change
+touches no Rust code).
+
+### Before the change
+
+- Qualification ran only by hand (`propose`, then `run`). Nothing looked for a
+  newer Helium release, nothing compared the pinned key with the one Helium
+  publishes, and nothing ran on a schedule.
+
+### After the change
+
+- `latest` (0.9 s) prints `0.18.1.1`, the pin, from the 102 release tags of
+  `imputnet/helium-linux`. The order is numeric: sorted as text, `0.9.4.1`
+  would come last.
+- `check-key` (0.4 s): "runtime/helium-signing-key.asc equals
+  https://raw.githubusercontent.com/imputnet/helium-linux/main/pubkey.asc". No
+  `~/.gnupg` is created.
+- `scheduled --summary FILE` (3 m 15 s, exit 0) wrote this table to the file and
+  to its output: the key equals the published one; the newest release is the
+  pin; the pin is **qualified** (live suite 54 passed and 0 failed in 84.7 s,
+  smoke passed in 109.2 s), with its record. No browser process or profile was
+  left.
+- The first such run, before the local wrapper stopped passing root's
+  `GIT_SSL_CAINFO` (a CA bundle only root can read here) to the test user,
+  recorded the newest release as unknown with git's exit status and exited 1
+  although the pin qualified: an unreachable upstream fails the run.
+  `latest` now reports git's own message, for example "unable to access".
+- `scheduled --version 0.17.2.1` (6 m 47 s, exit 1), the failure path with the
+  release known not to qualify: the key matched; the pin qualified again;
+  0.17.2.1 was proposed from a signature-verified download (signed 2026-09-17
+  23:11:31 UTC, the SHA-256 recorded on 28 September) and is **not
+  qualified**: live suite 53 passed and 1 failed
+  (`live_dialog_survives_hide_show_scroll_and_zoom`, as in the rehearsal) in
+  88.6 s, smoke passed in 110.2 s.
+
+### Key sources (ADR 0026, decision 1)
+
+| Source | Result |
+| --- | --- |
+| `keys.openpgp.org`, by fingerprint and by the address `helium@imput.net` | Both return the key with its user ID, which that server shows only after the address confirmed it by email. The five OpenPGP packets are byte-identical to the pinned file's |
+| `helium.computer` | No key or fingerprint on the site (`/pubkey.asc` is 404). The download page installs `https://raw.githubusercontent.com/imputnet/helium-linux/main/pubkey.asc` as the keyring of the apt repository `pkg.helium.computer/deb` |
+| `pkg.helium.computer/deb/dists/stable/InRelease` (Date 2026-09-24 11:51:22 UTC) | `gpgv` with the pinned key: `GOODSIG` and `VALIDSIG BE677C1989D35EAB2C5F26C9351601AD01D6378E`, signed 2026-09-24 |
+| `pubkey.asc` on `main` of `imputnet/helium-linux` | Byte-identical to `runtime/helium-signing-key.asc` |
+| Web Key Directory for `imput.net` | None: the advanced method's host is unreachable, the direct method returns 404 |
+
+`docs.github.com`, reachable now, confirms what ADRs 0025 and 0026 took from
+GitHub's documentation source on 29 September: artifact attestations only in
+public repositories on the Free, Pro and Team plans; 2,000 and 3,000 included
+Actions minutes a month for private repositories on Free and Pro; scheduled
+workflows disabled after 60 days without activity in public repositories.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `python3 -m unittest discover -s scripts/tests` | 14 tests passed, among them: the newest release by numeric order and git's error message; a published key that differs by one byte is refused; which releases `scheduled` qualifies (only the pin when it is current; the pin and a newer release; the pin and a named older one; a changed key or an unknown newest release fails while the pin still runs) and that a failed verdict fails it |
+| `actionlint` 1.7.12 with ShellCheck 0.9.0 | No findings for `qualify-helium.yml` and `ci.yml` |
+| `apparmor_parser` 4.0.1 (`-Q -K`, not loaded: this kernel has no AppArmor) | The workflow's profile, with the runner's workspace path, parses; a truncated profile is refused |
+| `bash scripts/check.sh` | Passed in 45 s: the SBOM check, the 14 tooling tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+
+### Limits
+
+- The workflow runs only on GitHub; its first run is this pull request's own.
+  The runner, like this container, draws the window with Xvfb and Lavapipe; no
+  physical GPU or Wayland.
+- `propose` never overwrites a prepared candidate, so a second local
+  `scheduled` for the same newer release refuses until that candidate is moved
+  aside; runners start empty.
+- A release tag whose tarball is not uploaded yet fails the run (the download
+  is refused) until it is.
+
 ## Owner decisions for ADRs 0021, 0025 and 0026, 29 September 2026 (cloud container)
 
 The owner delegated the open decisions of ADR 0021 (persistent sessions), ADR
