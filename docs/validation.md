@@ -3,6 +3,32 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #26 review corrections, 29 September 2026 (Linux X11)
+
+Review of `5c8ae74` found the SBOM `created` timestamp was local time labeled
+UTC (`%SZ` is seconds plus a literal `Z`, and git's `format-local` renders in
+the machine's timezone): on a non-UTC machine the document was SPDX-invalid and
+two `package.sh` runs of one commit in different timezones gave different
+archives. `created` now comes from the commit epoch in UTC. Also corrected:
+`cargo tree --prefix depth` concatenates depth and name, so a crate name
+starting with a digit misparsed (the split is now resolved against the known
+packages and the tree depth); `run()` hid cargo's stderr behind a traceback;
+the license-expression failure names where to fix the string; Python < 3.11
+gets a clear message instead of `ModuleNotFoundError` (README notes it).
+
+| Check | Result |
+| --- | --- |
+| `sbom.py --check` | "531 components (525 crates.io crates), 1388 relationships" — unchanged |
+| SBOM byte-equality across timezones | `TZ=Asia/Jakarta` and `TZ=UTC` runs of one commit: identical JSON; `created` = the commit's UTC time |
+| Archive equality across timezones | Two `package.sh` runs of commit `927fd41` (one `TZ=UTC`, one `TZ=Asia/Jakarta`): identical SHA-256 `627f03fc…53c462b` |
+| Digit-name parsing | Ad-hoc parse of a synthetic `cargo tree` with a `2d` crate at depths 1 and 2: correct package, edges and depth |
+| `bash scripts/check.sh` | Passed in 42 s |
+
+The packaged binaries, fetch script and smoke were not rebuilt or rerun: the
+correction touches only `sbom.py` output bytes and script diagnostics, and the
+archive layout is unchanged. The archive equality above re-exercised
+`package.sh` end to end, including the release build.
+
 ## P3.1 release archive and SBOM, 27 September 2026 (cloud container)
 
 Same container. Decisions and open owner decisions:
