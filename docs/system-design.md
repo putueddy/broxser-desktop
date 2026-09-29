@@ -399,8 +399,11 @@ mengubah pin. Keputusan 29 September (ADR 0025): kode Broxser tanpa lisensi dan
 arsip hanya untuk pilot pengguna perusahaan. Syarat arsip itu sudah dipenuhi:
 setiap crate membawa teks lisensinya, dan GPUI tidak lagi meng-compile protokol
 blur KDE (LGPL-2.1-or-later); `sbom.py --check` di CI menolak dependency yang
-hanya menawarkan lisensi lain. Belum diimplementasikan: attestation provenance
-GitHub sebagai signing, draft GitHub release dan `install.sh` per user.
+hanya menawarkan lisensi lain. Workflow **Release** membangun arsip dari tag
+`v<versi>` pada commit `main`, membuat attestation build provenance GitHub
+(Sigstore, tanpa kunci jangka panjang) dan melampirkannya ke draft GitHub
+release yang tidak pernah dipublikasikan otomatis. Belum diimplementasikan:
+`install.sh` per user.
 
 ## 9. Operational readiness and ten year stewardship
 

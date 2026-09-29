@@ -162,8 +162,15 @@ owner is the repository owner and no backup is named yet, so these are targets,
 not service guarantees. An incompatible upstream release blocks promotion until
 contract tests pass. Security response takes precedence over UI feature work.
 
-Release archives from `scripts/package.sh` are unsigned: only a `.sha256`
-obtained through a trusted channel protects them. Releases are to carry GitHub
-artifact attestations, keyless build provenance checked with
-`gh attestation verify` (ADR 0025, decision 2); the release workflow that
-creates them is not built yet.
+Release archives built by hand with `scripts/package.sh` are unsigned: only a
+`.sha256` obtained through a trusted channel protects them. Drafts from the
+release workflow (`.github/workflows/release.yml`, ADR 0025) carry a GitHub
+artifact attestation: keyless build provenance, signed through Sigstore's public
+instance with the workflow's short-lived identity and recorded in its public
+transparency log. `gh attestation verify <archive> --repo
+putueddy/broxser-desktop --signer-workflow
+putueddy/broxser-desktop/.github/workflows/release.yml --source-ref
+refs/tags/v<version>` shows that this repository's release workflow built the
+archive from that tag; the `.sha256` alone checks integrity, not origin. The
+workflow builds only tags that name the workspace version on commits of `main`,
+publishes nothing and never uploads the archive as a workflow artifact.
