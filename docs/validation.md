@@ -3,6 +3,57 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## P3.1 release workflow: draft releases with build provenance, 29 September 2026 (cloud container)
+
+ADR 0025, decisions 2 and 3. Same container; no Rust, engine or GUI code
+changed. The release job runs only for a tag, and a tag's run writes an
+attestation to Sigstore's public transparency log and a draft to this
+repository, so no tag was pushed: the job's steps ran here with a stand-in for
+the GitHub CLI, and pull requests run its build and checks as a dry run.
+
+### Before the change
+
+- Archives were built only by hand with `scripts/package.sh`: unsigned, with no
+  release channel and no attestation.
+
+### After the change
+
+- `.github/workflows/release.yml`. On a tag `v*`, the release job (contents,
+  OIDC token and attestations writable) refuses a commit that `main` does not
+  contain, runs `scripts/release-assets.sh "$TAG"`, attests the archive with
+  `actions/attest` v4.2.2 (`1e69f48…`) and creates the draft with
+  `gh release create --draft --verify-tag`. The dry-run job, read-only, runs on
+  pull requests that change the workflow, `package.sh`, `release-assets.sh`,
+  `sbom.py` or `scripts/licenses`.
+- `actions/attest-build-provenance` v4 is only a wrapper of `actions/attest`,
+  whose README asks new workflows to use it directly. Without a registry push
+  the action creates no storage record (its source), so `artifact-metadata`
+  is not granted.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `actionlint` 1.7.12 with ShellCheck 0.9.0 | No findings for `release.yml`, `ci.yml` and `qualify-helium.yml`; ShellCheck finds nothing in `release-assets.sh` |
+| `release-assets.sh` on `229cfb7`, as the dry run runs it | Exit 0 in 39 s, the release binaries already built: two archives with SHA-256 `c3499e98…6fe307`; the `.sha256`, `SHA256SUMS` (its 11 files and no others) and `COMMIT` checked; the SBOM and the release notes written beside the archive |
+| Refusals | The tags "", `0.1.0`, `V0.1.0`, `v0.1.0.1`, `v0.1.0-rc.1` and `v0.0.0` exit 1 before anything is built or written (script test); an existing `artifacts/release/v0.1.0` is refused |
+| The release job's shell steps, with a stand-in `gh` | "Release only reviewed code" exits 1 for a commit of this branch, which `main` does not contain, and 0 for `origin/main`. "Create the draft release" calls `gh release create v0.1.0 --draft --verify-tag --title 'Broxser 0.1.0' --notes-file artifacts/release/v0.1.0/release-notes.md` with the archive, its `.sha256`, `.sigstore.json` and `.spdx.json`, all present, and writes the run summary |
+| `python3 -m unittest discover -s scripts/tests` | 24 tests passed, 1 of them new |
+| `bash scripts/check.sh` | Passed in 45 s with this section: the SBOM and license check, the script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Live Helium suite, desktop smoke | Not rerun: nothing in the engine, the GUI or the archive's content changed |
+
+### Limits
+
+- The release job has not run. Attesting, creating the draft and uploading its
+  assets are first exercised by the owner's first tag; check that draft with
+  the commands in its notes before giving it to anyone.
+- The `gh attestation verify` command in the notes was checked against the
+  GitHub CLI manual, not run: the GitHub CLI is not installed here.
+- The workflow does not check CI: tag a commit of `main` whose CI passed.
+- The binaries are reproducible only with the same toolchain and build path, so
+  an archive built here differs from the runner's; the runner's two builds must
+  match each other.
+
 ## P3.1 license texts in the archive, GPUI without KDE's blur, 29 September 2026 (cloud container)
 
 ADR 0025, decision 1. Same container; the smoke, the Wayland check and the
