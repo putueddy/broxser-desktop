@@ -195,7 +195,7 @@ menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 | `examples/` | Workspace contoh, fixture responsif (`index.html`) dan fixture live (`live.html`) |
 | `runtime/` | Baseline Helium resmi beserta checksum dan kunci signing rilis Helium |
 | `docs/` | System Design, ADR, roadmap dan catatan verifikasi |
-| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`), arsip rilis (`package.sh`) dan kualifikasi update Helium (`qualify-helium.py`) |
+| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`), arsip dan aset rilis (`package.sh`, `release-assets.sh`) dan kualifikasi update Helium (`qualify-helium.py`) |
 
 GPUI dipin ke `0.2.2` dengan source dan patch Broxser (IME, atlas, tanpa
 protokol blur KDE) yang dicatat di
@@ -217,9 +217,28 @@ waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
 `scripts/check.sh` serta CI; `--check` juga gagal bila crate yang di-link hanya
 menawarkan lisensi di luar lisensi permisif dan MPL-2.0 tanpa modifikasi.
 Keputusan 29 September (ADR 0025): kode Broxser tanpa lisensi (all rights
-reserved) dan arsip hanya untuk pilot perusahaan. Rilis berikutnya berupa
-draft GitHub release dengan attestation provenance dan `install.sh`; keduanya
-belum diimplementasikan.
+reserved) dan arsip hanya untuk pilot perusahaan.
+
+Rilis dibuat workflow **Release** (ADR 0025, keputusan 2 dan 3). Pemilik repo
+menaikkan versi workspace di `Cargo.toml` bila perlu, lalu mem-push tag
+`v<versi>` pada commit `main` yang CI-nya hijau. Workflow membangun dan
+memeriksa arsip dengan `scripts/release-assets.sh` (dua build harus sama;
+`.sha256`, `SHA256SUMS` dan `COMMIT` dicek), membuat attestation build
+provenance lewat Sigstore tanpa kunci jangka panjang, lalu melampirkan arsip,
+`.sha256`, SBOM dan bundle attestation ke **draft** release. Tidak ada yang
+dipublikasikan otomatis, dan arsip tidak pernah diunggah sebagai artefak
+workflow. Tag yang tidak sama dengan versi workspace atau commit di luar `main`
+ditolak. Penerima mengecek arsip dengan GitHub CLI:
+
+```bash
+sha256sum -c broxser-<versi>-linux-x86_64.tar.xz.sha256
+gh attestation verify broxser-<versi>-linux-x86_64.tar.xz --repo putueddy/broxser-desktop \
+  --signer-workflow putueddy/broxser-desktop/.github/workflows/release.yml \
+  --source-ref refs/tags/v<versi> --deny-self-hosted-runners
+```
+
+PR yang mengubah jalur rilis menjalankan dry run: build dan cek yang sama, tanpa
+attestation dan tanpa unggahan. `install.sh` belum diimplementasikan.
 
 Update atau rollback Helium melewati kualifikasi (ADR 0026):
 
