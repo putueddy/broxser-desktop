@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds the unsigned Linux x86_64 release archive (P3.1, ADR 0025): the release
-# binaries, the notices, the SBOM and license inventory, the Helium manifest and
-# its fetch script, a SHA256SUMS of every file, and next to the archive its own
-# SHA-256. Helium itself is not included; scripts/fetch-helium.sh in the archive
+# binaries, the notices, the SBOM and license inventory, the license and notice
+# texts of every third-party component, the Helium manifest and its fetch
+# script, a SHA256SUMS of every file, and next to the archive its own SHA-256.
+# Helium itself is not included; scripts/fetch-helium.sh in the archive
 # downloads and verifies it. The archive is deterministic for a commit and its
 # binaries: order, owners, modes and times come from the commit, not the build.
 #
@@ -31,13 +32,13 @@ cargo build --release --locked -p broxser-desktop -p broxser-cli
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 root=$stage/$name
-mkdir -p "$root/bin" "$root/licenses" "$root/runtime" "$root/scripts"
+mkdir -p "$root/bin" "$root/runtime" "$root/scripts"
 install -m 0755 target/release/broxser-desktop target/release/broxser "$root/bin/"
 install -m 0644 README.md NOTICE.md SECURITY.md "$root/"
 install -m 0644 runtime/helium-linux-x86_64.json "$root/runtime/"
 install -m 0755 scripts/fetch-helium.sh "$root/scripts/"
-install -m 0644 vendor/gpui-0.2.2/LICENSE-APACHE "$root/licenses/gpui-LICENSE-APACHE"
-python3 scripts/sbom.py --output "$root/sbom.spdx.json" --summary "$root/THIRD-PARTY.md"
+python3 scripts/sbom.py --output "$root/sbom.spdx.json" --summary "$root/THIRD-PARTY.md" \
+  --licenses "$root/THIRD-PARTY-LICENSES.txt"
 printf '%s\n' "$commit" > "$root/COMMIT"
 (cd "$root" && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS)
 find "$root" -exec touch --no-dereference --date="@$epoch" {} +

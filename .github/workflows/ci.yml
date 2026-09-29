@@ -22,9 +22,9 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
-      - name: SBOM of the shipped graph (ADR 0025)
+      - name: SBOM and license texts of the shipped graph (ADR 0025)
         run: python3 scripts/sbom.py --check
-      - name: Helium update tooling (ADR 0026)
+      - name: Script tests (ADR 0025, ADR 0026)
         run: python3 -m unittest discover -s scripts/tests -v
       - name: Check GPUI desktop and input regression tests
         run: |

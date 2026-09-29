@@ -2,9 +2,9 @@
 
 Status: first part accepted for P3.1, 2026-09-27 (archive, SBOM, checksums);
 the open decisions were taken on 2026-09-29, on the owner's delegation (see
-"Decisions, 2026-09-29"). Their implementation comes in separate changes: the
-license texts with a fourth GPUI patch, then the release workflow, then the
-installer. Builds on ADR 0003 (engine update ownership), ADR 0001 (external
+"Decisions, 2026-09-29"). The license texts and the fourth GPUI patch of
+decision 1 are implemented; the release workflow and the installer are separate
+changes. Builds on ADR 0003 (engine update ownership), ADR 0001 (external
 Helium) and `NOTICE.md`.
 
 ## Context
@@ -50,7 +50,8 @@ backup owner. An audit of the repository on 2026-09-27 found:
 
 - `scripts/package.sh` builds the release binaries and writes
   `broxser-<version>-linux-x86_64.tar.xz`: `bin/broxser-desktop`,
-  `bin/broxser`, `README.md`, `NOTICE.md`, `SECURITY.md`, the GPUI license,
+  `bin/broxser`, `README.md`, `NOTICE.md`, `SECURITY.md`,
+  `THIRD-PARTY-LICENSES.txt` (the GPUI license alone until decision 1),
   `sbom.spdx.json`, `THIRD-PARTY.md`, the Helium manifest with
   `scripts/fetch-helium.sh`, `COMMIT`, and a `SHA256SUMS` of every file; next to
   it `<archive>.sha256`. File order, owners, modes and times come from the
@@ -83,9 +84,10 @@ signing of a public repository reveals nothing that is not already public.
    company's pilot users, not to the public (decision 3).
    The third-party review of 2026-09-29 (`docs/validation.md`) found that every
    shipped component allows redistribution in binary form on the terms below,
-   after one change to GPUI. The current archive does not meet them yet: it
-   lists licenses but carries only GPUI's text. No archive is given to anyone
-   before it does, so that change comes before the release workflow.
+   after one change to GPUI. The archive did not meet them then: it listed
+   licenses but carried only GPUI's text. No archive is given to anyone before
+   it does, so that change came before the release workflow (implemented
+   below).
    - Each archive carries every license and notice file of every shipped
      crate, including those of code a crate bundles (the Unicode data license
      in `regex-syntax`, the Wayland protocol authors' notice in
@@ -111,6 +113,19 @@ signing of a public repository reveals nothing that is not already public.
    - FreeType, bundled inside `freetype-sys`, is not shipped: the build links
      the system library, and the desktop calls none of it.
    This is a technical review, not legal advice.
+
+   Implemented on 2026-09-29. `sbom.py --licenses` writes
+   `THIRD-PARTY-LICENSES.txt` into the archive: the license and notice files of
+   every shipped third-party component, grouped by identical text; the SPDX
+   standard text (`scripts/licenses`) for each crate that ships none, the MIT
+   one naming the crate's authors; and notes for `self_cell`'s election,
+   `option-ext`'s source form and GPUI's changes. `sbom.py --check`, in
+   `check.sh` and CI, fails when a shipped crate offers no license but ones
+   outside the permissive set and MPL-2.0, when MPL-2.0 code is not unmodified
+   from crates.io, or when a crate without license files declares a license
+   `scripts/licenses` has no text for. The vendored GPUI no longer uses KDE's
+   blur protocol, and its changed files say so; the shipped graph drops to 524
+   crates.io crates, 31 of them without license files.
 2. **Signing is keyless build provenance.** The release workflow attests each
    archive with GitHub artifact attestations, signed through Sigstore's public
    instance with the workflow's short-lived identity, so there is no long-lived

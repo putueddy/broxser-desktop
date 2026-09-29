@@ -197,7 +197,8 @@ menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 | `docs/` | System Design, ADR, roadmap dan catatan verifikasi |
 | `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`), arsip rilis (`package.sh`) dan kualifikasi update Helium (`qualify-helium.py`) |
 
-GPUI dipin ke `0.2.2` dengan source dan patch commit IME yang dicatat di
+GPUI dipin ke `0.2.2` dengan source dan patch Broxser (IME, atlas, tanpa
+protokol blur KDE) yang dicatat di
 [`vendor/gpui-0.2.2/BROXSER-PATCH.md`](vendor/gpui-0.2.2/BROXSER-PATCH.md);
 baseline Helium Linux adalah `0.18.1.1`. Pin berguna untuk
 reproduksi, lalu harus diperbarui mengikuti security review. Binary tidak masuk Git.
@@ -206,17 +207,19 @@ Tidak ada code, aset, atau file DMG Sizzy di repo.
 `bash scripts/package.sh` membangun arsip rilis Linux x86_64 **tanpa signature**
 (`artifacts/release/broxser-<versi>-linux-x86_64.tar.xz` dan `.sha256`): binary
 release, notices, SBOM SPDX (`sbom.spdx.json`), inventory lisensi
-(`THIRD-PARTY.md`), manifest Helium dengan `scripts/fetch-helium.sh` dan
-`SHA256SUMS`. Helium tidak ikut; sesudah membongkar arsip, jalankan
+(`THIRD-PARTY.md`), teks lisensi dan notice setiap komponen pihak ketiga
+(`THIRD-PARTY-LICENSES.txt`), manifest Helium dengan `scripts/fetch-helium.sh`
+dan `SHA256SUMS`. Helium tidak ikut; sesudah membongkar arsip, jalankan
 `scripts/fetch-helium.sh`, lalu `BROXSER_HELIUM_BIN=$PWD/.local/helium/helium
 bin/broxser-desktop`. Arsip deterministik untuk satu commit dan binary-nya;
 waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
 `scripts/sbom.py` memerlukan Python 3.11+ (`tomllib`) dan dijalankan
-`scripts/check.sh` serta CI. Keputusan 29 September (ADR 0025), belum
-diimplementasikan: kode Broxser tanpa lisensi (all rights reserved) dan arsip
-hanya untuk pilot perusahaan, dan tidak diberikan kepada siapa pun sebelum
-membawa teks lisensi setiap komponen; rilis berikutnya berupa draft GitHub
-release dengan attestation provenance dan `install.sh`.
+`scripts/check.sh` serta CI; `--check` juga gagal bila crate yang di-link hanya
+menawarkan lisensi di luar lisensi permisif dan MPL-2.0 tanpa modifikasi.
+Keputusan 29 September (ADR 0025): kode Broxser tanpa lisensi (all rights
+reserved) dan arsip hanya untuk pilot perusahaan. Rilis berikutnya berupa
+draft GitHub release dengan attestation provenance dan `install.sh`; keduanya
+belum diimplementasikan.
 
 Update atau rollback Helium melewati kualifikasi (ADR 0026):
 

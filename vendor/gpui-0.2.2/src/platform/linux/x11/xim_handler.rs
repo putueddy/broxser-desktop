@@ -1,3 +1,4 @@
+// Broxser changed this file; BROXSER-PATCH.md at the root of this crate describes how.
 use std::default::Default;
 
 use x11rb::protocol::{Event, xproto};
