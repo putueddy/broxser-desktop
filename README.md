@@ -195,13 +195,25 @@ menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 | `examples/` | Workspace contoh, fixture responsif (`index.html`) dan fixture live (`live.html`) |
 | `runtime/` | Baseline Helium resmi beserta checksum |
 | `docs/` | System Design, ADR, roadmap dan catatan verifikasi |
-| `scripts/` | Unduh Helium, fixture server, `check.sh` dan pemeriksaan window X11 |
+| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`) dan arsip rilis (`package.sh`) |
 
 GPUI dipin ke `0.2.2` dengan source dan patch commit IME yang dicatat di
 [`vendor/gpui-0.2.2/BROXSER-PATCH.md`](vendor/gpui-0.2.2/BROXSER-PATCH.md);
 baseline Helium Linux adalah `0.18.1.1`. Pin berguna untuk
 reproduksi, lalu harus diperbarui mengikuti security review. Binary tidak masuk Git.
 Tidak ada code, aset, atau file DMG Sizzy di repo.
+
+`bash scripts/package.sh` membangun arsip rilis Linux x86_64 **tanpa signature**
+(`artifacts/release/broxser-<versi>-linux-x86_64.tar.xz` dan `.sha256`): binary
+release, notices, SBOM SPDX (`sbom.spdx.json`), inventory lisensi
+(`THIRD-PARTY.md`), manifest Helium dengan `scripts/fetch-helium.sh` dan
+`SHA256SUMS`. Helium tidak ikut; sesudah membongkar arsip, jalankan
+`scripts/fetch-helium.sh`, lalu `BROXSER_HELIUM_BIN=$PWD/.local/helium/helium
+bin/broxser-desktop`. Arsip deterministik untuk satu commit dan binary-nya;
+waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
+`scripts/sbom.py` memerlukan Python 3.11+ (`tomllib`) dan dijalankan
+`scripts/check.sh` serta CI. Format pengguna, signing, lisensi dan owner rilis
+masih keputusan pemilik (ADR 0025).
 
 ## Verifikasi
 

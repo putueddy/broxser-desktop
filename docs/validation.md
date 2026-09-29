@@ -3,6 +3,153 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #26 CI: three engine test races, 29 September 2026 (cloud container)
+
+CI on `e37328e` failed three engine tests that the PR's diff (scripts, CI and
+documentation) does not touch; the same engine code passed on `5c8ae74` and on
+`main` `3c01ad5`. The one re-run passed the pull-request run and failed the push
+run again on the nested chooser test, so that test failed in 2 of 3 live-suite
+runs of the commit. All three were races in the tests; no product code changed.
+
+| Test and CI symptom | Cause | Change |
+| --- | --- | --- |
+| `browser_runs_in_a_private_home` (run by `private_home_launch_preserves_display_auth_and_validates_cache_paths`): `XDG_CACHE_HOME` was `None` | `fs::read` of `/proc/<pid>/environ` takes several `read()` calls. Once the fake browser's shell execs `sleep`, the remaining ones return nothing, so a snapshot could hold the private `HOME` that ends the wait, without the variables sorted after it | One `read()` per snapshot |
+| `live_abandoned_touch_is_canceled_after_hide_dialog_and_navigation`: no report for gesture 1 | A press still on its way when hide stops page input is dropped together with its cancel (PR #24) | Hide once the page reports the press |
+| `live_nested_cross_site_file_choosers_and_downloads_belong_to_their_device`: no chooser in the inner frame | The click came once the nested cross-site iframe had run its scripts, but before the browser routed input to it, and reached the parent frame's `<iframe>` element | Move the mouse until the target frame reports it, then click once |
+
+Evidence, as `broxsertest` with the sandbox enabled:
+
+- Environment reads: a reproducer reading `never-ready`'s environment the way
+  `fs::read` does got 85 truncated snapshots out of 300 (`HOME` present, the
+  last variable missing), and 0 out of 300 with one `read()` per snapshot. The
+  test itself did not fail here in 700 runs before the change.
+- Nested routing: one failing run, caught with `pointerdown` listeners in every
+  frame, showed device 1's click at (100, 80) in the outer frame on its
+  `IFRAME`, nothing in the inner frame and no `cancel=inner`: the CI pattern.
+  Clicking the inner iframe of all three devices right after `ready=inner`,
+  with four test processes on two CPUs, 11 of 96 clicks reached the wrong frame
+  (10 the outer, 1 the main frame); after moving the mouse first, 0 of 96.
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` on this commit | Passed in 59 s |
+| Live Helium suite (`--ignored`, four threads) on this commit | 54/54 in 83.8 s; the same patch in a scratch tree, 3 more runs of 54/54 |
+| Nested test, four processes on two CPUs | 32/32, and 64/64 with the same fix plus one log line |
+| `browser::` unit tests, 40 runs with eight threads | 40/40 |
+| The failing CI case run directly, 200 runs with 100 extra variables | 200/200 |
+
+The touch and nested tests now wait for the page before the hide or the click.
+They no longer cover a press still in flight at hide, or a click that arrives
+before the frame takes input: the browser drops the first and sends the second
+to the parent frame, and Broxser repeats neither. The fake-CDP test
+`hiding_cancels_touch_before_ignoring_input_and_show_does_not_replay_release`
+still checks that hide sends the cancel before it ignores input.
+
+### Capture cancellation during startup (CI on `e167e79`)
+
+The pull-request run of the commit above failed another unit test,
+`capture::tests::cancellation_during_startup_is_prompt_and_cleans_up`, with "no
+browser process was observed". The test cancelled 300 ms after the capture
+began. When the profile and its guardian (a re-executed test binary) take longer
+than that, the start stops before the browser exists; the cancellation is
+correct and prompt, but there is no browser whose cleanup the test can check.
+The test now cancels once the profile's lease names the browser, which the start
+records right after spawning it, and measures promptness from the cancellation
+rather than from the start of the capture.
+
+| Runs of this test | Before | After |
+| --- | --- | --- |
+| Unloaded | 40/40, four copies at once on one CPU | 30/30 |
+| One CPU, `nice 19` beside two busy loops | 18 of 20 failed as on CI | 20/20 |
+| One CPU, `nice 19` beside four busy loops | 10 of 10 failed as on CI | 9 of 10 |
+
+The failing run under the heaviest load returned `Cancelled` but took more than
+the 3 s bound after the cancellation (33 s in all). The endpoint wait checks for
+cancellation every 50 ms, so that time went to the browser and guardian cleanup,
+whose waits are bounded. With this change, `bash scripts/check.sh` passed in
+56 s and the live Helium suite passed 54/54 in 81.1 s.
+
+## PR #26 review corrections, 29 September 2026 (Linux X11)
+
+Review of `5c8ae74` found the SBOM `created` timestamp was local time labeled
+UTC (`%SZ` is seconds plus a literal `Z`, and git's `format-local` renders in
+the machine's timezone): on a non-UTC machine the document was SPDX-invalid and
+two `package.sh` runs of one commit in different timezones gave different
+archives. `created` now comes from the commit epoch in UTC. Also corrected:
+`cargo tree --prefix depth` concatenates depth and name, so a crate name
+starting with a digit misparsed (the split is now resolved against the known
+packages and the tree depth); `run()` hid cargo's stderr behind a traceback;
+the license-expression failure names where to fix the string; Python < 3.11
+gets a clear message instead of `ModuleNotFoundError` (README notes it).
+
+| Check | Result |
+| --- | --- |
+| `sbom.py --check` | "531 components (525 crates.io crates), 1388 relationships" — unchanged |
+| SBOM byte-equality across timezones | `TZ=Asia/Jakarta` and `TZ=UTC` runs of one commit: identical JSON; `created` = the commit's UTC time |
+| Archive equality across timezones | Two `package.sh` runs of commit `927fd41` (one `TZ=UTC`, one `TZ=Asia/Jakarta`): identical SHA-256 `627f03fc…53c462b` |
+| Digit-name parsing | Ad-hoc parse of a synthetic `cargo tree` with a `2d` crate at depths 1 and 2: correct package, edges and depth |
+| `bash scripts/check.sh` | Passed in 42 s |
+
+The packaged binaries, fetch script and smoke were not rebuilt or rerun: the
+correction touches only `sbom.py` output bytes and script diagnostics, and the
+archive layout is unchanged. The archive equality above re-exercised
+`package.sh` end to end, including the release build.
+
+## P3.1 release archive and SBOM, 27 September 2026 (cloud container)
+
+Same container. Decisions and open owner decisions:
+[ADR 0025](adr/0025-linux-release-archive-and-sbom.md).
+
+### Before the change
+
+- No release build, archive, SBOM, checksum of Broxser artifacts or signature;
+  CI builds nothing with `--release`. `NOTICE.md` called `Cargo.lock` an
+  inventory, not an SBOM. Helium is pinned by manifest and checksum and was
+  current: `git ls-remote --tags` of `imputnet/helium-linux` listed 0.18.1.1 as
+  the newest tag.
+- `cargo metadata --filter-platform x86_64-unknown-linux-gnu` resolves 549
+  crates.io crates; the per-binary `cargo tree -e normal` of `broxser-desktop`
+  and `broxser-cli` links 525: 24 crates, such as `wasm-bindgen`, `quinn` and
+  `zed-scap`, come only from features other workspace targets unify.
+
+### After the change
+
+- `python3 scripts/sbom.py --check`: "SBOM ok: 531 components (525 crates.io
+  crates), 1387 relationships", in about 5 s; the component set equals the
+  per-binary `cargo tree` set exactly. Components: 525 crates with SHA-256 and
+  purl, GPUI vendored, four Broxser crates without license (none chosen), and
+  Helium 0.18.1.1 as the engine's runtime dependency with its pinned URL and
+  SHA-256.
+- `bash scripts/package.sh` after the release build (2 m 49 s) took 17 s and
+  wrote `broxser-0.1.0-linux-x86_64.tar.xz` (6.2 MB) with `bin/broxser-desktop`
+  (23.6 MB), `bin/broxser` (2.2 MB), the notices, `sbom.spdx.json` (644 KB),
+  `THIRD-PARTY.md`, the Helium manifest and fetch script, `COMMIT` and
+  `SHA256SUMS`, owned by 0/0 with the commit's time. A second run gave the same
+  SHA-256 (`0409ad40…025e0af`).
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| Archive reproducibility | Two builds of one commit's binaries: identical SHA-256 |
+| Archive as the unprivileged user | `sha256sum -c` of the `.sha256`: OK; unpacked; `sha256sum -c SHA256SUMS`: all files OK; `bin/broxser --version`: `broxser 0.1.0` |
+| Packaged `scripts/fetch-helium.sh` | Downloaded and verified Helium 0.18.1.1 into the unpacked folder in 10 s; run as root here because the unprivileged user cannot read this container's proxy CA bundle, then handed to that user |
+| Packaged CLI | `doctor` found the fetched browser; `validate` accepted the example workspace |
+| Full `scripts/desktop-smoke.sh` with the packaged release desktop and the packaged Helium | 15 of 15 scenarios passed in 1 m 23 s; the Restart-then-Ctrl+Q run started one browser, within ADR 0009's limit of one, where the debug build had started none |
+| `bash scripts/check.sh` with the SBOM check | Passed in 51 s: the SBOM check, fmt, `cargo test --locked` (1 CLI, 2 + 10 core, 107 engine, 41 desktop), strict Clippy for the workspace and the desktop crate |
+| Rerun after the cherry-pick onto `main` (`3c01ad5`, PR #25 merged with the owner's corrections `1040bcb`; one conflict in this file, both sections kept) | `check.sh` passed in 278 s: the SBOM check ("531 components (525 crates.io crates), 1388 relationships", one relationship more than at the first run), fmt, 1 CLI, 17 core, 159 engine and 50 desktop tests, strict Clippy. Two archive builds of one commit gave one SHA-256. As the unprivileged user: the `.sha256` and `SHA256SUMS` checked OK, `bin/broxser --version` printed `broxser 0.1.0`, the packaged fetch script (run as root, as above) prepared Helium 0.18.1.1 in 10 s, `doctor` found it and `validate` accepted the example workspace. The full smoke with the packaged release desktop and Helium passed 18 of 18 in 1 m 45 s |
+
+### Limits
+
+- Unsigned: the `.sha256` protects integrity only when it comes through a
+  trusted channel.
+- The binaries are reproducible only with the same toolchain, dependencies and
+  build path; only the archive around them is deterministic.
+- System libraries (X11/Wayland, Vulkan, fonts) are not bundled; no
+  distribution other than this container was tried.
+- No Helium update or rollback was qualified: the pinned engine is the newest,
+  and the qualification script is the next part.
+
 ## PR #25 review corrections, 28 September 2026 (Linux X11)
 
 Review of `424fd6e` found and corrected the following export problems:

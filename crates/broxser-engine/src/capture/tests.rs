@@ -80,11 +80,19 @@ fn cancellation_during_startup_is_prompt_and_cleans_up() {
     let output = tempfile::tempdir().unwrap();
     let options = options(fake_browser(FakeBrowser::NeverReady), root.path());
     let cancel = options.cancel.clone();
+    let profiles = root.path().to_owned();
     let canceller = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(300));
+        // Cancel while the capture waits for the endpoint, once the lease names
+        // the browser. Earlier, cancellation stops the start before there is a
+        // browser to clean up; on a loaded runner the profile and its guardian
+        // alone can take longer than a fixed delay.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !browser_recorded(&profiles) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         cancel.cancel();
+        Instant::now()
     });
-    let started = Instant::now();
     let outcome = run(
         &Workspace::demo(),
         &options,
@@ -94,10 +102,22 @@ fn cancellation_during_startup_is_prompt_and_cleans_up() {
             ..fast_limits()
         }),
     );
-    canceller.join().unwrap();
+    let cancelled = canceller.join().unwrap();
     assert!(outcome.result.as_ref().unwrap_err().is::<Cancelled>());
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(cancelled.elapsed() < Duration::from_secs(3));
     assert_cleaned_up(root.path(), &outcome.diagnostics.processes);
+}
+
+/// Whether a profile in `root` has a lease that names its browser. The start
+/// records the browser there right after spawning it.
+fn browser_recorded(root: &Path) -> bool {
+    fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            crate::profile::Lease::read(&entry.path()).is_ok_and(|lease| lease.browser.is_some())
+        })
 }
 
 #[test]
