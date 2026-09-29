@@ -3,6 +3,30 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## Graphite & Signal desktop redesign, 29 September 2026 (cloud container)
+
+ADR 0027 restyles both desktop views: new palette, bundled Geist fonts,
+embedded icons, the Workspace and Console panel right of the canvas, errors
+wrapping up to three lines, pluralized card counts, and popup reports held to
+360 px with their buttons on the left. No engine, core, CLI or workspace-format
+code changed, so the live Helium suite was not rerun. Checked on Xvfb 1600 ×
+1100 with Mesa Lavapipe, Helium 0.18.1.1 from `scripts/fetch-helium.sh`, as
+an ordinary user.
+
+| Check | Result |
+| --- | --- |
+| `bash scripts/check.sh` | Passed: format, SBOM (532 components, Geist listed as `geist-font` OFL-1.1 and checksum-verified), 8 script tests, workspace tests (engine 159 passed, 54 ignored as usual), strict Clippy for the workspace and the desktop, 53 desktop tests |
+| `scripts/desktop-smoke.sh`, debug build, with regions and colors updated for the new layout | Passed all 18 runs, from live close through the redacted report; no browser process or profile left, and the known preview directory after SIGTERM |
+| Real window screenshots at 1360 × 861 | Live canvas, Console panel on `console.html` (two errors and one warning per device, as the fixture logs), Workspace panel, confirm dialog, closed popup, refused download, stopped runtime with Restart runtime, and static previews all matched the design canvas |
+| `docs/images/live-x11.png` | Retaken at 1500 × 901 and 38%: with sync on, the phone followed "Page 2" and scroll, the tablet in the same session followed, the desktop in `admin` did not |
+
+Found and fixed during the check: in this GPUI and Taffy, a flex row whose
+child has an automatic left margin (`ml_auto`) laid its children out without
+their gaps; the redesign uses a growing right-aligned wrapper instead.
+
+Not covered: Wayland, a physical GPU, fractional scaling, the Fcitx5 IME
+smoke (not installed here) and screen readers.
+
 ## Owner decisions for ADRs 0021, 0025 and 0026, 29 September 2026 (cloud container)
 
 The owner delegated the open decisions of ADR 0021 (persistent sessions), ADR

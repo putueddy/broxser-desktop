@@ -37,6 +37,7 @@ install -m 0644 README.md NOTICE.md SECURITY.md "$root/"
 install -m 0644 runtime/helium-linux-x86_64.json "$root/runtime/"
 install -m 0755 scripts/fetch-helium.sh "$root/scripts/"
 install -m 0644 vendor/gpui-0.2.2/LICENSE-APACHE "$root/licenses/gpui-LICENSE-APACHE"
+install -m 0644 crates/broxser-desktop/fonts/OFL.txt "$root/licenses/geist-OFL.txt"
 python3 scripts/sbom.py --output "$root/sbom.spdx.json" --summary "$root/THIRD-PARTY.md"
 printf '%s\n' "$commit" > "$root/COMMIT"
 (cd "$root" && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS)

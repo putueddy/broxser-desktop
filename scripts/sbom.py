@@ -5,8 +5,9 @@ Writes an SPDX 2.3 JSON document for the shipped binaries `broxser-desktop`
 and `broxser`: every crate they link on x86_64-unknown-linux-gnu (normal
 dependencies only; build tools are not shipped), with its version, declared
 license, crates.io download location and the SHA-256 that Cargo.lock pins,
-the vendored GPUI, and Helium as a runtime dependency that is fetched and
-verified separately and not contained in the package. Output is deterministic
+the vendored GPUI, the Geist fonts compiled into the desktop (their pinned
+checksums are verified; ADR 0027), and Helium as a runtime dependency that is
+fetched and verified separately and not contained in the package. Output is deterministic
 for a commit: packages are sorted and the creation time is the commit's, in
 UTC regardless of the machine's timezone. Requires Python 3.11+ (tomllib).
 
@@ -16,6 +17,7 @@ UTC regardless of the machine's timezone. Requires Python 3.11+ (tomllib).
 
 import argparse
 import collections
+import hashlib
 import json
 import re
 import subprocess
@@ -30,6 +32,7 @@ import tomllib  # noqa: E402  (import guarded by the version check above)
 TARGET = "x86_64-unknown-linux-gnu"
 ROOTS = ("broxser-desktop", "broxser-cli")
 ROOT = Path(__file__).resolve().parent.parent
+FONTS = ROOT / "crates" / "broxser-desktop" / "fonts"
 
 
 def run(*command):
@@ -187,6 +190,29 @@ def build_document():
         ),
     })
 
+    fonts = json.loads((FONTS / "fonts.json").read_text())
+    for file, digest in fonts["files"].items():
+        actual = hashlib.sha256((FONTS / file).read_bytes()).hexdigest()
+        if actual != digest:
+            raise SystemExit(f"{FONTS / file}: SHA-256 {actual}, fonts.json pins {digest}")
+    fonts_id = spdx_id("font", fonts["name"], fonts["commit"][:12])
+    spdx_packages.append({
+        "SPDXID": fonts_id,
+        "name": fonts["name"],
+        "versionInfo": f"git-{fonts['commit'][:12]}",
+        "downloadLocation": f"git+{fonts['source']}@{fonts['commit']}",
+        "filesAnalyzed": False,
+        "licenseConcluded": "NOASSERTION",
+        "licenseDeclared": fonts["license"],
+        "copyrightText": fonts["copyright"],
+        "supplier": "NOASSERTION",
+        "comment": (
+            f"{fonts['versions']}. Compiled into broxser-desktop: "
+            + "; ".join(f"{file} (SHA-256 {digest})" for file, digest in sorted(fonts["files"].items()))
+            + ". License text: licenses/geist-OFL.txt in the release archive."
+        ),
+    })
+
     relationships = [
         {"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": ids[root]}
         for root in sorted(roots, key=lambda pid: packages[pid]["name"])
@@ -195,6 +221,13 @@ def build_document():
         {"spdxElementId": ids[a], "relationshipType": "DEPENDS_ON", "relatedSpdxElement": ids[b]}
         for a, b in sorted(edges, key=lambda edge: (ids[edge[0]], ids[edge[1]]))
     ]
+    desktop = next(pid for pid in packages if packages[pid]["name"] == "broxser-desktop")
+    relationships.append({
+        "spdxElementId": ids[desktop],
+        "relationshipType": "CONTAINS",
+        "relatedSpdxElement": fonts_id,
+        "comment": "The font files are embedded in the binary.",
+    })
     engine = next(pid for pid in packages if packages[pid]["name"] == "broxser-engine")
     relationships.append({
         "spdxElementId": ids[engine],

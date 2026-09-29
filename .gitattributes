@@ -3,3 +3,5 @@
 vendor/gpui-0.2.2/** -text linguist-vendored
 # These original shader indents contain a space before a tab; retain them intact.
 vendor/gpui-0.2.2/src/platform/mac/shaders.metal whitespace=-space-before-tab
+# Bundled fonts (ADR 0027): exact upstream bytes, pinned in fonts.json.
+crates/broxser-desktop/fonts/*.ttf binary

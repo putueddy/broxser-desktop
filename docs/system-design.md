@@ -284,6 +284,12 @@ sebelum mencari indeks device yang mungkin sudah dihapus oleh Apply. Input yang
 tiba sebelum redraw sesudah Apply masih memakai listener frame lama; handler
 pointer, wheel dan Hide mengabaikan indeks yang sudah hilang, dan Dismiss hanya
 berlaku untuk laporan yang masih tampil.
+Tampilan shell mengikuti sistem visual Graphite & Signal (ADR 0027): palet
+grafit dengan satu aksen lime, font Geist yang dibundel (OFL-1.1), satu isian
+solid per jenis aksi agar pemeriksaan window nyata tetap menemukan tombol dari
+warnanya, panel Workspace/Console di kanan canvas sehingga kartu tidak bergeser,
+dan setiap laporan di kartu (dialog, popup, download) paling lebar 360 piksel
+dengan tombol di kiri.
 Worker live menyimpan console setiap device di memori (ADR 0023): panggilan
 console dan exception dari `Runtime` serta entri `Log` (request gagal, pesan browser)
 milik session halaman dan session iframe lintas situsnya, yang kini mengaktifkan

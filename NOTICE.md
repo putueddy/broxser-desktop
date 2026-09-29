@@ -10,6 +10,11 @@ go only to the company's pilot users.
 - GPUI 0.2.2: Apache-2.0, as declared by the published crate. Its verified source
   and license are retained in `vendor/gpui-0.2.2`, with Broxser's patches
   described in `BROXSER-PATCH.md` (ADRs 0011 and 0012).
+- Geist and Geist Mono fonts: SIL Open Font License 1.1, Copyright 2024 The
+  Geist Project Authors. Five static faces from `vercel/geist-font` are
+  compiled into `broxser-desktop` (ADR 0027); their license, source commit and
+  checksums are in `crates/broxser-desktop/fonts/`, and release archives carry
+  the license as `licenses/geist-OFL.txt`.
 - Helium: its original code and patches use GPL-3.0; imported Chromium and other
   upstream components retain their respective licenses. The engine is obtained
   separately from the official release, is not vendored, and is not included in Git.

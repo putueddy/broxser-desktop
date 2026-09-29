@@ -1,7 +1,11 @@
 //! Static capture mode: fresh browser sessions per capture and PNG previews.
 //! Kept as the fallback while live frames are qualified on real desktops.
 
-use crate::{ACCENT, BG, BORDER, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT};
+use crate::theme::{
+    self, ACCENT, BORDER, BORDER_STRONG, CANVAS, CARD, CHROME, DIVIDER, INFO, INK, Icon, MUTED,
+    TEXT, TEXT_2, Tone,
+};
+use crate::{Quit, Refresh};
 use broxser_core::{Device, Workspace};
 use broxser_engine::{BrowserOptions, Cancellation, Cancelled, CaptureReport, capture_workspace};
 use gpui::{
@@ -149,80 +153,154 @@ impl StaticView {
             .workspace
             .sessions
             .iter()
-            .map(|session| {
-                let devices = self
+            .enumerate()
+            .map(|(session_index, session)| {
+                let hue = theme::session_hue(session_index);
+                let devices: Vec<_> = self
                     .workspace
                     .devices
                     .iter()
-                    .filter(|device| device.session == session.id);
-                let count = devices.clone().count();
+                    .filter(|device| device.session == session.id)
+                    .collect();
+                let initial: String = session
+                    .name
+                    .chars()
+                    .next()
+                    .map(|first| first.to_uppercase().collect())
+                    .unwrap_or_default();
                 div()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .mb_6()
+                    .gap(px(2.))
                     .child(
                         div()
+                            .h(px(24.))
+                            .pb(px(6.))
+                            .px(px(6.))
                             .flex()
-                            .justify_between()
-                            .text_sm()
-                            .child(session.name.clone())
-                            .child(count.to_string()),
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .size(px(18.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.))
+                                    .bg(theme::tint(hue, 0x29))
+                                    .text_size(px(10.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(hue))
+                                    .child(initial),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(session.name.clone()),
+                            )
+                            .child(
+                                theme::mono(devices.len().to_string(), 11., MUTED)
+                                    .flex_1()
+                                    .flex()
+                                    .justify_end(),
+                            ),
                     )
-                    .children(devices.map(|device| {
+                    .children(devices.into_iter().map(|device| {
                         div()
-                            .pl_3()
-                            .py_1()
-                            .border_l_2()
-                            .border_color(rgb(ACCENT))
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(device.name.clone())
+                            .h(px(34.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .gap(px(9.))
+                            .text_color(rgb(0xd7dbe0))
+                            .child(theme::icon(
+                                theme::device_icon(device.width, device.mobile),
+                                15.,
+                                0xa4abb5,
+                            ))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(device.name.clone()),
+                            )
+                            .child(
+                                theme::mono(
+                                    format!("{}×{}", device.width, device.height),
+                                    11.,
+                                    MUTED,
+                                )
+                                .flex_1()
+                                .flex()
+                                .justify_end(),
+                            )
                     }))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
         div()
-            .w(px(230.))
+            .w(px(256.))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(SURFACE))
+            .bg(rgb(CHROME))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .p_5()
             .child(
                 div()
-                    .mb_5()
-                    .text_xs()
-                    .text_color(rgb(ACCENT))
-                    .child("WORKSPACE"),
+                    .h(px(80.))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(6.))
+                    .px(px(16.))
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
+                    .child(theme::caps("WORKSPACE", ACCENT))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(self.workspace.name.clone()),
+                    ),
             )
             .child(
                 div()
-                    .mb_8()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(self.workspace.name.clone()),
-            )
-            .child(
-                div()
-                    .mb_4()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("SESSIONS · EPHEMERAL"),
-            )
-            .children(sections)
-            .child(
-                div()
-                    .mt_auto()
-                    .pt_4()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("Broxser · preview workspace"),
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .px(px(10.))
+                    .py(px(16.))
+                    .child(
+                        div()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px(px(6.))
+                            .child(theme::caps("SESSIONS", MUTED))
+                            .child(
+                                div()
+                                    .h(px(20.))
+                                    .px(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(rgb(BORDER_STRONG))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(0xa4abb5))
+                                    .child("Fresh per capture"),
+                            ),
+                    )
+                    .children(sections),
             )
     }
 
@@ -246,11 +324,21 @@ impl StaticView {
                 .w(px(width))
                 .h(px(height))
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .bg(rgb(BG))
-                .text_sm()
+                .gap(px(8.))
+                .bg(rgb(CANVAS))
                 .text_color(rgb(MUTED))
+                .child(theme::icon(
+                    if self.in_flight {
+                        Icon::Loading
+                    } else {
+                        Icon::Static
+                    },
+                    18.,
+                    MUTED,
+                ))
                 .child(if self.in_flight {
                     "Capturing…"
                 } else {
@@ -258,47 +346,71 @@ impl StaticView {
                 })
                 .into_any_element()
         };
+        let session = self
+            .workspace
+            .sessions
+            .iter()
+            .position(|session| session.id == device.session);
         div()
-            .w(px(width + 24.))
+            .w(px(width + 26.))
             .flex_none()
             .flex()
             .flex_col()
-            .rounded_lg()
+            .gap(px(12.))
+            .p(px(12.))
+            .rounded(px(14.))
             .border_1()
             .border_color(rgb(BORDER))
-            .bg(rgb(RAISED))
-            .p_3()
+            .bg(rgb(CARD))
+            .shadow(theme::card_shadow(false))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .mb_3()
+                    .gap(px(5.))
                     .child(
                         div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(device.name.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .child(theme::icon(
+                                theme::device_icon(device.width, device.mobile),
+                                14.,
+                                TEXT_2,
+                            ))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(device.name.clone()),
+                            )
+                            .children(session.map(|session| {
+                                div().flex_1().flex().justify_end().child(theme::tag(
+                                    self.workspace.sessions[session].name.clone(),
+                                    theme::session_hue(session),
+                                ))
+                            })),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{} × {} viewport", device.width, device.height)),
-                    ),
+                    .child(theme::mono(
+                        format!(
+                            "{} × {} · {}× · {}",
+                            device.width,
+                            device.height,
+                            device.device_scale_factor,
+                            if device.mobile { "mobile" } else { "desktop" }
+                        ),
+                        11.,
+                        MUTED,
+                    )),
             )
-            .child(div().overflow_hidden().rounded_sm().child(image))
             .child(
                 div()
-                    .flex()
-                    .justify_between()
-                    .mt_3()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(format!(
-                        "{} · {}×",
-                        device.session, device.device_scale_factor
-                    ))
-                    .child(if device.mobile { "Mobile" } else { "Desktop" }),
+                    .overflow_hidden()
+                    .rounded(px(8.))
+                    .shadow(theme::frame_shadow())
+                    .child(image),
             )
     }
 }
@@ -321,7 +433,30 @@ impl Render for StaticView {
             .iter()
             .map(|device| self.device_card(device).into_any_element())
             .collect::<Vec<_>>();
-        div().size_full().flex().flex_col().bg(rgb(BG)).text_color(rgb(TEXT)).font_family("sans-serif")
+        let chip = div()
+            .h(px(22.))
+            .px(px(9.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(0x2f343b))
+            .bg(rgb(0x1f2328))
+            .text_size(px(11.5))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(0xc9ced5))
+            .child(theme::icon(Icon::Static, 12., 0xc9ced5))
+            .child("Static previews");
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(CANVAS))
+            .text_color(rgb(TEXT))
+            .font_family(theme::SANS)
+            .text_size(px(13.))
             .track_focus(&self.focus)
             .on_action(cx.listener(|view, _: &Quit, window, cx| {
                 if view.request_close(cx) {
@@ -329,40 +464,150 @@ impl Render for StaticView {
                 }
             }))
             .on_action(cx.listener(|view, _: &Refresh, window, cx| view.capture(window, cx)))
-            .child(div().h(px(58.)).flex_none().flex().items_center().justify_between()
-                .px_5().border_b_1().border_color(rgb(BORDER))
-                .child(div().flex().items_center().gap_3()
-                    .child(div().size(px(11.)).rounded_full().bg(rgb(ACCENT)))
-                    .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("Broxser"))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child("STATIC PREVIEWS")))
-                .child(div().text_xs().text_color(rgb(MUTED)).child("Ctrl+R refresh · Ctrl+Q quit")))
-            .child(div().flex().flex_1().min_h_0()
-                .child(self.sidebar())
-                .child(div().flex_1().min_w_0().flex().flex_col()
-                    .child(div().flex().items_center().justify_between().gap_4().px_6().py_4()
-                        .border_b_1().border_color(rgb(BORDER))
-                        .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
-                            .child(div().text_xs().text_color(rgb(MUTED)).child("TARGET URL · FROM WORKSPACE"))
-                            .child(div().text_sm().text_ellipsis().child(self.workspace.url.clone())))
-                        .child(div().id("capture").cursor_pointer().rounded_md().bg(rgb(ACCENT))
-                            .px_4().py_2().text_sm().font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(BG)).child(if self.in_flight { "Capturing…" } else { "Capture previews" })
-                            .on_click(cx.listener(|view, _, window, cx| view.capture(window, cx)))))
-                    .child(div().flex().items_center().justify_between().px_6().py_4()
-                        .child(div().flex().flex_col().gap_1()
-                            .child(div().text_lg().font_weight(gpui::FontWeight::SEMIBOLD).child("Device canvas"))
-                            .child(div().text_xs().text_color(rgb(MUTED))
-                                .child("Screenshots are static; every capture starts fresh browser sessions.")))
-                        .child(div().flex().items_center().gap_2()
-                            .child(div().id("zoom-out").cursor_pointer().rounded_md().bg(rgb(RAISED))
-                                .px_3().py_1().child("−").on_click(cx.listener(|view, _, _, cx| view.zoom_by(-0.1, cx))))
-                            .child(div().w(px(44.)).text_center().text_sm().child(format!("{}%", (self.zoom * 100.).round() as u32)))
-                            .child(div().id("zoom-in").cursor_pointer().rounded_md().bg(rgb(RAISED))
-                                .px_3().py_1().child("+").on_click(cx.listener(|view, _, _, cx| view.zoom_by(0.1, cx))))))
-                    .child(div().id("canvas").flex_1().min_h_0().overflow_y_scroll().px_6().pb_6()
-                        .child(div().flex().flex_wrap().items_start().gap_5().children(cards)))
-                    .child(div().min_h(px(44.)).flex_none().flex().items_center().px_6()
-                        .border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
-                        .child(self.status.clone()))))
+            .child(
+                div()
+                    .h(px(52.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .pl(px(16.))
+                    .pr(px(14.))
+                    .bg(rgb(CHROME))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(theme::brand(chip))
+                    .child(theme::divider())
+                    // The target comes from the workspace; this mode has no URL bar.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(34.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .pl(px(11.))
+                            .pr(px(12.))
+                            .rounded(px(9.))
+                            .border_1()
+                            .border_dashed()
+                            .border_color(rgb(0x2f343b))
+                            .bg(rgb(theme::WELL))
+                            .child(theme::icon(Icon::Globe, 14., MUTED))
+                            .child(
+                                theme::mono(self.workspace.url.clone(), 12.5, TEXT)
+                                    .min_w_0()
+                                    .truncate(),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .justify_end()
+                                    .whitespace_nowrap()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(MUTED))
+                                    .child("Target from the workspace"),
+                            ),
+                    )
+                    .child(theme::stepper(
+                        format!("{}%", (self.zoom * 100.).round() as u32),
+                        div()
+                            .id("zoom-out")
+                            .on_click(cx.listener(|view, _, _, cx| view.zoom_by(-0.1, cx))),
+                        div()
+                            .id("zoom-in")
+                            .on_click(cx.listener(|view, _, _, cx| view.zoom_by(0.1, cx))),
+                    ))
+                    .child(theme::divider())
+                    .child(
+                        theme::button(
+                            "capture",
+                            if self.in_flight {
+                                Tone::Disabled
+                            } else {
+                                Tone::Primary
+                            },
+                            34.,
+                        )
+                        .rounded(px(9.))
+                        .text_size(px(13.))
+                        .child(theme::icon(
+                            Icon::Report,
+                            15.,
+                            if self.in_flight { MUTED } else { INK },
+                        ))
+                        .child(if self.in_flight {
+                            "Capturing…"
+                        } else {
+                            "Capture previews"
+                        })
+                        .on_click(cx.listener(|view, _, window, cx| view.capture(window, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.sidebar())
+                    .child(
+                        div()
+                            .id("canvas")
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(20.))
+                            .pt(px(22.))
+                            .px(px(24.))
+                            .pb(px(24.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child("Device canvas"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(TEXT_2))
+                                            .child("Screenshots are static; every capture starts fresh browser sessions."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_start()
+                                    .gap(px(20.))
+                                    .children(cards),
+                            ),
+                    ),
+            )
+            .child(
+                theme::status_bar()
+                    .child(theme::state(
+                        if self.in_flight { INFO } else { MUTED },
+                        self.status.clone(),
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .gap(px(16.))
+                            .pr(px(11.))
+                            .child(theme::shortcut(&["Ctrl", "R"], "Capture previews"))
+                            .child(theme::shortcut(&["Ctrl", "Q"], "Quit")),
+                    ),
+            )
     }
 }
