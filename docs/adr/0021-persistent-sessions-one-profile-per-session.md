@@ -1,10 +1,13 @@
 # ADR 0021 Persistent sessions: one on-disk browser profile per persistent session
 
-Status: proposed for P2.2, 2026-09-27. Not accepted: nothing here is implemented,
-and the default stays ephemeral until the gates below pass. Builds on ADR 0002
-(portable workspace), ADR 0003 (engine updates), ADR 0004 (blocker scope),
-ADR 0007 (profile ownership and cleanup), ADR 0019 (temporary discovery) and
-ADR 0020 (private home and profile-encryption backend).
+Status: proposed for P2.2, 2026-09-27; accepted on 2026-09-29, on the owner's
+delegation, with the product decisions below (see "Decisions, 2026-09-29").
+Nothing is implemented yet. Persistent sessions stay unavailable, and every
+session ephemeral, until each gate below has evidence; the stages that build
+them are separate changes. Builds on ADR 0002 (portable workspace), ADR 0003
+(engine updates), ADR 0004 (blocker scope), ADR 0007 (profile ownership and
+cleanup), ADR 0019 (temporary discovery) and ADR 0020 (private home and
+profile-encryption backend).
 
 ## Context
 
@@ -46,7 +49,7 @@ an isolation design choice, not a claim about every Chromium profile topology.
 | One on-disk profile per persistent session | The browser's own storage, isolation and deletion; one browser per persistent session; needs a clean shutdown path and a version binding |
 | One on-disk profile shared by a workspace's sessions | Sessions would share cookies: the isolation ADR 0002 promises is gone |
 
-## Proposed decision
+## Decision
 
 - A session can be marked persistent in the workspace: a flag, never a
   secret. The workspace JSON stays free of cookies, tokens and passwords, and
@@ -104,8 +107,8 @@ an isolation design choice, not a claim about every Chromium profile topology.
 - Secrets at rest are protected by the directory mode and the disk, not by a
   key: `--password-store=basic` (ADR 0020) is a fixed key, and a desktop
   keyring would require a separate Broxser secret-store design instead of
-  silently borrowing the personal Helium entry. This no-keyring proposal needs
-  explicit product/security acceptance for durable credentials; ADR 0020 only
+  silently borrowing the personal Helium entry. This no-keyring design is
+  accepted for durable credentials by decision 2 below; ADR 0020 only
   qualified the fixed-key choice for ephemeral profiles. Broxser would maintain
   no separate exported cookie store. Forget deletes the owned profile directory;
   it does not promise secure erasure or removal from captures, exports, backups,
@@ -114,11 +117,62 @@ an isolation design choice, not a claim about every Chromium profile topology.
 - Nothing is persisted by default; persistence and forgetting are explicit
   actions in the workspace UI.
 
-## Gates before acceptance
+## Decisions, 2026-09-29
 
-- Product: which machines may hold persistent sessions (disk encryption as a
-  condition?) and whether an application under test may keep a login on a
-  shared machine; acceptance of the proposed fixed-key storage and backup policy.
+The owner delegated the product gate. These decisions settle it; the other
+gates stay engineering acceptance criteria.
+
+1. **Where logins may be kept.** Persistent sessions are for a developer's own
+   account on their own machine, and they let an application under test keep
+   its login there. Broxser cannot tell whether a disk is encrypted or an
+   account shared, so it refuses nothing on a guess. Instead, the explicit
+   local opt-in states what is kept (the browser profile: cookies, site storage,
+   history and caches), where (`$XDG_DATA_HOME/broxser`, mode 0700), and how it
+   is protected: by the file permissions and the disk only, because the key is
+   fixed and anyone who can read those files can read the cookies. It
+   recommends full-disk encryption and advises against shared accounts.
+2. **Fixed-key storage is accepted for this use.** `--password-store=basic`
+   stays; there is no keyring item. A Broxser-owned secret store remains
+   possible later and would be its own decision. Broxser makes no backups of a
+   persistent profile. The one copy it makes is the protected copy before a
+   newer Helium first opens the profile (decision 5): kept beside the profile
+   under the same protection, and deleted once the newer Helium has closed the
+   profile cleanly. Forget deletes the profile directory and any such copy,
+   without promising secure erasure; backups the user makes are outside
+   Broxser's control and are named in the opt-in.
+3. **The binding is local and explicit.** Opting in records a binding in
+   Broxser's application state on that machine, never in the workspace file. A
+   copied, imported or moved workspace, or another workspace with the same
+   names and session IDs, never reaches an existing profile: it starts empty,
+   unless the user binds it to a profile chosen from the list of decision 4.
+4. **Retention.** A profile lives until the user forgets it. Profiles whose
+   binding is gone are listed for forgetting; nothing is deleted automatically,
+   and the list shows when each profile was last used.
+5. **Versions.** A profile last written by a newer Helium, or by another
+   product, is not opened: the session is unavailable until Helium is updated
+   or the user forgets the profile. A profile from an older Helium that was
+   qualified for Broxser opens after the protected copy of decision 2: that is
+   the upgrade Chromium supports, and the qualification of the newer Helium
+   (ADR 0026) checks it on a copy first. Security updates are never held back
+   for a profile (ADR 0003).
+6. **What survives a restart** is only what qualification shows. Cookies with
+   an expiry, localStorage and IndexedDB are the audit's candidates. Session
+   cookies survive only if `session.restore_on_startup` passes the no-replay
+   gate; otherwise the opt-in says that logins kept in session cookies end with
+   the browser.
+
+The gates below are built in stages, each a separate change with its own
+evidence: (1) the profile store, ownership, retention on every cleanup path,
+graceful close and Forget; (2) the default context's policies, the blocker and
+the no-replay qualification; (3) the runtime identity, the upgrade copy and an
+upgrade check in the Helium qualification; (4) the workspace flag with its
+migration, the opt-in, Forget and busy state in the UI; (5) resource and
+durability measurements. The UI offers persistence only after all five have
+evidence.
+
+## Gates before persistent sessions are available
+
+- Product: settled by the decisions of 2026-09-29 above.
 - Identity/ownership: stable local profile binding, no implicit credential reuse
   from an imported/copied workspace, two workspaces with identical names/session
   IDs still isolated, and one writer per profile. Refuse busy, foreign or invalid
@@ -143,7 +197,7 @@ an isolation design choice, not a claim about every Chromium profile topology.
   runtime identity, configuration and sanitized results before acceptance. The
   original uncommitted probe is an audit note, not a release qualification suite.
 
-## Consequences if accepted
+## Consequences
 
 - A persistent session costs a browser process tree, with disk usage driven by
   the site's storage, history and caches. Only the cookie/storage and policy

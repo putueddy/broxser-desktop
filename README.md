@@ -212,8 +212,11 @@ release, notices, SBOM SPDX (`sbom.spdx.json`), inventory lisensi
 bin/broxser-desktop`. Arsip deterministik untuk satu commit dan binary-nya;
 waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
 `scripts/sbom.py` memerlukan Python 3.11+ (`tomllib`) dan dijalankan
-`scripts/check.sh` serta CI. Format pengguna, signing, lisensi dan owner rilis
-masih keputusan pemilik (ADR 0025).
+`scripts/check.sh` serta CI. Keputusan 29 September (ADR 0025), belum
+diimplementasikan: kode Broxser tanpa lisensi (all rights reserved) dan arsip
+hanya untuk pilot perusahaan, dan tidak diberikan kepada siapa pun sebelum
+membawa teks lisensi setiap komponen; rilis berikutnya berupa draft GitHub
+release dengan attestation provenance dan `install.sh`.
 
 Update atau rollback Helium melewati kualifikasi (ADR 0026):
 
@@ -231,7 +234,9 @@ mengganti `runtime/helium-linux-x86_64.json` dengan ringkasan record di
 `docs/validation.md`; tanpa display verdict-nya `incomplete`. Rollback memakai
 jalur yang sama: rilis sebelumnya, 0.17.2.1, tidak lulus untuk commit ini.
 `fetch-helium.sh` tidak menghapus versi lain di `.local/helium`, jadi kembali
-ke versi sebelumnya cukup dengan rename.
+ke versi sebelumnya cukup dengan rename. Kualifikasi mingguan dan on-demand di
+GitHub Actions sudah diputuskan (ADR 0026) tetapi belum dibuat; sampai itu
+kualifikasi dijalankan manual seperti di atas.
 
 ## Verifikasi
 

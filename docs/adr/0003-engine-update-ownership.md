@@ -1,6 +1,10 @@
 # ADR 0003 Independent engine update lifecycle
 
-Status: proposed operating policy, 2026-09-24.
+Status: proposed operating policy, 2026-09-24; accepted on 2026-09-29, on the
+owner's delegation. The primary owner is the repository owner; a backup is not
+named yet ([ADR 0025](0025-linux-release-archive-and-sbom.md), decision 5). The
+weekly review and critical qualification run through the workflow of
+[ADR 0026](0026-helium-qualification-and-rollback.md), decision 2.
 
 A browser product remains useful for ten years only if someone maintains its engine.
 Exact versions and checksums reproduce a release; they are not a reason to freeze

@@ -375,10 +375,11 @@ masih ada. Tidak ada alamat halaman, cookie atau kredensial di state. Belum ada:
 edit nama/ukuran/session di panel, dialog buka file (portal desktop tidak
 tersedia di container), panel di mode statis.
 
-**Status P2.2 (27–28 September 2026, audit merged melalui PR #22; belum ada implementasi):** pengukuran
-ada di `docs/validation.md` (P2.2) dan usulannya di
-[ADR 0021](docs/adr/0021-persistent-sessions-one-profile-per-session.md)
-(proposed, belum diterima). Context CDP tidak punya opsi persisten; usulan adapter
+**Status P2.2 (27–29 September 2026, audit merged melalui PR #22; keputusan produk 29 September, PR menunggu review; belum ada implementasi):** pengukuran
+ada di `docs/validation.md` (P2.2) dan desainnya di
+[ADR 0021](docs/adr/0021-persistent-sessions-one-profile-per-session.md),
+diterima pada 29 September atas delegasi pemilik bersama keputusan produknya.
+Context CDP tidak punya opsi persisten; desain adapter
 ini memilih satu browser/default context dengan profil on-disk per session.
 Dalam fixture audit, cookie ber-expiry, localStorage dan IndexedDB bertahan
 setelah close bersih dan SIGKILL **setelah data sebelumnya sudah tersimpan**.
@@ -388,18 +389,30 @@ fixture `HttpOnly`, hanya teramati bertahan pada close bersih dengan
 `session.restore_on_startup = 1`. Preferensi itu belum boleh dijadikan seed
 tanpa membuktikan bahwa tab/navigasi lama tidak diputar ulang. Seed blocker
 ADR 0004 hanya mengatur incognito; default context memerlukan kualifikasi
-tersendiri. Cookie at rest memakai kunci tetap `--password-store=basic`, sehingga
-keputusan perlindungan kredensial persisten masih terbuka. Pada satu probe
-Chromium 141 atas profil Helium 154, query target tidak menjawab dalam 8 s;
+tersendiri. Cookie at rest memakai kunci tetap `--password-store=basic`. Pada
+satu probe Chromium 141 atas profil Helium 154, query target tidak menjawab dalam 8 s;
 itu bukan bukti umum kompatibilitas atau korupsi profil.
 Pekerjaan P2.2 dipecah: (a) UI kelola workspace, device
-dan preset serta restore konfigurasi tanpa kredensial, dapat berjalan lebih dulu;
-(b) persistent session sesuai ADR 0021 menunggu gate produk (mesin mana yang
-boleh menyimpan login), binding profil lokal dan satu pemilik, retensi pada
-semua jalur cleanup, durabilitas terukur, kompatibilitas runtime lengkap terhadap
-penulis profil terakhir, resource dan migrasi. Profil tidak kompatibel tidak
-boleh menahan update keamanan browser. Default tetap ephemeral; merge dokumen
-audit ini bukan penerimaan desain atau pengiriman persistent login.
+dan preset serta restore konfigurasi tanpa kredensial (P2.2a, sudah merged);
+(b) persistent session sesuai ADR 0021. Keputusan produk 29 September:
+persistent session hanya untuk akun developer sendiri di mesinnya sendiri;
+opt-in lokal yang eksplisit menyebut apa yang disimpan (profil browser), di mana
+(`$XDG_DATA_HOME/broxser`, mode 0700) dan bahwa perlindungannya hanya izin file
+dan disk (kunci tetap, tanpa keyring), serta menyarankan enkripsi disk penuh.
+Binding profil hanya ada di state aplikasi lokal, jadi workspace yang disalin,
+diimpor atau dipindah tidak pernah membuka profil yang sudah ada. Profil hidup
+sampai Forget; profil tanpa binding hanya didaftar, tidak dihapus otomatis.
+Profil dari Helium yang lebih baru atau produk lain tidak dibuka; profil dari
+Helium lama yang qualified dibuka sesudah salinan terlindung, dan update
+keamanan tidak pernah ditahan demi profil. Hanya state yang lolos kualifikasi
+yang dijanjikan bertahan; cookie session hanya bila `session.restore_on_startup`
+lolos gate no-replay. Implementasinya lima perubahan terpisah: (1) penyimpanan
+profil, ownership, retensi di semua jalur cleanup, close graceful dan Forget;
+(2) policy default context, blocker dan kualifikasi no-replay; (3) identitas
+runtime, salinan upgrade dan cek upgrade di kualifikasi Helium; (4) flag
+workspace dengan migrasi, opt-in, Forget dan status busy di UI; (5) pengukuran
+resource dan durabilitas. UI baru menawarkan persistensi sesudah kelimanya punya
+bukti; sampai itu default tetap ephemeral.
 
 **Status P2.3 (27–28 September 2026, dua bagian; merged melalui PR #24 dan PR #25):** keputusan ada
 di [ADR 0023](docs/adr/0023-device-console-in-memory.md) dan pengukuran di
@@ -443,7 +456,7 @@ satu, screenshot terikat revisi halaman sehingga hasil basi dibatalkan, redaksi
 juga mencakup alamat IPv6, host Unicode, bearer pendek dan JWT di path, metadata
 ditulis sebagai kode literal, dan PNG divalidasi utuh.
 
-**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua PR menunggu review):** audit dan
+**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik 29 September, PR menunggu review):** audit dan
 keputusan ada di [ADR 0025](docs/adr/0025-linux-release-archive-and-sbom.md) dan
 `docs/validation.md` (P3.1). Sebelumnya tidak ada build release, arsip, SBOM,
 checksum artefak Broxser atau signature; Helium sudah dipin dengan checksum dan
@@ -454,15 +467,15 @@ ikut dikemas) dan dicek di `check.sh` dan CI; `scripts/package.sh` membangun
 arsip `tar.xz` deterministik tanpa signature berisi binary release, notices,
 SBOM, inventory lisensi, manifest dan skrip unduh Helium serta `SHA256SUMS`.
 Arsip itu diverifikasi, dibongkar, mengunduh Helium sendiri dan lulus seluruh
-smoke di window X11 nyata (18/18 pada rerun terakhir). Menunggu pemilik: lisensi kode Broxser, identitas
-signing, kanal rilis, format pengguna (AppImage atau paket distro) dan owner
-utama serta cadangan. Koreksi review di PR #26: `created` SBOM kini waktu UTC
+smoke di window X11 nyata (18/18 pada rerun terakhir). Keputusan pemilik yang
+tertunda di bagian ini diambil pada 29 September (paragraf keputusan di bawah).
+Koreksi review di PR #26: `created` SBOM kini waktu UTC
 dari epoch commit (sebelumnya waktu lokal berlabel UTC), nama crate berawalan
 digit terurai benar, stderr cargo ditampilkan dan Python < 3.11 mendapat pesan
 jelas. PR #26 juga memperbaiki empat race di tes engine yang membuat CI merah,
 tanpa perubahan produk.
 
-Bagian kedua (28 September 2026, PR menunggu review;
+Bagian kedua (28 September 2026, merged melalui PR #27;
 [ADR 0026](docs/adr/0026-helium-qualification-and-rollback.md)): sebelumnya pin
 Helium hanya dicek dengan SHA-256 yang asal-usulnya tidak tercatat, kualifikasi
 versi lain manual tanpa catatan dan rollback belum pernah dicoba. Kini
@@ -478,9 +491,32 @@ rilis sebelumnya 0.17.2.1 (Chromium 153) *tidak lulus*: selama alert terbuka,
 device menghentikan seluruh runtime live (6 dari 6 run). Jadi target rollback
 untuk update berikutnya adalah pin sekarang; rollback engine saja ke 0.17.2.1
 akan membawa regresi itu. Pergantian pin bolak-balik di clone berjalan dalam 10
-detik dan kembali dengan rename. Menunggu pemilik: konfirmasi fingerprint lewat
-kanal kedua, jadwal dan pelaksana kualifikasi, tempat record dan wewenang pin
-Chromium lama.
+detik dan kembali dengan rename.
+
+Keputusan pemilik (29 September 2026, diambil atas delegasi pemilik, PR menunggu
+review; belum ada implementasi): menurut ADR 0025, kode Broxser tetap tanpa
+lisensi (all rights reserved; Apache-2.0 disarankan bila perusahaan membukanya)
+dan arsip hanya untuk pengguna pilot perusahaan. Review lisensi pihak ketiga
+menemukan bahwa arsip sekarang hanya membawa teks lisensi GPUI, dan bahwa GPUI
+mengompilasi protokol blur KDE yang deskripsinya LGPL-2.1-or-later, walau
+Broxser tidak memakainya. Karena itu arsip tidak diberikan kepada siapa pun
+sebelum membawa file lisensi dan notice setiap crate, dan sebelum patch GPUI
+keempat membuang protokol itu. Signing berupa attestation build provenance
+GitHub (Sigstore, tanpa kunci privat jangka panjang; dicek dengan
+`gh attestation verify`). Rilis berupa draft GitHub release dari tag
+`v<versi>`, yang hanya terlihat oleh pemegang akses tulis; arsip tidak pernah
+diunggah sebagai artefak workflow, yang di repo publik ini dapat diunduh siapa
+pun yang login. Format pengguna tetap arsip, ditambah `install.sh` per user
+tanpa root dan penemuan Helium di samping binary; AppImage, Flatpak dan paket
+distro tidak sekarang. Owner utama engine dan rilis adalah pemilik repo;
+cadangan harus ditunjuk perusahaan. Menurut ADR 0026, kunci Helium tetap:
+salinan di `keyserver.ubuntu.com` identik per paket OpenPGP, sedangkan
+`helium.computer` dan `keys.openpgp.org` ditolak kebijakan jaringan lingkungan
+ini. Rotasi kunci lewat satu PR yang di-review, dengan dua sumber, dan di-merge
+pemilik repo. Workflow GitHub Actions mingguan dan on-demand mengualifikasi pin
+dan rilis baru tanpa mengubah pin; record disimpan sebagai artefak workflow 90
+hari dan ringkasannya di `docs/validation.md`. Pin Helium yang lebih lama hanya
+dengan record `qualified`, bukti regresi dan batas paling lama 14 hari.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -575,10 +611,13 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   ADR 0019, merged melalui PR #20).
 - [ ] P2 — isolasi penyimpanan, persistent session, workspace UI dan debugging harian
   (P2.1 penyimpanan dan kredensial: ADR 0020, merged melalui PR #21; P2.2 persistent
-  session: audit dan ADR 0021 proposed, merged melalui PR #22; P2.2a panel workspace,
+  session: audit merged melalui PR #22, ADR 0021 diterima dengan keputusan produk
+  (PR menunggu review), implementasi lima tahap belum dimulai; P2.2a panel workspace,
   preset dan file state: ADR 0022, merged melalui PR #23; P2.3a console per device:
   ADR 0023, merged melalui PR #24; P2.3b laporan bug: ADR 0024, merged melalui PR #25).
 - [ ] P3 — packaging, update/rollback, ownership dan pilot perusahaan (P3.1 arsip
   rilis tanpa signature dan SBOM: ADR 0025, merged melalui PR #26; kualifikasi
-  update Helium dan latihan rollback: ADR 0026, PR menunggu review).
+  update Helium dan latihan rollback: ADR 0026, merged melalui PR #27; keputusan
+  lisensi, signing, kanal rilis, format, owner dan kualifikasi terjadwal: ADR
+  0025/0026, PR menunggu review; implementasinya menyusul).
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

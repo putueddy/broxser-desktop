@@ -1,12 +1,15 @@
 # Ownership and upstream components
 
-Broxser is an internal prototype. No public redistribution license for the new
-Broxser code has been selected; Cargo packages are not publishable. The company
-should choose its intended distribution policy before a public release.
+Broxser is an internal prototype. Its own code is licensed to no one: all rights
+are reserved. The repository being public on GitHub grants only what GitHub's
+terms allow on GitHub itself, and Cargo packages are not publishable. Choosing a
+license stays with the company that holds the rights; if it opens the code,
+Apache-2.0 is recommended (ADR 0025, decision 1). Until then, release archives
+go only to the company's pilot users.
 
 - GPUI 0.2.2: Apache-2.0, as declared by the published crate. Its verified source
-  and license are retained in `vendor/gpui-0.2.2`, with the native IME commit
-  patch described in `BROXSER-PATCH.md` and ADR 0011.
+  and license are retained in `vendor/gpui-0.2.2`, with Broxser's patches
+  described in `BROXSER-PATCH.md` (ADRs 0011 and 0012).
 - Helium: its original code and patches use GPL-3.0; imported Chromium and other
   upstream components retain their respective licenses. The engine is obtained
   separately from the official release, is not vendored, and is not included in Git.
@@ -14,8 +17,12 @@ should choose its intended distribution policy before a public release.
   unchanged from `imputnet/helium-linux` (`pubkey.asc`) to verify its signatures.
 - Rust transitive dependencies retain their own licenses. `scripts/sbom.py`
   writes an SPDX SBOM of the crates the Linux binaries link and a list by
-  declared license (`THIRD-PARTY.md` in the release archive, ADR 0025); it is an
-  inventory for the license owner's review, not a completed license audit.
+  declared license (`THIRD-PARTY.md` in the release archive, ADR 0025). The
+  technical review of 2026-09-29 (ADR 0025, decision 1; not legal advice) found
+  every shipped component redistributable in binary form once each archive
+  carries all their license and notice files and GPUI no longer compiles KDE's
+  blur protocol (LGPL-2.1-or-later). Neither is done yet, so no archive is given
+  to anyone before both land.
 - Sizzy is a functional reference. Its DMG, code, artwork, branding and license
   mechanism are not part of this repository.
 
