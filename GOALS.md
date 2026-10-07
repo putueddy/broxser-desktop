@@ -33,7 +33,7 @@ Baseline sesudah merge:
 
 | Bagian | Kondisi yang sudah berjalan |
 | --- | --- |
-| Dependency | GPUI 0.2.2, Helium Linux 0.18.1.1, tungstenite 0.30, base64 0.23.1 dalam lockfile, checkout 7.0.1 |
+| Dependency | GPUI 0.2.2, Helium Linux 0.18.3.1, tungstenite 0.30, base64 0.23.1 dalam lockfile, checkout 7.0.1 |
 | Domain | Workspace JSON v1 tervalidasi, atomic save, session/device IDs dan aturan sync |
 | Runtime | Satu Helium headless per workspace live, BrowserContext per session, profil privat, CDP lokal, queue dan frame berbatas |
 | Desktop | Frame live, URL input, Go, reload, pointer/wheel/keyboard, selection, hide/show, zoom dan status |
@@ -456,7 +456,7 @@ satu, screenshot terikat revisi halaman sehingga hasil basi dibatalkan, redaksi
 juga mencakup alamat IPv6, host Unicode, bearer pendek dan JWT di path, metadata
 ditulis sebagai kode literal, dan PNG divalidasi utuh.
 
-**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik merged melalui PR #28; workflow kualifikasi merged melalui PR #29; teks lisensi di arsip PR menunggu review):** audit dan
+**Status P3.1 (27–29 September 2026, dua bagian; bagian pertama merged melalui PR #26, bagian kedua merged melalui PR #27; keputusan pemilik merged melalui PR #28; workflow kualifikasi merged melalui PR #29; teks lisensi di arsip merged melalui PR #30; workflow rilis dan update Helium 0.18.3.1 PR menunggu review):** audit dan
 keputusan ada di [ADR 0025](docs/adr/0025-linux-release-archive-and-sbom.md) dan
 `docs/validation.md` (P3.1). Sebelumnya tidak ada build release, arsip, SBOM,
 checksum artefak Broxser atau signature; Helium sudah dipin dengan checksum dan
@@ -495,7 +495,7 @@ detik dan kembali dengan rename.
 
 Keputusan pemilik (29 September 2026, diambil atas delegasi pemilik, merged
 melalui PR #28; implementasi pertama, workflow kualifikasi, merged melalui PR #29;
-kedua, teks lisensi di arsip, PR menunggu review):
+kedua, teks lisensi di arsip, merged melalui PR #30; ketiga, workflow rilis, PR menunggu review):
 menurut ADR 0025, kode Broxser tetap tanpa
 lisensi (all rights reserved; Apache-2.0 disarankan bila perusahaan membukanya)
 dan arsip hanya untuk pengguna pilot perusahaan. Review lisensi pihak ketiga
@@ -535,7 +535,7 @@ pin. Uji lokal sebagai user biasa: pin qualified (54/54, smoke lulus) dalam
 sama, rilis terbaru adalah pin, pin qualified (live 54/54 dalam 93,3 s, smoke
 108,4 s).
 
-Teks lisensi di arsip (ADR 0025 keputusan 1, PR menunggu review): sebelumnya
+Teks lisensi di arsip (ADR 0025 keputusan 1, merged melalui PR #30): sebelumnya
 arsip mendaftar lisensi 525 crate tetapi hanya membawa teks lisensi GPUI, dan
 GPUI mengompilasi protokol blur KDE (LGPL-2.1-or-later) dari
 `wayland-protocols-plasma`. Kini `sbom.py --licenses` menulis
@@ -551,6 +551,39 @@ GPUI keempat membuang protokol blur KDE dan dependensinya (graph turun ke 524
 crate); file GPUI yang diubah kini menyatakannya (Apache-2.0 4(b)). Window
 Broxser tetap `Opaque`, jadi perilakunya tidak berubah; diverifikasi di window
 X11 (smoke) dan sebagai klien Wayland Weston.
+
+Workflow rilis (ADR 0025 keputusan 2 dan 3, PR menunggu review): sebelumnya
+arsip hanya dibangun manual dengan `package.sh`, tanpa signature dan tanpa
+kanal rilis. Kini `.github/workflows/release.yml` berjalan pada tag
+`v<versi>`: menolak commit di luar `main`, lalu `scripts/release-assets.sh`
+menolak tag yang bukan versi workspace, membangun arsip dua kali dan
+mensyaratkan SHA-256 yang sama, serta mengecek `.sha256`, `SHA256SUMS` dan
+`COMMIT`. Arsip lalu diberi attestation build provenance (`actions/attest`,
+Sigstore, tanpa kunci jangka panjang), dan arsip, `.sha256`, SBOM serta bundle
+attestation dilampirkan ke draft release yang tidak pernah dipublikasikan
+otomatis. PR yang mengubah jalur rilis menjalankan dry run tanpa attestation
+dan tanpa unggahan. Belum ada run pada tag: tag pertama pemilik yang
+menjalankannya.
+
+Update Helium 0.18.3.1 (ADR 0026, PR menunggu review): run terjadwal pertama
+workflow kualifikasi (Senin 5 Oktober) menemukan Helium 0.18.3.1 (Chromium
+154.0.8037.97, ditandatangani kunci rilis Helium 2 Oktober). Chromium itu
+membawa perbaikan keamanan dua update stable sejak pin (154.0.8037.92 dan .97:
+43 perbaikan, 2 critical dan 34 high). Run itu gagal dengan benar: pin 0.18.1.1
+qualified, tetapi 0.18.3.1 *tidak lulus* karena
+`live_script_and_stale_same_document_changes_never_sync` timeout menunggu route
+device yang disembunyikan. Akar masalahnya ada di tes, bukan produk: tes
+mengklik link lalu langsung menyembunyikan device, dan hide mengabaikan input
+halaman seketika (ADR 0006). Dengan Chromium baru, klik itu kadang masih dalam
+perjalanan; beacon dari handler klik membuktikan klik tidak pernah sampai pada
+6 dari 80 percobaan dengan empat run paralel (0 dari 80 pada 0.18.1.1). Tes kini
+menunggu halaman melihat klik, memastikan hide sudah berlaku dan router belum
+push, baru menunggu route; 60 dari 60 lulus untuk masing-masing versi. Dengan
+itu 0.18.3.1 qualified (live 54/54, smoke lulus), pin dipindah ke 0.18.3.1, dan
+0.18.1.1 tetap qualified sebagai target rollback. Target SECURITY.md (update
+kritis dikualifikasi dalam 72 jam setelah rilis upstream yang layak) terlewati:
+rilis 2 Oktober, qualified 7 Oktober, karena run mingguan baru menemukannya 5
+Oktober dan tidak ada yang memulai kualifikasi manual lebih awal.
 
 Pada P2, jangan sekadar mengekspor cookies menjadi JSON dan menamakannya persistent
 session. Jelaskan implikasi off-the-record BrowserContext, isolasi storage, migrasi,
@@ -654,6 +687,7 @@ simpan checkpoint yang dapat dilanjutkan, bukan klaim bahwa seluruh misi tuntas.
   update Helium dan latihan rollback: ADR 0026, merged melalui PR #27; keputusan
   lisensi, signing, kanal rilis, format, owner dan kualifikasi terjadwal: ADR
   0025/0026, merged melalui PR #28; workflow kualifikasi mingguan: merged melalui
-  PR #29; teks lisensi di arsip dan patch GPUI keempat: PR menunggu review;
-  workflow rilis dan installer menyusul).
+  PR #29; teks lisensi di arsip dan patch GPUI keempat: merged melalui PR #30;
+  workflow rilis draft dengan attestation dan update Helium 0.18.3.1: PR
+  menunggu review; installer menyusul).
 - [ ] Platform lanjutan setelah gate Linux terpenuhi.

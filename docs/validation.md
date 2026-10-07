@@ -3,6 +3,193 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #32 CI test isolation, 7 October 2026 (GitHub Actions)
+
+Two test synchronization issues surfaced after the Helium pin update. Neither
+correction changes production input dispatch, browser options or the test
+assertions.
+
+- The busy-iframe test waited for a script-ready beacon before clicking the
+  recovered cross-site frame. Script execution is not an input-routing barrier.
+  It now uses the existing harmless hover handshake for both recovered frames
+  and observes the first chooser's cancellation before clicking the second.
+  Commit `3c1973a` passed [push CI](https://github.com/putueddy/broxser-desktop/actions/runs/37645857248)
+  (54/54 live), [PR CI](https://github.com/putueddy/broxser-desktop/actions/runs/37645870767)
+  and [Helium qualification](https://github.com/putueddy/broxser-desktop/actions/runs/37645871081)
+  (54/54 live plus desktop smoke). The unchanged touch test passed on this run;
+  that alone did not establish its intermittent failure was fixed.
+- The original rapid touch sequence failed again under temporary input tracing
+  on `4e6921f`, before any added paced case ran:
+  [push CI, job 112888208681](https://github.com/putueddy/broxser-desktop/actions/runs/37649326819/job/112888208681).
+  Gesture 3 received pointerdown/touchstart/pointerup/touchend at (120, 220), but
+  no click within the existing 10-second bound. The trace showed a second fling
+  at velocity -17000 after the out-and-back moves arrived 14.205 ms apart.
+  The fresh tap canceled that fling and Chromium recorded
+  `FilterTapSuppression` after its down and up. Waiting longer cannot restore a
+  deliberately suppressed tap.
+
+Chromium handles flings before touch-action filtering, so the fixture's
+`touch-action:none` does not prevent this behavior. The test now sends harmless
+Shift down/up after each independently verified swipe and waits for that
+gesture's page-observed keyup. Keyboard input stops the fling before dispatch
+without resetting Broxser's touch ownership. This also prevents the first
+swipe's fling suppression from accidentally satisfying the second swipe's
+no-click assertion.
+
+The corrected instrumented candidate `4a12906` passed
+[PR CI](https://github.com/putueddy/broxser-desktop/actions/runs/37650463448):
+54/54 live tests, including 12 original rapid sequences and one paced sequence.
+Its trace recorded 28 fling records and **zero suppressed tap events**, with
+every no-click and fresh-click assertion intact. The final test removes all
+temporary tracing and repeated diagnostics, retaining one original rapid
+sequence and one sequence with 20 ms between pointer commands. That spacing
+creates gesture velocity deliberately; it is not a settling wait or retry.
+
+These checks ran with sandboxed Helium 0.18.3.1 in GitHub Actions. This repair
+environment had no Rust toolchain and could not launch a sandboxed browser,
+so it provides no additional local execution claim. The same missing-click
+symptom was recorded earlier on Helium 0.18.1.1 without these traces; this is
+not evidence of a new 0.18.3.1 product regression.
+
+Browser behavior was cross-checked against Chromium's
+[input router](https://github.com/chromium/chromium/blob/main/components/input/input_router_impl.cc),
+[fling controller](https://github.com/chromium/chromium/blob/main/components/input/fling_controller.cc)
+and [tap suppression controller](https://github.com/chromium/chromium/blob/main/components/input/tap_suppression_controller.cc).
+
+Local runs in the cloud container, added afterwards: unprivileged user, sandbox
+enabled, the test as four concurrent instances like the suite's four threads.
+The same sources at Chromium's tag 154.0.8037.97 agree with the above.
+
+| Check | Result |
+| --- | --- |
+| The original swipe test at `3c1973a` | Failed 12 of 40 with 0.18.3.1 and 6 of 40 with 0.18.1.1, each as on CI: the fresh tap reached the page without a click |
+| A probe, not kept: a flick (three moves 16 ms apart), then a tap at once | No click in 6 of 6 runs with 0.18.3.1 and 4 of 4 with 0.18.1.1. With 2.5 s before the tap, or 150 ms without movement before the release, every tap clicked |
+| The instrumented candidate `4a12906` | 40 of 40 with 0.18.3.1. With its trace printed, 40 of 40 with 0.18.1.1 and 12 of 12 with 0.18.3.1; every run recorded flings (1,264 and 368 records) and none a suppressed tap |
+| The final test at `ca3cc0f` | 40 of 40 with 0.18.3.1 and 40 of 40 with 0.18.1.1 |
+| `bash scripts/check.sh` at `ca3cc0f` | Passed in 50 s: the SBOM and license check, 24 script tests, fmt, 1 CLI, 17 core, 159 engine and 50 desktop tests (54 live tests ignored by default), strict Clippy |
+| Full live suite at `ca3cc0f` with the pinned 0.18.3.1, `--test-threads=4` | 54 of 54 in 107.8 s |
+
+## P3.1 Helium 0.18.3.1, 7 October 2026 (cloud container)
+
+ADR 0026. The first scheduled run of Qualify Helium
+([run 37297967268](https://github.com/putueddy/broxser-desktop/actions/runs/37297967268),
+Monday 5 October, 10:39 UTC, `main` `a29730a`) failed, as it should when a
+release does not qualify. The key equaled the published one; the newest
+release, 0.18.3.1, was newer than the pin; the pin 0.18.1.1 qualified (live
+suite 54 of 54 in 102.0 s, smoke 115.6 s). 0.18.3.1 (Chromium 154.0.8037.97),
+proposed from a download signed by Helium's release key on 2 October 23:34:14
+UTC (SHA-256 `89bd962c…63bf2`), did **not** qualify: live suite 53 passed and 1
+failed, `live_script_and_stale_same_document_changes_never_sync` ("timed out
+waiting for hidden route"); smoke passed (114.7 s).
+
+Upstream, Chromium 154.0.8037.97 follows the pin's 154.0.8037.57 after two
+stable updates (Chrome Releases, 29 September and 1 October): 43 security fixes,
+2 of them critical and 34 high; neither post mentions exploitation in the wild.
+
+### Root cause
+
+- The failing step loads `/spa-hidden` in every device, clicks the phone's link
+  (its handler cancels the navigation and pushes a route 700 ms later), hides the
+  phone at once and waits 10 s for the route. Hiding sends
+  `Input.setIgnoreInputEvents` right behind the click's mouse events, without
+  waiting for their acknowledgements: hide pauses page input (ADR 0006).
+- Alone, the test passed 5 of 5 with 0.18.3.1. As four concurrent instances, the
+  load the suite runs under (`--test-threads=4`), it failed 1 of 20, then 5 of
+  60 with a beacon in the click handler (instrumentation not kept), against 0 of
+  20 and 0 of 60 with 0.18.1.1. In every failure the beacon never arrived: the
+  click had not reached the page when the hide took effect, so the page never
+  scheduled its push. This Chromium delivers the click later, and the race in
+  the test shows.
+- The product behaves as designed: input around a hide is not promised, and
+  nothing is replayed (ADR 0006). The test assumed that the click lands.
+
+### Change
+
+- The page reports its click and its push. The test waits until the page saw
+  the click, hides the phone, waits until the hide took effect (no stream),
+  checks that the router has not pushed yet (its delay grows to 1.5 s), then
+  waits for the route. No product code changed.
+- The pin moves to 0.18.3.1: the manifest `propose` wrote, reviewed on 7
+  October. README, SECURITY, the system design and GOALS name it; 0.18.1.1 stays
+  the rollback target.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| The hidden-route test as four concurrent instances, unprivileged user | Before the change, 6 of 80 failed with 0.18.3.1 and 0 of 80 with 0.18.1.1. After it, 60 of 60 passed with each |
+| Full live suite against 0.18.3.1, `--test-threads=4` | 54 of 54, twice, 89 s each |
+| `qualify-helium.py run` for 0.18.3.1 at `cc18a8f` (the test fix on `main`) | **Qualified**: live suite 54 of 54 in 89.4 s, smoke passed in 115.9 s |
+| `qualify-helium.py run` for 0.18.1.1 at `cc18a8f` | **Qualified**: live suite 54 of 54 in 84.1 s, smoke passed in 107.9 s; the rollback target |
+| `qualify-helium.py verify` of the new pin | Signed by `BE677C19…D6378E` at 2026-10-02T23:34:14Z; SHA-256 matches |
+| `latest` and `check-key` | 0.18.3.1 is still the newest release; the pinned key equals the published one |
+| `fetch-helium.sh` with the new pin, unprivileged user | Prepared 0.18.3.1 in `.local/helium` after the 0.18.1.1 copy was moved aside to `.local/helium-0.18.1.1` |
+| `bash scripts/check.sh` on the pull request branch | Passed in 149 s: the SBOM and license check, 24 script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Live suite with the pinned browser on that branch | 54 of 54 in 104 s |
+| Full `scripts/desktop-smoke.sh` with the pinned browser (Xvfb 1600 × 1000) | 18 of 18 in 119 s; no browser process, profile or window left, and the known preview directory after SIGTERM |
+
+### Limits
+
+- SECURITY.md's target, critical updates qualified within 72 hours of a usable
+  upstream release, was missed: released 2 October, found by the weekly run on
+  5 October, qualified on 7 October. With a weekly schedule, a critical release
+  can wait up to a week unless someone starts the workflow by hand.
+- On its first launch in this container, one run with 0.18.1.1 timed out
+  starting its browsers ("pages", 30 s); 140 later launches did not.
+- `navigator.clipboard.readText()` was found denied on 0.18.1.1 (SECURITY.md)
+  and was not measured again on 0.18.3.1; the live permission tests pass.
+
+## P3.1 release workflow: draft releases with build provenance, 29 September 2026 (cloud container)
+
+ADR 0025, decisions 2 and 3. Same container; no Rust, engine or GUI code
+changed. The release job runs only for a tag, and a tag's run writes an
+attestation to Sigstore's public transparency log and a draft to this
+repository, so no tag was pushed: the job's steps ran here with a stand-in for
+the GitHub CLI, and pull requests run its build and checks as a dry run.
+
+### Before the change
+
+- Archives were built only by hand with `scripts/package.sh`: unsigned, with no
+  release channel and no attestation.
+
+### After the change
+
+- `.github/workflows/release.yml`. On a tag `v*`, the release job (contents,
+  OIDC token and attestations writable) refuses a commit that `main` does not
+  contain, runs `scripts/release-assets.sh "$TAG"`, attests the archive with
+  `actions/attest` v4.2.2 (`1e69f48…`) and creates the draft with
+  `gh release create --draft --verify-tag`. The dry-run job, read-only, runs on
+  pull requests that change the workflow, `package.sh`, `release-assets.sh`,
+  `sbom.py` or `scripts/licenses`.
+- `actions/attest-build-provenance` v4 is only a wrapper of `actions/attest`,
+  whose README asks new workflows to use it directly. Without a registry push
+  the action creates no storage record (its source), so `artifact-metadata`
+  is not granted.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `actionlint` 1.7.12 with ShellCheck 0.9.0 | No findings for `release.yml`, `ci.yml` and `qualify-helium.yml`; ShellCheck finds nothing in `release-assets.sh` |
+| `release-assets.sh` on `229cfb7`, as the dry run runs it | Exit 0 in 39 s, the release binaries already built: two archives with SHA-256 `c3499e98…6fe307`; the `.sha256`, `SHA256SUMS` (its 11 files and no others) and `COMMIT` checked; the SBOM and the release notes written beside the archive |
+| Refusals | The tags "", `0.1.0`, `V0.1.0`, `v0.1.0.1`, `v0.1.0-rc.1` and `v0.0.0` exit 1 before anything is built or written (script test); an existing `artifacts/release/v0.1.0` is refused |
+| The release job's shell steps, with a stand-in `gh` | "Release only reviewed code" exits 1 for a commit of this branch, which `main` does not contain, and 0 for `origin/main`. "Create the draft release" calls `gh release create v0.1.0 --draft --verify-tag --title 'Broxser 0.1.0' --notes-file artifacts/release/v0.1.0/release-notes.md` with the archive, its `.sha256`, `.sigstore.json` and `.spdx.json`, all present, and writes the run summary |
+| `python3 -m unittest discover -s scripts/tests` | 24 tests passed, 1 of them new |
+| `bash scripts/check.sh` | Passed in 45 s with this section: the SBOM and license check, the script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Live Helium suite, desktop smoke | Not rerun: nothing in the engine, the GUI or the archive's content changed |
+
+### Limits
+
+- The release job has not run. Attesting, creating the draft and uploading its
+  assets are first exercised by the owner's first tag; check that draft with
+  the commands in its notes before giving it to anyone.
+- The `gh attestation verify` command in the notes was checked against the
+  GitHub CLI manual, not run: the GitHub CLI is not installed here.
+- The workflow does not check CI: tag a commit of `main` whose CI passed.
+- The binaries are reproducible only with the same toolchain and build path, so
+  an archive built here differs from the runner's; the runner's two builds must
+  match each other.
+
 ## P3.1 license texts in the archive, GPUI without KDE's blur, 29 September 2026 (cloud container)
 
 ADR 0025, decision 1. Same container; the smoke, the Wayland check and the

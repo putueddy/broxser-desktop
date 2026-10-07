@@ -390,8 +390,8 @@ commit, tanpa Helium dan belum ber-signature. Update dan rollback Helium dikuali
 dengan `scripts/qualify-helium.py` (ADR 0026): pin baru hanya dari tarball yang
 ditandatangani kunci rilis Helium, lalu live suite dan smoke dijalankan terhadap
 browser kandidat di samping engine yang dipin dan hasilnya dicatat per pasangan
-commit Broxser dan versi Helium. Rollback memakai jalur yang sama; rilis
-sebelumnya (0.17.2.1) tidak lulus untuk commit ini. Workflow **Qualify Helium**
+commit Broxser dan versi Helium. Rollback memakai jalur yang sama; pin
+sebelumnya (0.18.1.1) lulus untuk commit ini, 0.17.2.1 tidak. Workflow **Qualify Helium**
 (ADR 0026) menjalankan kualifikasi itu setiap minggu, on demand dan pada PR yang
 mengubah pin: kunci dibandingkan dengan yang diterbitkan Helium, pin
 dikualifikasi ulang dan rilis yang lebih baru dikualifikasi, tanpa pernah
@@ -399,8 +399,11 @@ mengubah pin. Keputusan 29 September (ADR 0025): kode Broxser tanpa lisensi dan
 arsip hanya untuk pilot pengguna perusahaan. Syarat arsip itu sudah dipenuhi:
 setiap crate membawa teks lisensinya, dan GPUI tidak lagi meng-compile protokol
 blur KDE (LGPL-2.1-or-later); `sbom.py --check` di CI menolak dependency yang
-hanya menawarkan lisensi lain. Belum diimplementasikan: attestation provenance
-GitHub sebagai signing, draft GitHub release dan `install.sh` per user.
+hanya menawarkan lisensi lain. Workflow **Release** membangun arsip dari tag
+`v<versi>` pada commit `main`, membuat attestation build provenance GitHub
+(Sigstore, tanpa kunci jangka panjang) dan melampirkannya ke draft GitHub
+release yang tidak pernah dipublikasikan otomatis. Belum diimplementasikan:
+`install.sh` per user.
 
 ## 9. Operational readiness and ten year stewardship
 
@@ -519,7 +522,7 @@ dikunci di repo dan runtime manifest.
 - [Sizzy capabilities](https://sizzy.co/)
 - [GPUI introduction](https://gpui.rs/) dan [published 0.2.2](https://crates.io/crates/gpui/0.2.2)
 - [Helium source and license](https://github.com/imputnet/helium)
-- [Helium Linux baseline 0.18.1.1](https://github.com/imputnet/helium-linux/releases/tag/0.18.1.1)
+- [Helium Linux baseline 0.18.3.1](https://github.com/imputnet/helium-linux/releases/tag/0.18.3.1)
 - [Chrome headless](https://developer.chrome.com/docs/automation-and-testing/headless)
 - [Remote debugging and private profiles](https://developer.chrome.com/blog/remote-debugging-port)
 - [CDP Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), [CDP Page](https://chromedevtools.github.io/devtools-protocol/tot/Page/) dan [CDP Input](https://chromedevtools.github.io/devtools-protocol/tot/Input/)
