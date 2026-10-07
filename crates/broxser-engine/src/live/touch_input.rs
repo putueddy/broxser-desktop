@@ -733,7 +733,11 @@ fn start_touch_trace(live: &Live) -> Cdp {
         .filter(|name| name.starts_with("broxser-cdp-"))
         .collect();
     assert_eq!(profiles.len(), 1);
-    let endpoint_path = live.root.path().join(&profiles[0]).join("DevToolsActivePort");
+    let endpoint_path = live
+        .root
+        .path()
+        .join(&profiles[0])
+        .join("DevToolsActivePort");
     let endpoint = std::fs::read_to_string(endpoint_path).unwrap();
     let (port, path) = browser::parse_endpoint(&endpoint).unwrap();
     let mut probe = Cdp::connect(port, &path, Duration::from_secs(5), Cancellation::new()).unwrap();
