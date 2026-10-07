@@ -11,7 +11,8 @@ a tarball whose detached OpenPGP signature was made by Helium's release key
 `scripts/qualify-helium.py`), and CI rechecks the pinned tarball's signature on
 every run (ADR 0026). Users' fetch checks the SHA-256 only. Rolling back to an
 older Helium reintroduces the vulnerabilities fixed since and goes through the
-same qualification; the previous release, 0.17.2.1, did not qualify.
+same qualification; the previous pin, 0.18.1.1, qualifies for the current
+commit, and 0.17.2.1 does not.
 
 The browser subprocess keeps Chromium's sandbox enabled, uses a private temporary
 profile (mode 0700), and exposes CDP on a random loopback port. CDP can control every

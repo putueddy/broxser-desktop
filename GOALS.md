@@ -33,7 +33,7 @@ Baseline sesudah merge:
 
 | Bagian | Kondisi yang sudah berjalan |
 | --- | --- |
-| Dependency | GPUI 0.2.2, Helium Linux 0.18.1.1, tungstenite 0.30, base64 0.23.1 dalam lockfile, checkout 7.0.1 |
+| Dependency | GPUI 0.2.2, Helium Linux 0.18.3.1, tungstenite 0.30, base64 0.23.1 dalam lockfile, checkout 7.0.1 |
 | Domain | Workspace JSON v1 tervalidasi, atomic save, session/device IDs dan aturan sync |
 | Runtime | Satu Helium headless per workspace live, BrowserContext per session, profil privat, CDP lokal, queue dan frame berbatas |
 | Desktop | Frame live, URL input, Go, reload, pointer/wheel/keyboard, selection, hide/show, zoom dan status |

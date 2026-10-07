@@ -200,7 +200,7 @@ menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 GPUI dipin ke `0.2.2` dengan source dan patch Broxser (IME, atlas, tanpa
 protokol blur KDE) yang dicatat di
 [`vendor/gpui-0.2.2/BROXSER-PATCH.md`](vendor/gpui-0.2.2/BROXSER-PATCH.md);
-baseline Helium Linux adalah `0.18.1.1`. Pin berguna untuk
+baseline Helium Linux adalah `0.18.3.1`. Pin berguna untuk
 reproduksi, lalu harus diperbarui mengikuti security review. Binary tidak masuk Git.
 Tidak ada code, aset, atau file DMG Sizzy di repo.
 
@@ -243,7 +243,7 @@ attestation dan tanpa unggahan. `install.sh` belum diimplementasikan.
 Update atau rollback Helium melewati kualifikasi (ADR 0026):
 
 ```bash
-VERSION=0.18.1.1  # tag rilis imputnet/helium-linux
+VERSION=0.18.3.1  # tag rilis imputnet/helium-linux
 # Manifest kandidat hanya dari tarball yang ditandatangani kunci rilis Helium.
 python3 scripts/qualify-helium.py propose "$VERSION"
 # Sebagai user biasa dengan display X11: browser kandidat di
@@ -254,7 +254,8 @@ python3 scripts/qualify-helium.py run "artifacts/helium/helium-linux-x86_64-$VER
 Hanya verdict `qualified` yang dipromosikan, lewat commit yang di-review yang
 mengganti `runtime/helium-linux-x86_64.json` dengan ringkasan record di
 `docs/validation.md`; tanpa display verdict-nya `incomplete`. Rollback memakai
-jalur yang sama: rilis sebelumnya, 0.17.2.1, tidak lulus untuk commit ini.
+jalur yang sama: pin sebelumnya, 0.18.1.1, lulus untuk commit ini, sedangkan
+0.17.2.1 tidak.
 `fetch-helium.sh` tidak menghapus versi lain di `.local/helium`, jadi kembali
 ke versi sebelumnya cukup dengan rename. Workflow **Qualify Helium**
 (`.github/workflows/qualify-helium.yml`, ADR 0026) menjalankan
