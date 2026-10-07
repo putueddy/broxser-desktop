@@ -807,8 +807,8 @@ fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
     let live = live_touch_regression(&fixture, "/touch");
     let mut trace = start_touch_trace(&live);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for round in 0..12 {
-            eprintln!("TOUCH TRACE: original sequence round {round}");
+        for round in 0..13 {
+            eprintln!("TOUCH TRACE: sequence round {round}, paced={}", round == 12);
             for (index, release_x) in [300.0, 100.0].into_iter().enumerate() {
                 for command in [
                     pointer(PointerKind::Down, 100.0, 200.0),
@@ -817,6 +817,9 @@ fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
                     pointer(PointerKind::Up, release_x, 200.0),
                 ] {
                     live.send(command);
+                    if round == 12 {
+                        thread::sleep(Duration::from_millis(20));
+                    }
                 }
                 let report =
                     wait_regression_report(&fixture, "/touch", round * 3 + index as u32 + 1);
