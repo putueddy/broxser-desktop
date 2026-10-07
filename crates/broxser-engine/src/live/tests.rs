@@ -2933,7 +2933,7 @@ fn fixture() -> Fixture {
             ),
             "/spa-hidden" => link_page(
                 "'/spa-hidden-route'",
-                "a.addEventListener('click', e => { e.preventDefault(); setTimeout(() => history.pushState(null, '', a.href), 700); });",
+                "a.addEventListener('click', e => { e.preventDefault(); fetch('/event?hidden=click'); setTimeout(() => { fetch('/event?hidden=push'); history.pushState(null, '', a.href); }, 1500); });",
             ),
             // Not scrollable: a frame's fragment navigation would scroll it.
             "/frames" => PAGE.replace(
@@ -4717,13 +4717,30 @@ fn live_script_and_stale_same_document_changes_never_sync() {
     );
     assert_eq!(count(&fixture, "/spa-x"), 0);
 
-    // The router pushes after the phone was hidden.
+    // The router pushes after the phone was hidden. Hiding ignores page input
+    // at once (ADR 0006), so a click still in flight can be lost: the page must
+    // have seen it first.
     load_all(&live, &fixture, "/spa-hidden");
     click(&live, 0, 100.0, 120.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |fixture| count(
+            fixture,
+            "/event?hidden=click"
+        ) == 1),
+        "the click did not reach the page"
+    );
     live.send(Command::SetVisible {
         device: 0,
         visible: false,
     });
+    live.wait("phone hidden", Duration::from_secs(5), |s| {
+        !s.devices[0].streaming
+    });
+    assert_eq!(
+        count(&fixture, "/event?hidden=push"),
+        0,
+        "the router pushed before the phone was hidden"
+    );
     live.wait("hidden route", Duration::from_secs(10), |s| {
         s.devices[0].url == fixture.url("/spa-hidden-route")
     });
