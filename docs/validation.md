@@ -3,6 +3,59 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #32 CI test isolation, 7 October 2026 (GitHub Actions)
+
+Two test synchronization issues surfaced after the Helium pin update. Neither
+correction changes production input dispatch, browser options or the test
+assertions.
+
+- The busy-iframe test waited for a script-ready beacon before clicking the
+  recovered cross-site frame. Script execution is not an input-routing barrier.
+  It now uses the existing harmless hover handshake for both recovered frames
+  and observes the first chooser's cancellation before clicking the second.
+  Commit `3c1973a` passed [push CI](https://github.com/putueddy/broxser-desktop/actions/runs/37645857248)
+  (54/54 live), [PR CI](https://github.com/putueddy/broxser-desktop/actions/runs/37645870767)
+  and [Helium qualification](https://github.com/putueddy/broxser-desktop/actions/runs/37645871081)
+  (54/54 live plus desktop smoke). The unchanged touch test passed on this run;
+  that alone did not establish its intermittent failure was fixed.
+- The original rapid touch sequence failed again under temporary input tracing
+  on `4e6921f`, before any added paced case ran:
+  [push CI, job 112888208681](https://github.com/putueddy/broxser-desktop/actions/runs/37649326819/job/112888208681).
+  Gesture 3 received pointerdown/touchstart/pointerup/touchend at (120, 220), but
+  no click within the existing 10-second bound. The trace showed a second fling
+  at velocity -17000 after the out-and-back moves arrived 14.205 ms apart.
+  The fresh tap canceled that fling and Chromium recorded
+  `FilterTapSuppression` after its down and up. Waiting longer cannot restore a
+  deliberately suppressed tap.
+
+Chromium handles flings before touch-action filtering, so the fixture's
+`touch-action:none` does not prevent this behavior. The test now sends harmless
+Shift down/up after each independently verified swipe and waits for that
+gesture's page-observed keyup. Keyboard input stops the fling before dispatch
+without resetting Broxser's touch ownership. This also prevents the first
+swipe's fling suppression from accidentally satisfying the second swipe's
+no-click assertion.
+
+The corrected instrumented candidate `4a12906` passed
+[PR CI](https://github.com/putueddy/broxser-desktop/actions/runs/37650463448):
+54/54 live tests, including 12 original rapid sequences and one paced sequence.
+Its trace recorded 28 fling records and **zero suppressed tap events**, with
+every no-click and fresh-click assertion intact. The final test removes all
+temporary tracing and repeated diagnostics, retaining one original rapid
+sequence and one sequence with 20 ms between pointer commands. That spacing
+creates gesture velocity deliberately; it is not a settling wait or retry.
+
+These checks ran with sandboxed Helium 0.18.3.1 in GitHub Actions. This repair
+environment had no Rust toolchain and could not launch a sandboxed browser,
+so it provides no additional local execution claim. The same missing-click
+symptom was recorded earlier on Helium 0.18.1.1 without these traces; this is
+not evidence of a new 0.18.3.1 product regression.
+
+Browser behavior was cross-checked against Chromium's
+[input router](https://github.com/chromium/chromium/blob/main/components/input/input_router_impl.cc),
+[fling controller](https://github.com/chromium/chromium/blob/main/components/input/fling_controller.cc)
+and [tap suppression controller](https://github.com/chromium/chromium/blob/main/components/input/tap_suppression_controller.cc).
+
 ## P3.1 Helium 0.18.3.1, 7 October 2026 (cloud container)
 
 ADR 0026. The first scheduled run of Qualify Helium

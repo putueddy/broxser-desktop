@@ -715,96 +715,6 @@ fn live_touch_regression(fixture: &Fixture, path: &str) -> Live {
     live
 }
 
-// Temporary CI diagnostic: only attaches to this test's app-owned browser.
-// Keep the original gesture commands and assertions, and collect the browser's
-// own input trace even when an assertion panics. No event is retried.
-fn touch_trace_request(probe: &mut Cdp, method: &str, params: Value) -> Value {
-    let id = probe.send(method, params, None).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(response) = probe.take_response(id) {
-            return parse_response(response, method).unwrap();
-        }
-        assert!(
-            probe.read_until(deadline).unwrap(),
-            "trace {method} timed out"
-        );
-    }
-}
-
-fn start_touch_trace(live: &Live) -> Cdp {
-    let profiles: Vec<_> = fs_entries(live.root.path())
-        .into_iter()
-        .filter(|name| name.starts_with("broxser-cdp-"))
-        .collect();
-    assert_eq!(profiles.len(), 1);
-    let endpoint_path = live
-        .root
-        .path()
-        .join(&profiles[0])
-        .join("DevToolsActivePort");
-    let endpoint = std::fs::read_to_string(endpoint_path).unwrap();
-    let (port, path) = browser::parse_endpoint(&endpoint).unwrap();
-    let mut probe = Cdp::connect(port, &path, Duration::from_secs(5), Cancellation::new()).unwrap();
-    touch_trace_request(
-        &mut probe,
-        "Tracing.start",
-        json!({"categories":"input", "options":"record-until-full", "transferMode":"ReportEvents"}),
-    );
-    probe
-}
-
-fn finish_touch_trace(probe: &mut Cdp) {
-    touch_trace_request(probe, "Tracing.end", json!({}));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut recent = VecDeque::new();
-    let mut suppressed = 0;
-    let mut flings = 0;
-    loop {
-        while let Some(event) = probe.pop_event() {
-            if event.method == "Tracing.tracingComplete" {
-                eprintln!(
-                    "TOUCH TRACE: fling records={flings}, suppressed tap events={suppressed}"
-                );
-                for entry in recent {
-                    eprintln!("TOUCH TRACE: {entry}");
-                }
-                return;
-            }
-            if event.method != "Tracing.dataCollected" {
-                continue;
-            }
-            for entry in event.params["value"].as_array().unwrap() {
-                let name = entry["name"].as_str().unwrap_or_default();
-                if name == "FilterTapSuppression" {
-                    suppressed += 1;
-                }
-                if name == "FlingController::HandlingGestureFling" {
-                    flings += 1;
-                }
-                if matches!(
-                    name,
-                    "FilterTapSuppression"
-                        | "FlingController::HandlingGestureFling"
-                        | "GestureProvider::OnTouchEvent"
-                        | "NoActiveFling"
-                        | "FilteredForFling"
-                        | "FilteredForTouchAction"
-                ) {
-                    if recent.len() == 250 {
-                        recent.pop_front();
-                    }
-                    recent.push_back(entry.clone());
-                }
-            }
-        }
-        assert!(
-            probe.read_until(deadline).unwrap(),
-            "touch trace did not finish"
-        );
-    }
-}
-
 // Chromium handles flings before touch-action filtering, even on this page's
 // touch-action:none target. A new touch that stops a fling has its tap gestures
 // suppressed. Stop inertia between the independent cases, so suppression cannot
@@ -843,55 +753,47 @@ fn stop_regression_fling(live: &Live, fixture: &Fixture, path: &str, gesture: u3
 fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
     let fixture = regression_fixture();
     let live = live_touch_regression(&fixture, "/touch");
-    let mut trace = start_touch_trace(&live);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for round in 0..13 {
-            eprintln!(
-                "TOUCH TRACE: barrier sequence round {round}, paced={}",
-                round == 12
-            );
-            for (index, release_x) in [300.0, 100.0].into_iter().enumerate() {
-                for command in [
-                    pointer(PointerKind::Down, 100.0, 200.0),
-                    pointer(PointerKind::Move, 300.0, 200.0),
-                    pointer(PointerKind::Move, release_x, 200.0),
-                    pointer(PointerKind::Up, release_x, 200.0),
-                ] {
-                    live.send(command);
-                    if round == 12 {
-                        thread::sleep(Duration::from_millis(20));
-                    }
+    // Preserve the original immediate/coalesced input. The paced case also
+    // exercises nonzero fling velocity without relying on scheduling jitter;
+    // this spacing is gesture input, not a wait for the browser to settle.
+    for (round, paced) in [false, true].into_iter().enumerate() {
+        let first_gesture = round as u32 * 3 + 1;
+        for (index, release_x) in [300.0, 100.0].into_iter().enumerate() {
+            for command in [
+                pointer(PointerKind::Down, 100.0, 200.0),
+                pointer(PointerKind::Move, 300.0, 200.0),
+                pointer(PointerKind::Move, release_x, 200.0),
+                pointer(PointerKind::Up, release_x, 200.0),
+            ] {
+                live.send(command);
+                if paced {
+                    thread::sleep(Duration::from_millis(20));
                 }
-                let report =
-                    wait_regression_report(&fixture, "/touch", round * 3 + index as u32 + 1);
-                let report = report.as_array().unwrap();
-                // Chromium may coalesce the DOM touchmoves too. The fake CDP test
-                // checks the excursion dispatch; here the final point and absence of
-                // click prove that its gesture recognition retained the drag.
-                assert!(
-                    report
-                        .iter()
-                        .any(|e| e["type"] == "touchend" && e["x"] == release_x),
-                    "{report:?}"
-                );
-                assert!(
-                    !report.iter().any(|e| e["type"] == "click"),
-                    "swipe generated click: {report:?}"
-                );
-                stop_regression_fling(&live, &fixture, "/touch", round * 3 + index as u32 + 1);
             }
-            // A late click from the preceding swipe must not satisfy this fresh tap.
-            live.send(pointer(PointerKind::Down, 120.0, 220.0));
-            live.send(pointer(PointerKind::Up, 120.0, 220.0));
-            let report = wait_tap_report(&fixture, "/touch", round * 3 + 3);
-            assert!(fresh_tap(&report, 120, 220), "fresh tap: {report}");
-            assert_eq!(live.session().status().protocol_error, None);
+            let gesture = first_gesture + index as u32;
+            let report = wait_regression_report(&fixture, "/touch", gesture);
+            let report = report.as_array().unwrap();
+            // Chromium may coalesce the DOM touchmoves too. The fake CDP test
+            // checks the excursion dispatch; here the final point and absence of
+            // click prove that its gesture recognition retained the drag.
+            assert!(
+                report
+                    .iter()
+                    .any(|e| e["type"] == "touchend" && e["x"] == release_x),
+                "{report:?}"
+            );
+            assert!(
+                !report.iter().any(|e| e["type"] == "click"),
+                "swipe generated click: {report:?}"
+            );
+            stop_regression_fling(&live, &fixture, "/touch", gesture);
         }
-    }));
-    finish_touch_trace(&mut trace);
-    drop(trace);
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
+        // A late click from the preceding swipe must not satisfy this fresh tap.
+        live.send(pointer(PointerKind::Down, 120.0, 220.0));
+        live.send(pointer(PointerKind::Up, 120.0, 220.0));
+        let report = wait_tap_report(&fixture, "/touch", first_gesture + 2);
+        assert!(fresh_tap(&report, 120, 220), "fresh tap: {report}");
+        assert_eq!(live.session().status().protocol_error, None);
     }
     live.close();
 }
