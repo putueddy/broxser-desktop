@@ -612,6 +612,11 @@ for (const type of ['pointerdown','pointermove','pointerup','pointercancel','tou
     if (type === 'touchstart' && location.pathname === '/dialog' && !asked) { asked = true; alert('touch'); }
   });
 }
+addEventListener('keyup', e => {
+  if (e.key === 'Shift') {
+    fetch('/event?' + new URLSearchParams({kind:'touch-regression-keyup',w:innerWidth,path:location.pathname,n:gesture}));
+  }
+});
 fetch('/event?' + new URLSearchParams({kind:'touch-regression-ready',w:innerWidth,path:location.pathname}));
 </script>"#;
 
@@ -800,6 +805,39 @@ fn finish_touch_trace(probe: &mut Cdp) {
     }
 }
 
+// Chromium handles flings before touch-action filtering, even on this page's
+// touch-action:none target. A new touch that stops a fling has its tap gestures
+// suppressed. Stop inertia between the independent cases, so suppression cannot
+// either satisfy a swipe's no-click assertion or swallow the positive control.
+// InputRouterImpl::SendKeyboardEvent stops a fling before dispatching the key;
+// its page-observed keyup is the barrier, without changing touch ownership.
+fn stop_regression_fling(live: &Live, fixture: &Fixture, path: &str, gesture: u32) {
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput {
+                down,
+                key: "Shift".into(),
+                code: "ShiftLeft".into(),
+                text: None,
+                key_code: 16,
+                modifiers: Modifiers {
+                    shift: down,
+                    ..Modifiers::default()
+                },
+            },
+        });
+    }
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| {
+            events(f, "touch-regression-keyup").iter().any(|event| {
+                event["w"] == "360" && event["path"] == path && event["n"] == gesture.to_string()
+            })
+        }),
+        "page did not acknowledge the fling-stopping key after {path} gesture {gesture}"
+    );
+}
+
 #[test]
 #[ignore = "requires an installed CDP browser"]
 fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
@@ -808,7 +846,10 @@ fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
     let mut trace = start_touch_trace(&live);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for round in 0..13 {
-            eprintln!("TOUCH TRACE: sequence round {round}, paced={}", round == 12);
+            eprintln!(
+                "TOUCH TRACE: barrier sequence round {round}, paced={}",
+                round == 12
+            );
             for (index, release_x) in [300.0, 100.0].into_iter().enumerate() {
                 for command in [
                     pointer(PointerKind::Down, 100.0, 200.0),
@@ -837,6 +878,7 @@ fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
                     !report.iter().any(|e| e["type"] == "click"),
                     "swipe generated click: {report:?}"
                 );
+                stop_regression_fling(&live, &fixture, "/touch", round * 3 + index as u32 + 1);
             }
             // A late click from the preceding swipe must not satisfy this fresh tap.
             live.send(pointer(PointerKind::Down, 120.0, 220.0));
