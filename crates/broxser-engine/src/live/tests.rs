@@ -6718,7 +6718,7 @@ fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recover
         }
         let controls = |name: &str| {
             format!(
-                "<input id=file type=file style='top:0'><a href='/download?{name}' style='top:60px'>download</a><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}'));</script>"
+                "<input id=file type=file style='top:0'><a href='/download?{name}' style='top:60px'>download</a><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}'));document.addEventListener('mousemove',()=>fetch('/event?hover={name}'),{{once:true}});</script>"
             )
         };
         let style = "<style>body{margin:0}input,a{position:absolute;left:0;width:300px;height:40px}iframe{position:absolute;left:0;border:0;width:400px;height:200px}</style>";
@@ -6780,12 +6780,20 @@ fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recover
             == 1
             && count(f, "/event?ready=second") == 1)
     );
+    // Script readiness does not mean Chromium has published the cross-site
+    // frame's input hit-test data. Wait for harmless hover before clicking.
+    hover_until(&live, &fixture, 0, 100.0, 20.0, "first");
     click(&live, 0, 100.0, 20.0);
     live.wait(
         "configured iframe after recovery",
         Duration::from_secs(5),
         |s| s.devices[0].file_choosers == 1,
     );
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |f| count(f, "/event?cancel=first")
+            == 1)
+    );
+    hover_until(&live, &fixture, 0, 100.0, 270.0, "second");
     click(&live, 0, 100.0, 270.0);
     assert!(
         fixture.wait_for(Duration::from_secs(5), |f| count(f, "/event?cancel=second")
