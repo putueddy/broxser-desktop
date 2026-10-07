@@ -56,6 +56,19 @@ Browser behavior was cross-checked against Chromium's
 [fling controller](https://github.com/chromium/chromium/blob/main/components/input/fling_controller.cc)
 and [tap suppression controller](https://github.com/chromium/chromium/blob/main/components/input/tap_suppression_controller.cc).
 
+Local runs in the cloud container, added afterwards: unprivileged user, sandbox
+enabled, the test as four concurrent instances like the suite's four threads.
+The same sources at Chromium's tag 154.0.8037.97 agree with the above.
+
+| Check | Result |
+| --- | --- |
+| The original swipe test at `3c1973a` | Failed 12 of 40 with 0.18.3.1 and 6 of 40 with 0.18.1.1, each as on CI: the fresh tap reached the page without a click |
+| A probe, not kept: a flick (three moves 16 ms apart), then a tap at once | No click in 6 of 6 runs with 0.18.3.1 and 4 of 4 with 0.18.1.1. With 2.5 s before the tap, or 150 ms without movement before the release, every tap clicked |
+| The instrumented candidate `4a12906` | 40 of 40 with 0.18.3.1. With its trace printed, 40 of 40 with 0.18.1.1 and 12 of 12 with 0.18.3.1; every run recorded flings (1,264 and 368 records) and none a suppressed tap |
+| The final test at `ca3cc0f` | 40 of 40 with 0.18.3.1 and 40 of 40 with 0.18.1.1 |
+| `bash scripts/check.sh` at `ca3cc0f` | Passed in 50 s: the SBOM and license check, 24 script tests, fmt, 1 CLI, 17 core, 159 engine and 50 desktop tests (54 live tests ignored by default), strict Clippy |
+| Full live suite at `ca3cc0f` with the pinned 0.18.3.1, `--test-threads=4` | 54 of 54 in 107.8 s |
+
 ## P3.1 Helium 0.18.3.1, 7 October 2026 (cloud container)
 
 ADR 0026. The first scheduled run of Qualify Helium
