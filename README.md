@@ -195,33 +195,55 @@ menolak meluncurkan browser dengan error yang menyebut panggilan tersebut.
 | `examples/` | Workspace contoh, fixture responsif (`index.html`) dan fixture live (`live.html`) |
 | `runtime/` | Baseline Helium resmi beserta checksum dan kunci signing rilis Helium |
 | `docs/` | System Design, ADR, roadmap dan catatan verifikasi |
-| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`), arsip rilis (`package.sh`) dan kualifikasi update Helium (`qualify-helium.py`) |
+| `scripts/` | Unduh Helium, fixture server, `check.sh`, pemeriksaan window X11, SBOM (`sbom.py`), arsip dan aset rilis (`package.sh`, `release-assets.sh`) dan kualifikasi update Helium (`qualify-helium.py`) |
 
-GPUI dipin ke `0.2.2` dengan source dan patch commit IME yang dicatat di
+GPUI dipin ke `0.2.2` dengan source dan patch Broxser (IME, atlas, tanpa
+protokol blur KDE) yang dicatat di
 [`vendor/gpui-0.2.2/BROXSER-PATCH.md`](vendor/gpui-0.2.2/BROXSER-PATCH.md);
-baseline Helium Linux adalah `0.18.1.1`. Pin berguna untuk
+baseline Helium Linux adalah `0.18.3.1`. Pin berguna untuk
 reproduksi, lalu harus diperbarui mengikuti security review. Binary tidak masuk Git.
 Tidak ada code, aset, atau file DMG Sizzy di repo.
 
 `bash scripts/package.sh` membangun arsip rilis Linux x86_64 **tanpa signature**
 (`artifacts/release/broxser-<versi>-linux-x86_64.tar.xz` dan `.sha256`): binary
 release, notices, SBOM SPDX (`sbom.spdx.json`), inventory lisensi
-(`THIRD-PARTY.md`), manifest Helium dengan `scripts/fetch-helium.sh` dan
-`SHA256SUMS`. Helium tidak ikut; sesudah membongkar arsip, jalankan
+(`THIRD-PARTY.md`), teks lisensi dan notice setiap komponen pihak ketiga
+(`THIRD-PARTY-LICENSES.txt`), manifest Helium dengan `scripts/fetch-helium.sh`
+dan `SHA256SUMS`. Helium tidak ikut; sesudah membongkar arsip, jalankan
 `scripts/fetch-helium.sh`, lalu `BROXSER_HELIUM_BIN=$PWD/.local/helium/helium
 bin/broxser-desktop`. Arsip deterministik untuk satu commit dan binary-nya;
 waktu `created` SBOM selalu UTC dari commit, tidak tergantung zona waktu mesin.
 `scripts/sbom.py` memerlukan Python 3.11+ (`tomllib`) dan dijalankan
-`scripts/check.sh` serta CI. Keputusan 29 September (ADR 0025), belum
-diimplementasikan: kode Broxser tanpa lisensi (all rights reserved) dan arsip
-hanya untuk pilot perusahaan, dan tidak diberikan kepada siapa pun sebelum
-membawa teks lisensi setiap komponen; rilis berikutnya berupa draft GitHub
-release dengan attestation provenance dan `install.sh`.
+`scripts/check.sh` serta CI; `--check` juga gagal bila crate yang di-link hanya
+menawarkan lisensi di luar lisensi permisif dan MPL-2.0 tanpa modifikasi.
+Keputusan 29 September (ADR 0025): kode Broxser tanpa lisensi (all rights
+reserved) dan arsip hanya untuk pilot perusahaan.
+
+Rilis dibuat workflow **Release** (ADR 0025, keputusan 2 dan 3). Pemilik repo
+menaikkan versi workspace di `Cargo.toml` bila perlu, lalu mem-push tag
+`v<versi>` pada commit `main` yang CI-nya hijau. Workflow membangun dan
+memeriksa arsip dengan `scripts/release-assets.sh` (dua build harus sama;
+`.sha256`, `SHA256SUMS` dan `COMMIT` dicek), membuat attestation build
+provenance lewat Sigstore tanpa kunci jangka panjang, lalu melampirkan arsip,
+`.sha256`, SBOM dan bundle attestation ke **draft** release. Tidak ada yang
+dipublikasikan otomatis, dan arsip tidak pernah diunggah sebagai artefak
+workflow. Tag yang tidak sama dengan versi workspace atau commit di luar `main`
+ditolak. Penerima mengecek arsip dengan GitHub CLI:
+
+```bash
+sha256sum -c broxser-<versi>-linux-x86_64.tar.xz.sha256
+gh attestation verify broxser-<versi>-linux-x86_64.tar.xz --repo putueddy/broxser-desktop \
+  --signer-workflow putueddy/broxser-desktop/.github/workflows/release.yml \
+  --source-ref refs/tags/v<versi> --deny-self-hosted-runners
+```
+
+PR yang mengubah jalur rilis menjalankan dry run: build dan cek yang sama, tanpa
+attestation dan tanpa unggahan. `install.sh` belum diimplementasikan.
 
 Update atau rollback Helium melewati kualifikasi (ADR 0026):
 
 ```bash
-VERSION=0.18.1.1  # tag rilis imputnet/helium-linux
+VERSION=0.18.3.1  # tag rilis imputnet/helium-linux
 # Manifest kandidat hanya dari tarball yang ditandatangani kunci rilis Helium.
 python3 scripts/qualify-helium.py propose "$VERSION"
 # Sebagai user biasa dengan display X11: browser kandidat di
@@ -232,11 +254,17 @@ python3 scripts/qualify-helium.py run "artifacts/helium/helium-linux-x86_64-$VER
 Hanya verdict `qualified` yang dipromosikan, lewat commit yang di-review yang
 mengganti `runtime/helium-linux-x86_64.json` dengan ringkasan record di
 `docs/validation.md`; tanpa display verdict-nya `incomplete`. Rollback memakai
-jalur yang sama: rilis sebelumnya, 0.17.2.1, tidak lulus untuk commit ini.
+jalur yang sama: pin sebelumnya, 0.18.1.1, lulus untuk commit ini, sedangkan
+0.17.2.1 tidak.
 `fetch-helium.sh` tidak menghapus versi lain di `.local/helium`, jadi kembali
-ke versi sebelumnya cukup dengan rename. Kualifikasi mingguan dan on-demand di
-GitHub Actions sudah diputuskan (ADR 0026) tetapi belum dibuat; sampai itu
-kualifikasi dijalankan manual seperti di atas.
+ke versi sebelumnya cukup dengan rename. Workflow **Qualify Helium**
+(`.github/workflows/qualify-helium.yml`, ADR 0026) menjalankan
+`python3 scripts/qualify-helium.py scheduled` setiap Senin 03:23 UTC, on demand
+dari tab Actions (opsional dengan versi rilis, misalnya target rollback) dan
+pada PR yang mengubah pin, kunci, skrip atau workflow itu: kunci yang dipin
+dibandingkan dengan `pubkey.asc` Helium, pin dikualifikasi ulang, lalu rilis
+yang lebih baru (atau yang disebut) di-propose dan dikualifikasi. Hasilnya ada
+di ringkasan run dan di artefak 90 hari; workflow tidak pernah mengubah pin.
 
 ## Verifikasi
 

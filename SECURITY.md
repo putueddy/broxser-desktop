@@ -11,7 +11,8 @@ a tarball whose detached OpenPGP signature was made by Helium's release key
 `scripts/qualify-helium.py`), and CI rechecks the pinned tarball's signature on
 every run (ADR 0026). Users' fetch checks the SHA-256 only. Rolling back to an
 older Helium reintroduces the vulnerabilities fixed since and goes through the
-same qualification; the previous release, 0.17.2.1, did not qualify.
+same qualification; the previous pin, 0.18.1.1, qualifies for the current
+commit, and 0.17.2.1 does not.
 
 The browser subprocess keeps Chromium's sandbox enabled, uses a private temporary
 profile (mode 0700), and exposes CDP on a random loopback port. CDP can control every
@@ -153,14 +154,24 @@ customer screenshots, or full sensitive URLs to public issues.
 
 Operating targets (ADR 0003, accepted 2026-09-29): triage browser advisories
 within one business day; qualify critical updates within 72 hours of a usable
-upstream release; review other updates weekly. The primary owner is the
-repository owner; no backup is named yet, and the scheduled qualification
-workflow that ADR 0026 decides is not built yet, so these are targets, not current
-service guarantees. An incompatible upstream release blocks promotion until
+upstream release; review other updates weekly. The weekly qualification
+(`.github/workflows/qualify-helium.yml`, ADR 0026) requalifies the pin every
+Monday, qualifies a newer Helium release in the first weekly run after it is
+tagged (a critical one is started by hand), and fails when the pinned signing
+key differs from the one Helium publishes. The primary
+owner is the repository owner and no backup is named yet, so these are targets,
+not service guarantees. An incompatible upstream release blocks promotion until
 contract tests pass. Security response takes precedence over UI feature work.
 
-Release archives from `scripts/package.sh` are unsigned: only a `.sha256`
-obtained through a trusted channel protects them. Releases are to carry GitHub
-artifact attestations, keyless build provenance checked with
-`gh attestation verify` (ADR 0025, decision 2); the release workflow that
-creates them is not built yet.
+Release archives built by hand with `scripts/package.sh` are unsigned: only a
+`.sha256` obtained through a trusted channel protects them. Drafts from the
+release workflow (`.github/workflows/release.yml`, ADR 0025) carry a GitHub
+artifact attestation: keyless build provenance, signed through Sigstore's public
+instance with the workflow's short-lived identity and recorded in its public
+transparency log. `gh attestation verify <archive> --repo
+putueddy/broxser-desktop --signer-workflow
+putueddy/broxser-desktop/.github/workflows/release.yml --source-ref
+refs/tags/v<version>` shows that this repository's release workflow built the
+archive from that tag; the `.sha256` alone checks integrity, not origin. The
+workflow builds only tags that name the workspace version on commits of `main`,
+publishes nothing and never uploads the archive as a workflow artifact.

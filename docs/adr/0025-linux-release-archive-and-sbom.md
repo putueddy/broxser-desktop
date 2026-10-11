@@ -2,9 +2,9 @@
 
 Status: first part accepted for P3.1, 2026-09-27 (archive, SBOM, checksums);
 the open decisions were taken on 2026-09-29, on the owner's delegation (see
-"Decisions, 2026-09-29"). Their implementation comes in separate changes: the
-license texts with a fourth GPUI patch, then the release workflow, then the
-installer. Builds on ADR 0003 (engine update ownership), ADR 0001 (external
+"Decisions, 2026-09-29"). The license texts and the fourth GPUI patch of
+decision 1 and the release workflow of decisions 2 and 3 are implemented; the
+installer of decision 4 is a separate change. Builds on ADR 0003 (engine update ownership), ADR 0001 (external
 Helium) and `NOTICE.md`.
 
 ## Context
@@ -50,7 +50,8 @@ backup owner. An audit of the repository on 2026-09-27 found:
 
 - `scripts/package.sh` builds the release binaries and writes
   `broxser-<version>-linux-x86_64.tar.xz`: `bin/broxser-desktop`,
-  `bin/broxser`, `README.md`, `NOTICE.md`, `SECURITY.md`, the GPUI license,
+  `bin/broxser`, `README.md`, `NOTICE.md`, `SECURITY.md`,
+  `THIRD-PARTY-LICENSES.txt` (the GPUI license alone until decision 1),
   `sbom.spdx.json`, `THIRD-PARTY.md`, the Helium manifest with
   `scripts/fetch-helium.sh`, `COMMIT`, and a `SHA256SUMS` of every file; next to
   it `<archive>.sha256`. File order, owners, modes and times come from the
@@ -83,9 +84,10 @@ signing of a public repository reveals nothing that is not already public.
    company's pilot users, not to the public (decision 3).
    The third-party review of 2026-09-29 (`docs/validation.md`) found that every
    shipped component allows redistribution in binary form on the terms below,
-   after one change to GPUI. The current archive does not meet them yet: it
-   lists licenses but carries only GPUI's text. No archive is given to anyone
-   before it does, so that change comes before the release workflow.
+   after one change to GPUI. The archive did not meet them then: it listed
+   licenses but carried only GPUI's text. No archive is given to anyone before
+   it does, so that change came before the release workflow (implemented
+   below).
    - Each archive carries every license and notice file of every shipped
      crate, including those of code a crate bundles (the Unicode data license
      in `regex-syntax`, the Wayland protocol authors' notice in
@@ -111,6 +113,19 @@ signing of a public repository reveals nothing that is not already public.
    - FreeType, bundled inside `freetype-sys`, is not shipped: the build links
      the system library, and the desktop calls none of it.
    This is a technical review, not legal advice.
+
+   Implemented on 2026-09-29. `sbom.py --licenses` writes
+   `THIRD-PARTY-LICENSES.txt` into the archive: the license and notice files of
+   every shipped third-party component, grouped by identical text; the SPDX
+   standard text (`scripts/licenses`) for each crate that ships none, the MIT
+   one naming the crate's authors; and notes for `self_cell`'s election,
+   `option-ext`'s source form and GPUI's changes. `sbom.py --check`, in
+   `check.sh` and CI, fails when a shipped crate offers no license but ones
+   outside the permissive set and MPL-2.0, when MPL-2.0 code is not unmodified
+   from crates.io, or when a crate without license files declares a license
+   `scripts/licenses` has no text for. The vendored GPUI no longer uses KDE's
+   blur protocol, and its changed files say so; the shipped graph drops to 524
+   crates.io crates, 31 of them without license files.
 2. **Signing is keyless build provenance.** The release workflow attests each
    archive with GitHub artifact attestations, signed through Sigstore's public
    instance with the workflow's short-lived identity, so there is no long-lived
@@ -128,6 +143,27 @@ signing of a public repository reveals nothing that is not already public.
    decision 1 allows public distribution. Nothing is published automatically.
    The archive is never uploaded as a workflow artifact, which any signed-in
    GitHub user could download from this public repository.
+
+   Decisions 2 and 3 implemented on 2026-09-29 in
+   `.github/workflows/release.yml`. On a tag `v*` the release job refuses a
+   commit that `main` does not contain, then runs `scripts/release-assets.sh`:
+   it refuses a tag other than `v<workspace version>`, builds the archive twice
+   with `scripts/package.sh` and requires one SHA-256, checks the `.sha256`, the
+   `SHA256SUMS` of the unpacked files (and that it lists exactly those files)
+   and `COMMIT`, and writes the SBOM and the release notes beside the archive.
+   `actions/attest` (v4.2.2, pinned by commit) then attests the archive with
+   SLSA build provenance, and `gh release create --draft --verify-tag`
+   attaches the archive, its `.sha256`, the SBOM and the attestation's Sigstore
+   bundle. Only that job may write contents, request an OIDC token and store
+   attestations. Pull requests that change the release path run a dry-run job
+   with read-only permissions: the same build and checks, no attestation and no
+   upload. The workflow does not check that CI passed; the owner tags a commit
+   of `main` whose CI is green. The release notes give the verification
+   command with the signer workflow, the tag and the commit:
+   `gh attestation verify <archive> --repo putueddy/broxser-desktop
+   --signer-workflow putueddy/broxser-desktop/.github/workflows/release.yml
+   --source-ref refs/tags/v<version> --source-digest <commit>
+   --deny-self-hosted-runners`.
 4. **The user-facing format is the archive with an installer.** The archive
    gains `install.sh`, which installs it for the current user without root:
    the files under `~/.local/opt/broxser/<version>`, `broxser` and
@@ -162,7 +198,7 @@ signing of a public repository reveals nothing that is not already public.
   they are not bundled.
 - Without signatures an attacker who can replace both the archive and its
   `.sha256` goes unnoticed; the provenance attestation of decision 2 closes this
-  gap once the release workflow lands. Archives built by hand with
+  gap for drafts of the release workflow. Archives built by hand with
   `scripts/package.sh` stay unsigned.
 
 ## Validation

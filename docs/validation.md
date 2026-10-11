@@ -3,6 +3,350 @@
 Evidence per milestone. It is not production qualification or a claim of Sizzy
 parity. Keep failed, skipped and manual-only results visible.
 
+## PR #32 CI test isolation, 7 October 2026 (GitHub Actions)
+
+Two test synchronization issues surfaced after the Helium pin update. Neither
+correction changes production input dispatch, browser options or the test
+assertions.
+
+- The busy-iframe test waited for a script-ready beacon before clicking the
+  recovered cross-site frame. Script execution is not an input-routing barrier.
+  It now uses the existing harmless hover handshake for both recovered frames
+  and observes the first chooser's cancellation before clicking the second.
+  Commit `3c1973a` passed [push CI](https://github.com/putueddy/broxser-desktop/actions/runs/37645857248)
+  (54/54 live), [PR CI](https://github.com/putueddy/broxser-desktop/actions/runs/37645870767)
+  and [Helium qualification](https://github.com/putueddy/broxser-desktop/actions/runs/37645871081)
+  (54/54 live plus desktop smoke). The unchanged touch test passed on this run;
+  that alone did not establish its intermittent failure was fixed.
+- The original rapid touch sequence failed again under temporary input tracing
+  on `4e6921f`, before any added paced case ran:
+  [push CI, job 112888208681](https://github.com/putueddy/broxser-desktop/actions/runs/37649326819/job/112888208681).
+  Gesture 3 received pointerdown/touchstart/pointerup/touchend at (120, 220), but
+  no click within the existing 10-second bound. The trace showed a second fling
+  at velocity -17000 after the out-and-back moves arrived 14.205 ms apart.
+  The fresh tap canceled that fling and Chromium recorded
+  `FilterTapSuppression` after its down and up. Waiting longer cannot restore a
+  deliberately suppressed tap.
+
+Chromium handles flings before touch-action filtering, so the fixture's
+`touch-action:none` does not prevent this behavior. The test now sends harmless
+Shift down/up after each independently verified swipe and waits for that
+gesture's page-observed keyup. Keyboard input stops the fling before dispatch
+without resetting Broxser's touch ownership. This also prevents the first
+swipe's fling suppression from accidentally satisfying the second swipe's
+no-click assertion.
+
+The corrected instrumented candidate `4a12906` passed
+[PR CI](https://github.com/putueddy/broxser-desktop/actions/runs/37650463448):
+54/54 live tests, including 12 original rapid sequences and one paced sequence.
+Its trace recorded 28 fling records and **zero suppressed tap events**, with
+every no-click and fresh-click assertion intact. The final test removes all
+temporary tracing and repeated diagnostics, retaining one original rapid
+sequence and one sequence with 20 ms between pointer commands. That spacing
+creates gesture velocity deliberately; it is not a settling wait or retry.
+
+These checks ran with sandboxed Helium 0.18.3.1 in GitHub Actions. This repair
+environment had no Rust toolchain and could not launch a sandboxed browser,
+so it provides no additional local execution claim. The same missing-click
+symptom was recorded earlier on Helium 0.18.1.1 without these traces; this is
+not evidence of a new 0.18.3.1 product regression.
+
+Browser behavior was cross-checked against Chromium's
+[input router](https://github.com/chromium/chromium/blob/main/components/input/input_router_impl.cc),
+[fling controller](https://github.com/chromium/chromium/blob/main/components/input/fling_controller.cc)
+and [tap suppression controller](https://github.com/chromium/chromium/blob/main/components/input/tap_suppression_controller.cc).
+
+Local runs in the cloud container, added afterwards: unprivileged user, sandbox
+enabled, the test as four concurrent instances like the suite's four threads.
+The same sources at Chromium's tag 154.0.8037.97 agree with the above.
+
+| Check | Result |
+| --- | --- |
+| The original swipe test at `3c1973a` | Failed 12 of 40 with 0.18.3.1 and 6 of 40 with 0.18.1.1, each as on CI: the fresh tap reached the page without a click |
+| A probe, not kept: a flick (three moves 16 ms apart), then a tap at once | No click in 6 of 6 runs with 0.18.3.1 and 4 of 4 with 0.18.1.1. With 2.5 s before the tap, or 150 ms without movement before the release, every tap clicked |
+| The instrumented candidate `4a12906` | 40 of 40 with 0.18.3.1. With its trace printed, 40 of 40 with 0.18.1.1 and 12 of 12 with 0.18.3.1; every run recorded flings (1,264 and 368 records) and none a suppressed tap |
+| The final test at `ca3cc0f` | 40 of 40 with 0.18.3.1 and 40 of 40 with 0.18.1.1 |
+| `bash scripts/check.sh` at `ca3cc0f` | Passed in 50 s: the SBOM and license check, 24 script tests, fmt, 1 CLI, 17 core, 159 engine and 50 desktop tests (54 live tests ignored by default), strict Clippy |
+| Full live suite at `ca3cc0f` with the pinned 0.18.3.1, `--test-threads=4` | 54 of 54 in 107.8 s |
+
+## P3.1 Helium 0.18.3.1, 7 October 2026 (cloud container)
+
+ADR 0026. The first scheduled run of Qualify Helium
+([run 37297967268](https://github.com/putueddy/broxser-desktop/actions/runs/37297967268),
+Monday 5 October, 10:39 UTC, `main` `a29730a`) failed, as it should when a
+release does not qualify. The key equaled the published one; the newest
+release, 0.18.3.1, was newer than the pin; the pin 0.18.1.1 qualified (live
+suite 54 of 54 in 102.0 s, smoke 115.6 s). 0.18.3.1 (Chromium 154.0.8037.97),
+proposed from a download signed by Helium's release key on 2 October 23:34:14
+UTC (SHA-256 `89bd962c…63bf2`), did **not** qualify: live suite 53 passed and 1
+failed, `live_script_and_stale_same_document_changes_never_sync` ("timed out
+waiting for hidden route"); smoke passed (114.7 s).
+
+Upstream, Chromium 154.0.8037.97 follows the pin's 154.0.8037.57 after two
+stable updates (Chrome Releases, 29 September and 1 October): 43 security fixes,
+2 of them critical and 34 high; neither post mentions exploitation in the wild.
+
+### Root cause
+
+- The failing step loads `/spa-hidden` in every device, clicks the phone's link
+  (its handler cancels the navigation and pushes a route 700 ms later), hides the
+  phone at once and waits 10 s for the route. Hiding sends
+  `Input.setIgnoreInputEvents` right behind the click's mouse events, without
+  waiting for their acknowledgements: hide pauses page input (ADR 0006).
+- Alone, the test passed 5 of 5 with 0.18.3.1. As four concurrent instances, the
+  load the suite runs under (`--test-threads=4`), it failed 1 of 20, then 5 of
+  60 with a beacon in the click handler (instrumentation not kept), against 0 of
+  20 and 0 of 60 with 0.18.1.1. In every failure the beacon never arrived: the
+  click had not reached the page when the hide took effect, so the page never
+  scheduled its push. This Chromium delivers the click later, and the race in
+  the test shows.
+- The product behaves as designed: input around a hide is not promised, and
+  nothing is replayed (ADR 0006). The test assumed that the click lands.
+
+### Change
+
+- The page reports its click and its push. The test waits until the page saw
+  the click, hides the phone, waits until the hide took effect (no stream),
+  checks that the router has not pushed yet (its delay grows to 1.5 s), then
+  waits for the route. No product code changed.
+- The pin moves to 0.18.3.1: the manifest `propose` wrote, reviewed on 7
+  October. README, SECURITY, the system design and GOALS name it; 0.18.1.1 stays
+  the rollback target.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| The hidden-route test as four concurrent instances, unprivileged user | Before the change, 6 of 80 failed with 0.18.3.1 and 0 of 80 with 0.18.1.1. After it, 60 of 60 passed with each |
+| Full live suite against 0.18.3.1, `--test-threads=4` | 54 of 54, twice, 89 s each |
+| `qualify-helium.py run` for 0.18.3.1 at `cc18a8f` (the test fix on `main`) | **Qualified**: live suite 54 of 54 in 89.4 s, smoke passed in 115.9 s |
+| `qualify-helium.py run` for 0.18.1.1 at `cc18a8f` | **Qualified**: live suite 54 of 54 in 84.1 s, smoke passed in 107.9 s; the rollback target |
+| `qualify-helium.py verify` of the new pin | Signed by `BE677C19…D6378E` at 2026-10-02T23:34:14Z; SHA-256 matches |
+| `latest` and `check-key` | 0.18.3.1 is still the newest release; the pinned key equals the published one |
+| `fetch-helium.sh` with the new pin, unprivileged user | Prepared 0.18.3.1 in `.local/helium` after the 0.18.1.1 copy was moved aside to `.local/helium-0.18.1.1` |
+| `bash scripts/check.sh` on the pull request branch | Passed in 149 s: the SBOM and license check, 24 script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Live suite with the pinned browser on that branch | 54 of 54 in 104 s |
+| Full `scripts/desktop-smoke.sh` with the pinned browser (Xvfb 1600 × 1000) | 18 of 18 in 119 s; no browser process, profile or window left, and the known preview directory after SIGTERM |
+
+### Limits
+
+- SECURITY.md's target, critical updates qualified within 72 hours of a usable
+  upstream release, was missed: released 2 October, found by the weekly run on
+  5 October, qualified on 7 October. With a weekly schedule, a critical release
+  can wait up to a week unless someone starts the workflow by hand.
+- On its first launch in this container, one run with 0.18.1.1 timed out
+  starting its browsers ("pages", 30 s); 140 later launches did not.
+- `navigator.clipboard.readText()` was found denied on 0.18.1.1 (SECURITY.md)
+  and was not measured again on 0.18.3.1; the live permission tests pass.
+
+## P3.1 release workflow: draft releases with build provenance, 29 September 2026 (cloud container)
+
+ADR 0025, decisions 2 and 3. Same container; no Rust, engine or GUI code
+changed. The release job runs only for a tag, and a tag's run writes an
+attestation to Sigstore's public transparency log and a draft to this
+repository, so no tag was pushed: the job's steps ran here with a stand-in for
+the GitHub CLI, and pull requests run its build and checks as a dry run.
+
+### Before the change
+
+- Archives were built only by hand with `scripts/package.sh`: unsigned, with no
+  release channel and no attestation.
+
+### After the change
+
+- `.github/workflows/release.yml`. On a tag `v*`, the release job (contents,
+  OIDC token and attestations writable) refuses a commit that `main` does not
+  contain, runs `scripts/release-assets.sh "$TAG"`, attests the archive with
+  `actions/attest` v4.2.2 (`1e69f48…`) and creates the draft with
+  `gh release create --draft --verify-tag`. The dry-run job, read-only, runs on
+  pull requests that change the workflow, `package.sh`, `release-assets.sh`,
+  `sbom.py` or `scripts/licenses`.
+- `actions/attest-build-provenance` v4 is only a wrapper of `actions/attest`,
+  whose README asks new workflows to use it directly. Without a registry push
+  the action creates no storage record (its source), so `artifact-metadata`
+  is not granted.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `actionlint` 1.7.12 with ShellCheck 0.9.0 | No findings for `release.yml`, `ci.yml` and `qualify-helium.yml`; ShellCheck finds nothing in `release-assets.sh` |
+| `release-assets.sh` on `229cfb7`, as the dry run runs it | Exit 0 in 39 s, the release binaries already built: two archives with SHA-256 `c3499e98…6fe307`; the `.sha256`, `SHA256SUMS` (its 11 files and no others) and `COMMIT` checked; the SBOM and the release notes written beside the archive |
+| Refusals | The tags "", `0.1.0`, `V0.1.0`, `v0.1.0.1`, `v0.1.0-rc.1` and `v0.0.0` exit 1 before anything is built or written (script test); an existing `artifacts/release/v0.1.0` is refused |
+| The release job's shell steps, with a stand-in `gh` | "Release only reviewed code" exits 1 for a commit of this branch, which `main` does not contain, and 0 for `origin/main`. "Create the draft release" calls `gh release create v0.1.0 --draft --verify-tag --title 'Broxser 0.1.0' --notes-file artifacts/release/v0.1.0/release-notes.md` with the archive, its `.sha256`, `.sigstore.json` and `.spdx.json`, all present, and writes the run summary |
+| `python3 -m unittest discover -s scripts/tests` | 24 tests passed, 1 of them new |
+| `bash scripts/check.sh` | Passed in 45 s with this section: the SBOM and license check, the script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Live Helium suite, desktop smoke | Not rerun: nothing in the engine, the GUI or the archive's content changed |
+
+### Limits
+
+- The release job has not run. Attesting, creating the draft and uploading its
+  assets are first exercised by the owner's first tag; check that draft with
+  the commands in its notes before giving it to anyone.
+- The `gh attestation verify` command in the notes was checked against the
+  GitHub CLI manual, not run: the GitHub CLI is not installed here.
+- The workflow does not check CI: tag a commit of `main` whose CI passed.
+- The binaries are reproducible only with the same toolchain and build path, so
+  an archive built here differs from the runner's; the runner's two builds must
+  match each other.
+
+## P3.1 license texts in the archive, GPUI without KDE's blur, 29 September 2026 (cloud container)
+
+ADR 0025, decision 1. Same container; the smoke, the Wayland check and the
+archive checks ran as `broxsertest` with the sandbox enabled. The archive was
+built from `20fec97`, the change without this section.
+
+### Before the change
+
+- The archive carried one license text, GPUI's (`licenses/gpui-LICENSE-APACHE`),
+  beside `THIRD-PARTY.md`, the list of 525 crates by declared license; 32 of
+  those crates ship no license file.
+- GPUI compiled KDE's blur protocol from `wayland-protocols-plasma`, whose
+  protocol description is LGPL-2.1-or-later: the release desktop of `5d3887e`
+  held its client code (`org_kde_kwin_blur_manager`, `org_kde_kwin_blur`).
+  GPUI's three patched files carried no notice of the change.
+- `sbom.py --check` validated the SPDX document, not whether a dependency's
+  license allowed shipping it.
+
+### After the change
+
+- `sbom.py --check`: "SBOM ok: 530 components (524 crates.io crates), 1382
+  relationships; 337 distinct license texts". `Cargo.lock` loses only
+  `wayland-protocols-plasma` 0.2.0 and GPUI's dependency on it (14 lines).
+- `THIRD-PARTY-LICENSES.txt` (1,004,844 bytes) holds 337 distinct texts for
+  921 license and notice files, standard texts included. Parsed back from the
+  archive, every one of the SBOM's 525 third-party components (524 crates and
+  GPUI) has at least one text. The 31 crates that ship no license file get the
+  SPDX standard text: 20 Apache-2.0, 10 MIT naming the crate's authors, 1
+  CC0-1.0. The notes name GPUI's changes, `option-ext`'s source form with its
+  SHA-256, and `self_cell` used under Apache-2.0. Files of bundled code are
+  kept: the Unicode data license in `regex-syntax`, fiat-crypto and BoringSSL
+  in `ring`, the Wayland protocol authors in `wayland-protocols`, and FreeType
+  in `freetype-sys`, which is not built (the header says that a file does not
+  mean its code is built in).
+- Compared with the published `gpui-0.2.2.crate` (SHA-256 `979b45cf…bee707`
+  checked), the vendored GPUI differs in five files (`Cargo.toml`,
+  `wayland/client.rs`, `wayland/window.rs`, `x11/xim_handler.rs`,
+  `blade/blade_atlas.rs`) and adds `BROXSER-PATCH.md`; each of the five starts
+  with the notice that Broxser changed it.
+- The release desktop contains no `org_kde_kwin_blur` string (the text input
+  protocol and `xdg_toplevel` still do) and needs the same seven libraries as
+  before.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `python3 -m unittest discover -s scripts/tests` | 23 tests passed. The 9 new ones: a permissive choice is taken by preference (`self_cell`'s Apache-2.0, never GPL-2.0-only; `ring`'s Apache-2.0 and ISC); MPL-2.0 only without a permissive alternative; copyleft-only and malformed expressions are refused; license files of bundled code are found, those of tests, examples and sources are not; the MIT text names the authors; identical texts are grouped; copyleft, modified MPL-2.0, a missing standard text, a malformed expression and a license file that is not UTF-8 are reported as problems; every standard text file is described |
+| `bash scripts/check.sh` | Passed in 45 s with this section (1 m 52 s on the first run after the GPUI change, which rebuilt GPUI): the SBOM and license check, the script tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+| Archive reproducibility | Two `package.sh` runs of `20fec97`, the first with the release build (5 m 12 s), the second in 18 s with `TZ=Asia/Jakarta`: identical SHA-256 `64f44461…af3c8a6`, 6.3 MB. `THIRD-PARTY-LICENSES.txt` replaces `licenses/`; `SHA256SUMS` lists 11 files |
+| Archive as the unprivileged user | The `.sha256` checked OK; unpacked; `SHA256SUMS` all OK; `bin/broxser --version`: `broxser 0.1.0`; `COMMIT` is `20fec97`. The packaged fetch script prepared Helium 0.18.1.1 in 12 s as this user (earlier runs needed root for the proxy's CA bundle); `doctor` found it; `validate` accepted the example workspace |
+| Live Helium suite (`--ignored`, two threads) | 54 of 54 passed in 133.3 s; the engine and its dependencies did not change |
+| Full `scripts/desktop-smoke.sh`, X11 (Xvfb 1600 × 1000) | 18 of 18 scenarios with the debug build (110 s), and 18 of 18 with the packaged release desktop and the packaged Helium (102 s); no browser process, profile or window left, and the known preview directory after SIGTERM |
+| Wayland: the desktop as a client of Weston 13.0.0 (X11 backend inside Xvfb, pixman renderer), three devices on the animation fixture | Debug build and packaged release desktop: the window drew the workspace and the device frames streamed (9,456 and 9,558 of 292,400 sampled pixels changed within one second); after SIGTERM no browser process or profile was left; Weston logged no protocol error |
+| `git diff --check` | Clean |
+
+### Limits
+
+- KDE Plasma was not tried; no KDE compositor is available here. There, a GPUI
+  window that asks for `Blurred` now draws like `Transparent`; Broxser's window
+  does not ask.
+- Weston's headless backend offers no `wl_seat`, and GPUI 0.2.2 then panics at
+  startup (upstream, unchanged), so the Wayland check ran Weston's X11 backend
+  inside Xvfb. No physical GPU and no other compositor. The screenshots show a
+  console error badge on the devices, which the check did not open; the
+  fixture folder has no favicon.
+- The file carries the license files of bundled code whether or not that code
+  is built. The standard texts name the authors from Cargo's metadata, without
+  years. A technical reading, not legal advice.
+- A license file that is not UTF-8 fails the check, naming the file, rather
+  than being transcoded.
+- The archive is still unsigned; the release workflow with attestations and
+  the installer are the next changes.
+
+## P3.1 scheduled Helium qualification, 29 September 2026 (cloud container)
+
+ADR 0026, decision 2: `.github/workflows/qualify-helium.yml` runs
+`scripts/qualify-helium.py scheduled`. Same container, now with unrestricted
+network access; qualification ran as `broxsertest` against Xvfb `:99` with the
+sandbox enabled, using the debug binaries of `main` `c1db07a` (this change
+touches no Rust code).
+
+### Before the change
+
+- Qualification ran only by hand (`propose`, then `run`). Nothing looked for a
+  newer Helium release, nothing compared the pinned key with the one Helium
+  publishes, and nothing ran on a schedule.
+
+### After the change
+
+- `latest` (0.9 s) prints `0.18.1.1`, the pin, from the 102 release tags of
+  `imputnet/helium-linux`. The order is numeric: sorted as text, `0.9.4.1`
+  would come last.
+- `check-key` (0.4 s): "runtime/helium-signing-key.asc equals
+  https://raw.githubusercontent.com/imputnet/helium-linux/main/pubkey.asc". No
+  `~/.gnupg` is created.
+- `scheduled --summary FILE` (3 m 15 s, exit 0) wrote this table to the file and
+  to its output: the key equals the published one; the newest release is the
+  pin; the pin is **qualified** (live suite 54 passed and 0 failed in 84.7 s,
+  smoke passed in 109.2 s), with its record. No browser process or profile was
+  left.
+- The first such run, before the local wrapper stopped passing root's
+  `GIT_SSL_CAINFO` (a CA bundle only root can read here) to the test user,
+  recorded the newest release as unknown with git's exit status and exited 1
+  although the pin qualified: an unreachable upstream fails the run.
+  `latest` now reports git's own message, for example "unable to access".
+- `scheduled --version 0.17.2.1` (6 m 47 s, exit 1), the failure path with the
+  release known not to qualify: the key matched; the pin qualified again;
+  0.17.2.1 was proposed from a signature-verified download (signed 2026-09-17
+  23:11:31 UTC, the SHA-256 recorded on 28 September) and is **not
+  qualified**: live suite 53 passed and 1 failed
+  (`live_dialog_survives_hide_show_scroll_and_zoom`, as in the rehearsal) in
+  88.6 s, smoke passed in 110.2 s.
+
+### Key sources (ADR 0026, decision 1)
+
+| Source | Result |
+| --- | --- |
+| `keys.openpgp.org`, by fingerprint and by the address `helium@imput.net` | Both return the key with its user ID, which that server shows only after the address confirmed it by email. The five OpenPGP packets are byte-identical to the pinned file's |
+| `helium.computer` | No key or fingerprint on the site (`/pubkey.asc` is 404). The download page installs `https://raw.githubusercontent.com/imputnet/helium-linux/main/pubkey.asc` as the keyring of the apt repository `pkg.helium.computer/deb` |
+| `pkg.helium.computer/deb/dists/stable/InRelease` (Date 2026-09-24 11:51:22 UTC) | `gpgv` with the pinned key: `GOODSIG` and `VALIDSIG BE677C1989D35EAB2C5F26C9351601AD01D6378E`, signed 2026-09-24 |
+| `pubkey.asc` on `main` of `imputnet/helium-linux` | Byte-identical to `runtime/helium-signing-key.asc` |
+| Web Key Directory for `imput.net` | None: the advanced method's host is unreachable, the direct method returns 404 |
+
+`docs.github.com`, reachable now, confirms what ADRs 0025 and 0026 took from
+GitHub's documentation source on 29 September: artifact attestations only in
+public repositories on the Free, Pro and Team plans; 2,000 and 3,000 included
+Actions minutes a month for private repositories on Free and Pro; scheduled
+workflows disabled after 60 days without activity in public repositories.
+
+### Checks
+
+| Check | Result |
+| --- | --- |
+| `python3 -m unittest discover -s scripts/tests` | 14 tests passed, among them: the newest release by numeric order and git's error message; a published key that differs by one byte is refused; which releases `scheduled` qualifies (only the pin when it is current; the pin and a newer release; the pin and a named older one; a changed key or an unknown newest release fails while the pin still runs) and that a failed verdict fails it |
+| `actionlint` 1.7.12 with ShellCheck 0.9.0 | No findings for `qualify-helium.yml` and `ci.yml` |
+| `apparmor_parser` 4.0.1 (`-Q -K`, not loaded: this kernel has no AppArmor) | The workflow's profile, with the runner's workspace path, parses; a truncated profile is refused |
+| `bash scripts/check.sh` | Passed in 45 s: the SBOM check, the 14 tooling tests, fmt, `cargo test --locked` (1 CLI, 17 core, 159 engine and 50 desktop tests; 54 live tests ignored by default), strict Clippy |
+
+### First run on GitHub (recorded by the next change)
+
+| Run | Result |
+| --- | --- |
+| [Qualify Helium run 1](https://github.com/putueddy/broxser-desktop/actions/runs/36558890390), `pull_request` for PR #29 at `8c54fc6`, 29 September 10:58 UTC | Succeeded; the job took 6 m 57 s. The key equals the published one; the newest release is the pin; the pin, downloaded and signature-verified on the runner, is **qualified** (live suite 54 of 54 in 93.3 s, smoke 108.4 s). Artifact `helium-qualification-36558890390-1`: 3 files, 3,814 bytes, kept 90 days |
+
+### Limits
+
+- The workflow runs only on GitHub; its first run was this pull request's own
+  (above).
+  The runner, like this container, draws the window with Xvfb and Lavapipe; no
+  physical GPU or Wayland.
+- `propose` never overwrites a prepared candidate, so a second local
+  `scheduled` for the same newer release refuses until that candidate is moved
+  aside; runners start empty.
+- A release tag whose tarball is not uploaded yet fails the run (the download
+  is refused) until it is.
+
 ## Graphite & Signal desktop redesign, 29 September 2026 (cloud container)
 
 ADR 0027 restyles both desktop views: new palette, bundled Geist fonts,

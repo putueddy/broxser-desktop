@@ -1,3 +1,4 @@
+// Broxser changed this file; BROXSER-PATCH.md at the root of this crate describes how.
 use crate::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, DevicePixels, PlatformAtlas,
     Point, Size, platform::AtlasTextureList,

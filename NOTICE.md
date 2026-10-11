@@ -9,7 +9,8 @@ go only to the company's pilot users.
 
 - GPUI 0.2.2: Apache-2.0, as declared by the published crate. Its verified source
   and license are retained in `vendor/gpui-0.2.2`, with Broxser's patches
-  described in `BROXSER-PATCH.md` (ADRs 0011 and 0012).
+  described in `BROXSER-PATCH.md` (ADRs 0011, 0012 and 0025); each changed file
+  says that Broxser changed it.
 - Geist and Geist Mono fonts: SIL Open Font License 1.1, Copyright 2024 The
   Geist Project Authors. Five static faces from `vercel/geist-font` are
   compiled into `broxser-desktop` (ADR 0027); their license, source commit and
@@ -21,13 +22,14 @@ go only to the company's pilot users.
   `runtime/helium-signing-key.asc` is Helium's public release signing key, copied
   unchanged from `imputnet/helium-linux` (`pubkey.asc`) to verify its signatures.
 - Rust transitive dependencies retain their own licenses. `scripts/sbom.py`
-  writes an SPDX SBOM of the crates the Linux binaries link and a list by
-  declared license (`THIRD-PARTY.md` in the release archive, ADR 0025). The
-  technical review of 2026-09-29 (ADR 0025, decision 1; not legal advice) found
-  every shipped component redistributable in binary form once each archive
-  carries all their license and notice files and GPUI no longer compiles KDE's
-  blur protocol (LGPL-2.1-or-later). Neither is done yet, so no archive is given
-  to anyone before both land.
+  writes an SPDX SBOM of the crates the Linux binaries link, a list by declared
+  license (`THIRD-PARTY.md`) and their license and notice texts
+  (`THIRD-PARTY-LICENSES.txt`), all three in the release archive (ADR 0025).
+  The technical review of 2026-09-29 (ADR 0025, decision 1; not legal advice)
+  found every shipped component redistributable in binary form on those
+  terms, once GPUI no longer compiled KDE's blur protocol (LGPL-2.1-or-later),
+  which it no longer does. `sbom.py --check` fails CI for a new dependency
+  that offers only other licenses.
 - Sizzy is a functional reference. Its DMG, code, artwork, branding and license
   mechanism are not part of this repository.
 

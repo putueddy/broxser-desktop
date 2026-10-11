@@ -1,3 +1,4 @@
+// Broxser changed this file; BROXSER-PATCH.md at the root of this crate describes how.
 use std::{
     cell::{Ref, RefCell, RefMut},
     ffi::c_void,
@@ -22,7 +23,6 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
     xdg::shell::client::xdg_toplevel::XdgToplevel,
 };
-use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 
 use crate::{
     AnyWindowHandle, Bounds, Decorations, Globals, GpuSpecs, Modifiers, Output, Pixels,
@@ -89,7 +89,6 @@ pub struct WaylandWindowState {
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     app_id: Option<String>,
     appearance: WindowAppearance,
-    blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     toplevel: xdg_toplevel::XdgToplevel,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
@@ -163,7 +162,6 @@ impl WaylandWindowState {
             surface,
             decoration,
             app_id: None,
-            blur: None,
             toplevel,
             viewport,
             globals,
@@ -239,9 +237,6 @@ impl Drop for WaylandWindow {
         state.renderer.destroy();
         if let Some(decoration) = &state.decoration {
             decoration.destroy();
-        }
-        if let Some(blur) = &state.blur {
-            blur.release();
         }
         state.toplevel.destroy();
         if let Some(viewport) = &state.viewport {
@@ -1128,22 +1123,6 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(Some(&region));
     } else {
         state.surface.set_opaque_region(None);
-    }
-
-    if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.blur.is_none() {
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
-                state.blur = Some(blur);
-            }
-            state.blur.as_ref().unwrap().commit();
-        } else {
-            // It probably doesn't hurt to clear the blur for opaque windows
-            blur_manager.unset(&state.surface);
-            if let Some(b) = state.blur.take() {
-                b.release()
-            }
-        }
     }
 
     region.destroy();

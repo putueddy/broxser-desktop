@@ -2933,7 +2933,7 @@ fn fixture() -> Fixture {
             ),
             "/spa-hidden" => link_page(
                 "'/spa-hidden-route'",
-                "a.addEventListener('click', e => { e.preventDefault(); setTimeout(() => history.pushState(null, '', a.href), 700); });",
+                "a.addEventListener('click', e => { e.preventDefault(); fetch('/event?hidden=click'); setTimeout(() => { fetch('/event?hidden=push'); history.pushState(null, '', a.href); }, 1500); });",
             ),
             // Not scrollable: a frame's fragment navigation would scroll it.
             "/frames" => PAGE.replace(
@@ -4717,13 +4717,30 @@ fn live_script_and_stale_same_document_changes_never_sync() {
     );
     assert_eq!(count(&fixture, "/spa-x"), 0);
 
-    // The router pushes after the phone was hidden.
+    // The router pushes after the phone was hidden. Hiding ignores page input
+    // at once (ADR 0006), so a click still in flight can be lost: the page must
+    // have seen it first.
     load_all(&live, &fixture, "/spa-hidden");
     click(&live, 0, 100.0, 120.0);
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |fixture| count(
+            fixture,
+            "/event?hidden=click"
+        ) == 1),
+        "the click did not reach the page"
+    );
     live.send(Command::SetVisible {
         device: 0,
         visible: false,
     });
+    live.wait("phone hidden", Duration::from_secs(5), |s| {
+        !s.devices[0].streaming
+    });
+    assert_eq!(
+        count(&fixture, "/event?hidden=push"),
+        0,
+        "the router pushed before the phone was hidden"
+    );
     live.wait("hidden route", Duration::from_secs(10), |s| {
         s.devices[0].url == fixture.url("/spa-hidden-route")
     });
@@ -6701,7 +6718,7 @@ fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recover
         }
         let controls = |name: &str| {
             format!(
-                "<input id=file type=file style='top:0'><a href='/download?{name}' style='top:60px'>download</a><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}'));</script>"
+                "<input id=file type=file style='top:0'><a href='/download?{name}' style='top:60px'>download</a><script>file.addEventListener('cancel',()=>fetch('/event?cancel={name}'));file.addEventListener('change',()=>fetch('/event?change={name}'));document.addEventListener('mousemove',()=>fetch('/event?hover={name}'),{{once:true}});</script>"
             )
         };
         let style = "<style>body{margin:0}input,a{position:absolute;left:0;width:300px;height:40px}iframe{position:absolute;left:0;border:0;width:400px;height:200px}</style>";
@@ -6763,12 +6780,20 @@ fn live_busy_iframe_setup_degrades_one_device_and_resumes_after_renderer_recover
             == 1
             && count(f, "/event?ready=second") == 1)
     );
+    // Script readiness does not mean Chromium has published the cross-site
+    // frame's input hit-test data. Wait for harmless hover before clicking.
+    hover_until(&live, &fixture, 0, 100.0, 20.0, "first");
     click(&live, 0, 100.0, 20.0);
     live.wait(
         "configured iframe after recovery",
         Duration::from_secs(5),
         |s| s.devices[0].file_choosers == 1,
     );
+    assert!(
+        fixture.wait_for(Duration::from_secs(5), |f| count(f, "/event?cancel=first")
+            == 1)
+    );
+    hover_until(&live, &fixture, 0, 100.0, 270.0, "second");
     click(&live, 0, 100.0, 270.0);
     assert!(
         fixture.wait_for(Duration::from_secs(5), |f| count(f, "/event?cancel=second")

@@ -612,6 +612,11 @@ for (const type of ['pointerdown','pointermove','pointerup','pointercancel','tou
     if (type === 'touchstart' && location.pathname === '/dialog' && !asked) { asked = true; alert('touch'); }
   });
 }
+addEventListener('keyup', e => {
+  if (e.key === 'Shift') {
+    fetch('/event?' + new URLSearchParams({kind:'touch-regression-keyup',w:innerWidth,path:location.pathname,n:gesture}));
+  }
+});
 fetch('/event?' + new URLSearchParams({kind:'touch-regression-ready',w:innerWidth,path:location.pathname}));
 </script>"#;
 
@@ -710,42 +715,86 @@ fn live_touch_regression(fixture: &Fixture, path: &str) -> Live {
     live
 }
 
+// Chromium handles flings before touch-action filtering, even on this page's
+// touch-action:none target. A new touch that stops a fling has its tap gestures
+// suppressed. Stop inertia between the independent cases, so suppression cannot
+// either satisfy a swipe's no-click assertion or swallow the positive control.
+// InputRouterImpl::SendKeyboardEvent stops a fling before dispatching the key;
+// its page-observed keyup is the barrier, without changing touch ownership.
+fn stop_regression_fling(live: &Live, fixture: &Fixture, path: &str, gesture: u32) {
+    for down in [true, false] {
+        live.send(Command::Key {
+            device: 0,
+            key: KeyInput {
+                down,
+                key: "Shift".into(),
+                code: "ShiftLeft".into(),
+                text: None,
+                key_code: 16,
+                modifiers: Modifiers {
+                    shift: down,
+                    ..Modifiers::default()
+                },
+            },
+        });
+    }
+    assert!(
+        fixture.wait_for(Duration::from_secs(10), |f| {
+            events(f, "touch-regression-keyup").iter().any(|event| {
+                event["w"] == "360" && event["path"] == path && event["n"] == gesture.to_string()
+            })
+        }),
+        "page did not acknowledge the fling-stopping key after {path} gesture {gesture}"
+    );
+}
+
 #[test]
 #[ignore = "requires an installed CDP browser"]
 fn live_rapid_swipe_and_coalesced_out_and_back_do_not_click() {
     let fixture = regression_fixture();
     let live = live_touch_regression(&fixture, "/touch");
-    for (index, release_x) in [300.0, 100.0].into_iter().enumerate() {
-        for command in [
-            pointer(PointerKind::Down, 100.0, 200.0),
-            pointer(PointerKind::Move, 300.0, 200.0),
-            pointer(PointerKind::Move, release_x, 200.0),
-            pointer(PointerKind::Up, release_x, 200.0),
-        ] {
-            live.send(command);
+    // Preserve the original immediate/coalesced input. The paced case also
+    // exercises nonzero fling velocity without relying on scheduling jitter;
+    // this spacing is gesture input, not a wait for the browser to settle.
+    for (round, paced) in [false, true].into_iter().enumerate() {
+        let first_gesture = round as u32 * 3 + 1;
+        for (index, release_x) in [300.0, 100.0].into_iter().enumerate() {
+            for command in [
+                pointer(PointerKind::Down, 100.0, 200.0),
+                pointer(PointerKind::Move, 300.0, 200.0),
+                pointer(PointerKind::Move, release_x, 200.0),
+                pointer(PointerKind::Up, release_x, 200.0),
+            ] {
+                live.send(command);
+                if paced {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            let gesture = first_gesture + index as u32;
+            let report = wait_regression_report(&fixture, "/touch", gesture);
+            let report = report.as_array().unwrap();
+            // Chromium may coalesce the DOM touchmoves too. The fake CDP test
+            // checks the excursion dispatch; here the final point and absence of
+            // click prove that its gesture recognition retained the drag.
+            assert!(
+                report
+                    .iter()
+                    .any(|e| e["type"] == "touchend" && e["x"] == release_x),
+                "{report:?}"
+            );
+            assert!(
+                !report.iter().any(|e| e["type"] == "click"),
+                "swipe generated click: {report:?}"
+            );
+            stop_regression_fling(&live, &fixture, "/touch", gesture);
         }
-        let report = wait_regression_report(&fixture, "/touch", (index + 1) as u32);
-        let report = report.as_array().unwrap();
-        // Chromium may coalesce the DOM touchmoves too. The fake CDP test
-        // checks the excursion dispatch; here the final point and absence of
-        // click prove that its gesture recognition retained the drag.
-        assert!(
-            report
-                .iter()
-                .any(|e| e["type"] == "touchend" && e["x"] == release_x),
-            "{report:?}"
-        );
-        assert!(
-            !report.iter().any(|e| e["type"] == "click"),
-            "swipe generated click: {report:?}"
-        );
+        // A late click from the preceding swipe must not satisfy this fresh tap.
+        live.send(pointer(PointerKind::Down, 120.0, 220.0));
+        live.send(pointer(PointerKind::Up, 120.0, 220.0));
+        let report = wait_tap_report(&fixture, "/touch", first_gesture + 2);
+        assert!(fresh_tap(&report, 120, 220), "fresh tap: {report}");
+        assert_eq!(live.session().status().protocol_error, None);
     }
-    // A late click from the preceding swipe must not satisfy this fresh tap.
-    live.send(pointer(PointerKind::Down, 120.0, 220.0));
-    live.send(pointer(PointerKind::Up, 120.0, 220.0));
-    let report = wait_tap_report(&fixture, "/touch", 3);
-    assert!(fresh_tap(&report, 120, 220), "fresh tap: {report}");
-    assert_eq!(live.session().status().protocol_error, None);
     live.close();
 }
 

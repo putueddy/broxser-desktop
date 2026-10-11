@@ -4,6 +4,9 @@
     python3 scripts/qualify-helium.py propose VERSION [--output FILE]
     python3 scripts/qualify-helium.py verify MANIFEST
     python3 scripts/qualify-helium.py run MANIFEST
+    python3 scripts/qualify-helium.py latest
+    python3 scripts/qualify-helium.py check-key
+    python3 scripts/qualify-helium.py scheduled [--version VERSION] [--summary FILE]
 
 `propose` downloads the Linux x86_64 tarball of a Helium release and its
 detached signature, accepts it only when Helium's signing key signed it (the
@@ -26,6 +29,15 @@ BROXSER_ENGINE_TESTS and BROXSER_DESKTOP_BIN may name prebuilt binaries (the
 engine's test binary; a release archive's desktop), otherwise cargo builds
 them. The smoke needs DISPLAY (an X11 session or Xvfb); without it the record
 says "incomplete", never "qualified".
+
+`latest` prints the newest release tag of imputnet/helium-linux. `check-key`
+compares runtime/helium-signing-key.asc with the pubkey.asc Helium publishes
+now and refuses any difference: a rotation is a reviewed change, never taken
+over silently. `scheduled` is what the weekly workflow runs (ADR 0026,
+decision 2): the key check, then `run` for the pin and, when the newest release
+is newer (or --version names another), `propose` and `run` for it. It prints a
+Markdown table of the results, appends it to --summary, and fails unless the
+key matches and every run is "qualified".
 """
 
 import argparse
@@ -48,7 +60,10 @@ SIGNING_KEY = ROOT / "runtime" / "helium-signing-key.asc"
 # Helium's release signing key as imputnet/helium-linux publishes it (pubkey.asc
 # and the README's "Signature" section). Changing it is a reviewed decision.
 SIGNING_FINGERPRINT = "BE677C1989D35EAB2C5F26C9351601AD01D6378E"
-RELEASES = "https://github.com/imputnet/helium-linux/releases"
+UPSTREAM = "https://github.com/imputnet/helium-linux"
+RELEASES = f"{UPSTREAM}/releases"
+# Where Helium publishes that key today (its download page points here too).
+PUBLISHED_KEY = "https://raw.githubusercontent.com/imputnet/helium-linux/main/pubkey.asc"
 CANDIDATES = ROOT / ".local" / "helium-candidates"
 RECORDS = ROOT / "artifacts" / "qualification"
 MARKER = ".broxser-runtime.json"
@@ -68,6 +83,21 @@ def release_urls(version):
         f"{RELEASES}/tag/{version}",
         f"{RELEASES}/download/{version}/helium-{version}-x86_64_linux.tar.xz",
     )
+
+
+def release_order(version):
+    """Sort key of a release version: numeric, so 0.18.1.1 follows 0.9.4.1."""
+    return tuple(int(part) for part in version.split("."))
+
+
+def newest_release(refs):
+    """The newest release version among `git ls-remote --tags` output lines."""
+    names = {line.split()[-1].removeprefix("refs/tags/").removesuffix("^{}")
+             for line in refs.splitlines() if line.strip()}
+    versions = [name for name in names if RELEASE_VERSION.fullmatch(name)]
+    if not versions:
+        raise Refused(f"{UPSTREAM} lists no release tags")
+    return max(versions, key=release_order)
 
 
 def check_manifest(manifest):
@@ -257,6 +287,7 @@ def propose(version, output):
           f"at {verified['signed_at']}; SHA-256 {verified['sha256']}.")
     print(f"Manifest: {output}\nBrowser: {directory / 'helium'}")
     print(f"Next: python3 scripts/qualify-helium.py run {output}")
+    return output
 
 
 def load_manifest(path):
@@ -386,7 +417,86 @@ def run(path):
         seconds = f" ({entry['seconds']} s)" if "seconds" in entry else ""
         print(f"  {entry['name']}: {entry['result']}{seconds}: {entry['detail']}")
     print(f"Record: {base}.json")
-    return record["verdict"] == "qualified"
+    return record, Path(f"{base}.json")
+
+
+def latest():
+    result = subprocess.run(["git", "ls-remote", "--tags", UPSTREAM],
+                            capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise Refused(f"git ls-remote {UPSTREAM} failed: "
+                      f"{result.stderr.strip() or f'exit status {result.returncode}'}")
+    return newest_release(result.stdout)
+
+
+def check_key():
+    """Refuses a pinned key that differs from the one Helium publishes now."""
+    with tempfile.TemporaryDirectory() as scratch:
+        keyring(SIGNING_KEY, SIGNING_FINGERPRINT, scratch)
+        published = Path(scratch) / "pubkey.asc"
+        download(PUBLISHED_KEY, published)
+        if published.read_bytes() != SIGNING_KEY.read_bytes():
+            raise Refused(f"{PUBLISHED_KEY} (SHA-256 {sha256(published)}) differs from "
+                          f"{SIGNING_KEY.relative_to(ROOT)} (SHA-256 {sha256(SIGNING_KEY)}); "
+                          "review it as a key rotation (ADR 0026, decision 1)")
+    return f"{SIGNING_KEY.relative_to(ROOT)} equals {PUBLISHED_KEY}"
+
+
+def describe(record, path):
+    """One line for the summary table: the verdict and what decided it."""
+    steps = "; ".join(f"{entry['name']} {entry['result']}: {entry['detail']}"
+                      for entry in record["steps"] if entry["name"] != "prepare")
+    return f"**{record['verdict']}**. {steps}. Record `{path.relative_to(ROOT)}`"
+
+
+FAILURES = (Refused, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError)
+
+
+def scheduled(version=None, summary=None):
+    """The weekly (or named) qualification of ADR 0026, decision 2. True when
+    the key matches and every run qualified."""
+    rows, passed = [], True
+    try:
+        rows.append(("Signing key", check_key()))
+    except FAILURES as error:
+        rows.append(("Signing key", f"**refused**: {error}"))
+        passed = False
+    pinned = json.loads(PINNED.read_text())["version"]
+    if version is None:
+        try:
+            version = latest()
+        except FAILURES as error:
+            rows.append(("Newest release", f"**unknown**: {error}"))
+            passed = False
+        else:
+            relation = ("the pin is current" if version == pinned else
+                        f"newer than the pin {pinned}" if release_order(version) > release_order(pinned)
+                        else f"older than the pin {pinned}")
+            rows.append(("Newest release", f"{version} in {UPSTREAM}: {relation}"))
+            if release_order(version) < release_order(pinned):
+                version = None
+    elif not RELEASE_VERSION.fullmatch(version):
+        raise Refused(f"{version!r} is not a Helium release version")
+    targets = [(f"Helium {pinned} (pin)", PINNED)]
+    if version is not None and version != pinned:
+        targets.append((f"Helium {version}", None))
+    for label, manifest in targets:
+        try:
+            record, path = run(manifest or propose(version, None))
+        except FAILURES as error:
+            rows.append((label, f"**refused**: {error}"))
+            passed = False
+            continue
+        rows.append((label, describe(record, path)))
+        passed = passed and record["verdict"] == "qualified"
+    table = "\n".join(["## Helium qualification", "", "| Check | Result |", "| --- | --- |"]
+                      + [f"| {name} | {' '.join(text.replace('|', '/').split())} |"
+                         for name, text in rows]) + "\n"
+    print(table)
+    if summary:
+        with open(summary, "a") as out:
+            out.write(table)
+    return passed
 
 
 def main():
@@ -397,8 +507,13 @@ def main():
     proposal.add_argument("--output", type=Path)
     commands.add_parser("verify", help="check a manifest's signature and SHA-256").add_argument("manifest")
     commands.add_parser("run", help="qualify a manifest's browser and write a record").add_argument("manifest")
+    commands.add_parser("latest", help="print the newest Helium release version")
+    commands.add_parser("check-key", help="compare the pinned key with Helium's published key")
+    weekly = commands.add_parser("scheduled", help="the key check and the pin's and newest release's runs")
+    weekly.add_argument("--version", help="qualify this release instead of the newest one")
+    weekly.add_argument("--summary", type=Path, help="append the Markdown result table to this file")
     args = parser.parse_args()
-    for tool in ("curl", "gpg", "gpgv", "tar"):
+    for tool in ("curl", "git", "gpg", "gpgv", "tar"):
         if shutil.which(tool) is None:
             raise SystemExit(f"{tool} is required")
     try:
@@ -406,7 +521,14 @@ def main():
             propose(args.version, args.output)
         elif args.command == "verify":
             verify(args.manifest)
-        elif not run(args.manifest):
+        elif args.command == "run":
+            if run(args.manifest)[0]["verdict"] != "qualified":
+                raise SystemExit(1)
+        elif args.command == "latest":
+            print(latest())
+        elif args.command == "check-key":
+            print(check_key())
+        elif not scheduled(args.version, args.summary):
             raise SystemExit(1)
     except (Refused, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise SystemExit(f"Refused: {error}")
