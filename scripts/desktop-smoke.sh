@@ -203,12 +203,12 @@ restart_run() {
   touch "$work/launches"
   watch_profiles "$work/launches"
   before=$(wc -l < "$work/requests")
-  # "Restart runtime" is the last control of the 44 px status bar, 24 px from
-  # the right edge of the 1360 × 861 window.
+  # "Restart runtime" is the last control of the 32 px status bar, at the
+  # right edge of the 1360 × 861 window.
   if [[ $quit == quit ]]; then
-    xdotool mousemove --window "$window" 1300 839 click --repeat 2 --delay 0 1 key --delay 0 ctrl+q
+    xdotool mousemove --window "$window" 1290 845 click --repeat 2 --delay 0 1 key --delay 0 ctrl+q
   else
-    xdotool mousemove --window "$window" 1300 839 click --repeat 2 --delay 0 1
+    xdotool mousemove --window "$window" 1290 845 click --repeat 2 --delay 0 1
     # Startup can outlast a fixed sleep under load. Require the new runtime's
     # fixture request, within the same bound as the initial startup above.
     for _ in $(seq 300); do
@@ -318,14 +318,14 @@ typing_run() {
       [[ $requests -gt 0 ]] && break
       sleep 0.1
     done
-    # At 50% zoom in this window the phone frame (195 × 422 px) is at (267, 180)
-    # and the tablet frame (384 × 512 px) at (508, 180); the fixture's box moves
+    # At 50% zoom in this window the phone frame (195 × 422 px) is at (293, 169)
+    # and the tablet frame (384 × 512 px) at (534, 169); the fixture's box moves
     # through these bands of them. The desktop device is below the fold.
     if [[ $requests -eq 0 ]]; then
       failure="the browser did not request /$page within 30 s"
-    elif ! frames_change "$window" 270 205 190 75 15; then
+    elif ! frames_change "$window" 296 194 190 75 15; then
       failure="the phone frame did not animate within 15 s"
-    elif ! frames_change "$window" 512 215 376 75 15; then
+    elif ! frames_change "$window" 538 204 376 75 15; then
       failure="the tablet frame did not animate within 15 s"
     fi
   fi
@@ -337,7 +337,7 @@ typing_run() {
     xdotool type --delay 10 "$keys" || failure="xdotool could not type"
     if ! kill -0 "$app" 2>/dev/null; then
       failure="the desktop exited while typing"
-    elif [[ -z $failure ]] && ! frames_change "$window" 270 205 190 75 15; then
+    elif [[ -z $failure ]] && ! frames_change "$window" 296 194 190 75 15; then
       failure="the phone frame stopped animating after typing"
     fi
   fi
@@ -446,26 +446,27 @@ dialog_run() {
       [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /dialog.html || true) -gt 0 ]] && break
       sleep 0.1
     done
-    # The phone card is the left column; its frame shows the page's blue button.
+    # The phone card is the left column (x 280-501); its frame shows the page's
+    # blue button.
     for answer in OK Cancel; do
       [[ -n $failure ]] && break
-      if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+      if ! button=$(find_color "$window" 282 60 216 760 3b82f6 40 30); then
         failure="the phone frame did not show the page ($answer)"
         break
       fi
       read -r x y _ < <(echo "$button")
       xdotool mousemove --window "$window" "$x" "$y" click 1
-      # The dialog panel has an orange (WARN) border.
-      if ! panel=$(find_color "$window" 250 60 230 760 f2b872 6 10); then
+      # The dialog panel has an amber (WARN) border.
+      if ! panel=$(find_color "$window" 282 60 216 760 f2b35e 6 10); then
         failure="the dialog panel did not appear ($answer)"
         break
       fi
       read -r _ _ x0 y0 x1 y1 < <(echo "$panel")
       # OK is the accent-colored button, Cancel the raised one, inside the panel.
       if [[ $answer == OK ]]; then
-        button=$(find_color "$window" $((x0 + 3)) $((y0 + 3)) $((x1 - x0 - 6)) $((y1 - y0 - 6)) 7ce29b 6 3) || true
+        button=$(find_color "$window" $((x0 + 3)) $((y0 + 3)) $((x1 - x0 - 6)) $((y1 - y0 - 6)) c6f26b 6 3) || true
       else
-        button=$(find_color "$window" $((x0 + 3)) $((y0 + 3)) $((x1 - x0 - 6)) $((y1 - y0 - 6)) 252c29 6 3) || true
+        button=$(find_color "$window" $((x0 + 3)) $((y0 + 3)) $((x1 - x0 - 6)) $((y1 - y0 - 6)) 171a1e 6 3) || true
       fi
       if [[ -z $button ]]; then
         failure="the $answer button was not found in the panel"
@@ -484,7 +485,7 @@ dialog_run() {
         break
       fi
       # The card repaints once the runtime reports the dialog closed.
-      if ! find_color "$window" 250 60 230 760 f2b872 6 5 absent; then
+      if ! find_color "$window" 282 60 216 760 f2b35e 6 5 absent; then
         failure="the dialog panel stayed after $answer"
         break
       fi
@@ -531,14 +532,15 @@ popup_run() {
       [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /popup.html || true) -gt 0 ]] && break
       sleep 0.1
     done
-    if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+    if ! button=$(find_color "$window" 282 60 216 760 3b82f6 40 30); then
       failure="the phone frame did not show the page"
     else
       read -r x y x0 y0 x1 y1 < <(echo "$button")
       xdotool mousemove --window "$window" "$x" "$y" click 1
       # The notice's "Open here" button is accent-filled, below the frame; the
-      # selected card's one-pixel border has the same color.
-      if ! button=$(find_color "$window" 262 $((y1 + 1)) 206 $((820 - y1 - 1)) 7ce29b 6 10 filled); then
+      # selected card's one-pixel border has the same color but lies outside
+      # the region, and the streaming dot is too small to count.
+      if ! button=$(find_color "$window" 284 $((y1 + 1)) 212 $((820 - y1 - 1)) c6f26b 6 10 filled); then
         failure="the card did not report the closed window"
       else
         sleep 2
@@ -553,9 +555,9 @@ popup_run() {
           done
           if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "popup-alive=page" || true) -eq 0 ]]; then
             failure="Open here did not load the page in the phone within 10 s"
-          elif ! find_color "$window" 250 60 230 760 16a34a 40 10 >/dev/null; then
+          elif ! find_color "$window" 282 60 216 760 16a34a 40 10 >/dev/null; then
             failure="the phone frame did not show the opened page"
-          elif ! find_color "$window" 262 $((y1 + 1)) 206 $((820 - y1 - 1)) 7ce29b 6 5 absent,filled; then
+          elif ! find_color "$window" 284 $((y1 + 1)) 212 $((820 - y1 - 1)) c6f26b 6 5 absent,filled; then
             failure="the report stayed after Open here"
           fi
         fi
@@ -598,7 +600,7 @@ download_run() {
       [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- /download.html || true) -gt 0 ]] && break
       sleep 0.1
     done
-    if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+    if ! button=$(find_color "$window" 282 60 216 760 3b82f6 40 30); then
       failure="the phone frame did not show the page"
     else
       read -r x y x0 y0 x1 y1 < <(echo "$button")
@@ -611,14 +613,14 @@ download_run() {
       # selected card's one-pixel border has the same color.
       if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- "download.html?file" || true) -eq 0 ]]; then
         failure="the browser did not request the file within 10 s"
-      elif ! button=$(find_color "$window" 262 $((y1 + 1)) 206 $((960 - y1 - 1)) 7ce29b 6 10 filled); then
+      elif ! button=$(find_color "$window" 284 $((y1 + 1)) 212 $((960 - y1 - 1)) c6f26b 6 10 filled); then
         failure="the card did not report the refused download"
-      elif ! find_color "$window" 250 60 230 760 3b82f6 40 3 >/dev/null; then
+      elif ! find_color "$window" 282 60 216 760 3b82f6 40 3 >/dev/null; then
         failure="the phone left its page"
       else
         read -r x y _ < <(echo "$button")
         xdotool mousemove --window "$window" "$x" "$y" click 1
-        if ! find_color "$window" 262 $((y1 + 1)) 206 $((960 - y1 - 1)) 7ce29b 6 5 absent,filled; then
+        if ! find_color "$window" 284 $((y1 + 1)) 212 $((960 - y1 - 1)) c6f26b 6 5 absent,filled; then
           failure="the report stayed after Dismiss"
         fi
       fi
@@ -681,7 +683,9 @@ PY
     done
     size_window "$window"
     xdotool mousemove --window "$window" 600 400 || true
-    if ! button=$(find_color "$window" 1300 10 40 38 252c29 6 30 filled); then
+    # The raised plus of the zoom stepper, right of its percentage and left of
+    # the Workspace button.
+    if ! button=$(find_color "$window" 1060 12 36 30 171a1e 6 30 filled); then
       failure="the zoom-in control did not appear"
     else
       read -r x y _ <<< "$button"
@@ -692,8 +696,8 @@ PY
       [[ -n $failure ]] && break
       # The gutter belongs to the host canvas, so wheel events scroll the
       # card rather than the page. Scroll to the frame before each gesture.
-      xdotool mousemove --window "$window" 242 400 click --repeat 30 --delay 20 4
-      if ! button=$(find_color "$window" 267 180 1080 600 3b82f6 40 30); then
+      xdotool mousemove --window "$window" 268 400 click --repeat 30 --delay 20 4
+      if ! button=$(find_color "$window" 294 170 1059 600 3b82f6 40 30); then
         failure="$stage: the desktop frame did not show the page"
         break
       fi
@@ -709,17 +713,17 @@ PY
         failure="$stage: the page did not report the download gesture within 10 s"
         break
       fi
-      xdotool mousemove --window "$window" 242 400 click --repeat 30 --delay 20 5
+      xdotool mousemove --window "$window" 268 400 click --repeat 30 --delay 20 5
       # Interior only: filled filtering also matches vertical card borders.
-      # The desktop's right border is beyond the window at 100%; x267 also
+      # The desktop's right border is beyond the window at 100%; x294 also
       # excludes its left border. The status bar starts below this region.
-      if ! button=$(find_color "$window" 267 60 1080 750 7ce29b 6 10 filled); then
+      if ! button=$(find_color "$window" 294 60 1059 750 c6f26b 6 10 filled); then
         failure="$stage: Dismiss was not visible in the desktop card at 100%"
         break
       fi
       read -r x y _ <<< "$button"
       xdotool mousemove --window "$window" "$x" "$y" click 1
-      if ! find_color "$window" 267 60 1080 750 7ce29b 6 5 absent,filled; then
+      if ! find_color "$window" 294 60 1059 750 c6f26b 6 5 absent,filled; then
         failure="$stage: the report stayed after Dismiss"
         break
       fi
@@ -735,7 +739,7 @@ PY
           [[ -z $(find "$TMPDIR" -maxdepth 1 -name 'broxser-cdp-*' -print -quit) ]] && break
           sleep 0.05
         done
-        if ! button=$(find_color "$window" 1100 818 245 36 7ce29b 6 10 filled); then
+        if ! button=$(find_color "$window" 1100 830 255 30 c6f26b 6 10 filled); then
           failure="Restart runtime did not appear after the browser stopped"
           break
         fi
@@ -791,7 +795,7 @@ touch_run() {
     failure="no window within 20 s"
   else
     size_window "$window"
-    if ! button=$(find_color "$window" 250 60 230 760 3b82f6 40 30); then
+    if ! button=$(find_color "$window" 282 60 216 760 3b82f6 40 30); then
       failure="the phone frame did not show the touch target"
     else
       read -r x y _ < <(echo "$button")
@@ -876,17 +880,15 @@ workspace_run() {
     done
     return 1
   }
-  # The panel's buttons are filled: Add, Apply and Save in the accent color,
-  # Remove in the danger color. Buttons of one kind stack vertically at the
-  # right edge, so the first one sits at the top right of the bounding box of
-  # that color, and the lowest accent button is Apply or Save, at the left.
-  # Regions of the 340 px panel next to the 230 px sidebar: its right edge
-  # holds the Add and Remove columns (the selected card's accent border sits
-  # left of it while the panel is still closed); its left part holds the one
-  # accent action at the top: Apply while the draft differs, else Save.
-  panel_button() {
-    find_color "$window" "$2" 60 "$3" 780 "$1" 8 10 filled
-  }
+  # The panel sits right of the canvas (x 980-1360). Its filled buttons: Apply
+  # or Save and the plus of each preset tile in the accent color, Remove in
+  # the danger color. The card above the device list holds the one accent
+  # action, Apply while the draft differs, else Save; the preset tiles follow
+  # the device list, the first at the top left; the Remove column is at the
+  # right edge, the first at its top.
+  action_button() { find_color "$window" 996 150 350 260 c6f26b 8 10 filled; }
+  add_buttons() { find_color "$window" 996 440 350 380 c6f26b 8 10 filled; }
+  remove_buttons() { find_color "$window" 1236 180 114 520 ff7b72 8 10 filled; }
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   elif ! loaded "$before" 3; then
@@ -894,32 +896,32 @@ workspace_run() {
   else
     size_window "$window"
     xdotool mousemove --window "$window" 600 400 key ctrl+shift+w
-    if ! found=$(panel_button 7ce29b 500 70); then
+    if ! found=$(add_buttons); then
       failure="the panel did not open with Add buttons"
     else
-      # Add buttons are right-aligned; Save shares the color at the bottom left.
-      read -r _ _ _ y0 x1 _ < <(echo "$found")
-      xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+      # The first preset's plus is the top left of the pluses.
+      read -r _ _ x0 y0 _ _ < <(echo "$found")
+      xdotool mousemove --window "$window" $((x0 + 10)) $((y0 + 10)) click 1
       sleep 0.5
       mark=$(wc -l < "$work/requests")
-      read -r x y _ < <(panel_button 7ce29b 232 170)
+      read -r x y _ < <(action_button)
       xdotool mousemove --window "$window" "$x" "$y" click 1
       if ! loaded "$mark" 4; then
         failure="Apply did not restart with four devices"
-      elif ! found=$(panel_button e07a7a 480 90); then
+      elif ! found=$(remove_buttons); then
         failure="the draft showed no Remove button"
       else
-        read -r _ _ _ y0 x1 _ < <(echo "$found")
-        xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+        read -r _ _ x0 y0 _ _ < <(echo "$found")
+        xdotool mousemove --window "$window" $((x0 + 20)) $((y0 + 10)) click 1
         sleep 0.5
         mark=$(wc -l < "$work/requests")
-        read -r x y _ < <(panel_button 7ce29b 232 170)
+        read -r x y _ < <(action_button)
         xdotool mousemove --window "$window" "$x" "$y" click 1
         if ! loaded "$mark" 3; then
           failure="Apply did not restart with three devices"
         else
           sleep 1
-          read -r x y _ < <(panel_button 7ce29b 232 170)
+          read -r x y _ < <(action_button)
           xdotool mousemove --window "$window" "$x" "$y" click 1
           for _ in $(seq 50); do
             grep -q '"small-phone"' "$workspace" && break
@@ -938,7 +940,7 @@ workspace_run() {
             xdotool type --clearmodifiers --delay 0 'file:///tmp/broxser-invalid-save'
             # Locate Save again after each notice, rather than retaining its
             # coordinates from the previous action.
-            if ! found=$(panel_button 7ce29b 232 170); then
+            if ! found=$(action_button); then
               failure="Save was unavailable for the invalid URL"
             else
               read -r x y _ < <(echo "$found")
@@ -949,7 +951,7 @@ workspace_run() {
               else
                 xdotool key --clearmodifiers ctrl+l
                 xdotool type --clearmodifiers --delay 0 "$saved_url"
-                if ! found=$(panel_button 7ce29b 232 170); then
+                if ! found=$(action_button); then
                   failure="Save was unavailable after the invalid URL notice"
                 else
                   read -r x y _ < <(echo "$found")
@@ -1044,9 +1046,10 @@ PY
     done
     return 1
   }
-  panel_button() {
-    find_color "$window" "$2" 60 "$3" 780 "$1" 8 10 filled
-  }
+  # As in the workspace run: the panel is right of the canvas.
+  action_button() { find_color "$window" 996 150 350 260 c6f26b 8 10 filled; }
+  add_buttons() { find_color "$window" 996 440 350 380 c6f26b 8 10 filled; }
+  remove_buttons() { find_color "$window" 1236 180 114 520 ff7b72 8 10 filled; }
   if [[ -z $window ]]; then
     failure="no window within 20 s"
   elif ! loaded "$before" 3; then
@@ -1054,21 +1057,19 @@ PY
   else
     size_window "$window"
     xdotool mousemove --window "$window" 600 400 key ctrl+shift+w
-    # Until the panel is drawn, a card's error count lies where its Remove
-    # column will be and has the same danger color; wait for the Add column.
-    if ! panel_button 7ce29b 500 70 >/dev/null; then
+    if ! add_buttons >/dev/null; then
       failure="the panel did not open with Add buttons"
-    elif ! found=$(panel_button e07a7a 480 90); then
+    elif ! found=$(remove_buttons); then
       failure="the panel showed no Remove button"
     else
-      read -r _ _ _ y0 x1 _ < <(echo "$found")
-      xdotool mousemove --window "$window" $((x1 - 15)) $((y0 + 8)) click 1
+      read -r _ _ x0 y0 _ _ < <(echo "$found")
+      xdotool mousemove --window "$window" $((x0 + 20)) $((y0 + 10)) click 1
       sleep 0.5
-      # The pages' dark headers and buttons lie right of the panel; once all
-      # three frames show them (about 620 px at 50%), the right edge of their
-      # bounding box is in the third frame.
+      # The three frames sit side by side left of the panel (x 293-925 at
+      # 50%); once all show the pages' dark headers and buttons, the right
+      # edge of their bounding box is in the third frame.
       for _ in $(seq 20); do
-        found=$(find_color "$window" 580 60 770 700 17312b 10 1 filled) || found=
+        found=$(find_color "$window" 290 60 680 700 17312b 10 1 filled) || found=
         read -r _ _ x0 y0 x1 _ < <(echo "${found:-0 0 0 0 0 0}")
         ((x1 - x0 >= 500)) && break
         found=
@@ -1078,17 +1079,17 @@ PY
         failure="the three frames did not show the page"
       else
         x=$((x1 - 40)) y=$((y0 + 150))
-        if ! found=$(panel_button 7ce29b 232 170); then
+        if ! found=$(action_button); then
           failure="Apply was unavailable after Remove"
         else
           read -r apply_x apply_y _ < <(echo "$found")
           mark=$(wc -l < "$work/requests")
           # Apply, then move, scroll and click in the third frame, then click
-          # Hide on the sidebar's third row, outside every frame.
+          # Hide (the eye) on the sidebar's third row, outside every frame.
           xdotool mousemove --window "$window" "$apply_x" "$apply_y" mousedown 1 mouseup 1 \
             mousemove --window "$window" "$x" "$y" mousemove --window "$window" $((x + 4)) "$y" \
             mousedown 5 mouseup 5 mousedown 1 mouseup 1 \
-            mousemove --window "$window" 195 337 mousedown 1 mouseup 1
+            mousemove --window "$window" 227 301 mousedown 1 mouseup 1
           if ! loaded "$mark" 2; then
             failure="the desktop did not restart with two devices"
           fi
@@ -1122,9 +1123,10 @@ PY
 # Every device's page logs an error and a warning (ADR 0023). The phone's card
 # shows a filled count; clicking it opens the Console panel for the phone,
 # where Clear empties the phone's console only; Ctrl+Shift+J closes the panel.
-# Regions at 50%: the phone card spans x 254-474 without the panel and moves
-# 340 px right with it; the panel's Clear sits at its top right (x 480-570),
-# where nothing else is filled in the danger color.
+# Regions at 50%: the phone card spans x 280-501 and the tablet's x 521-931,
+# with or without the panel right of the canvas; the panel's Clear sits right
+# of Save report near its top (x 1100-1260, y 140-200), where nothing else is
+# filled in the danger color.
 console_run() {
   local label=$1
   local before app window= failure= found x0 y0 x y code=0 left_processes left_profiles
@@ -1143,25 +1145,25 @@ console_run() {
     done
     if [[ $(tail -n +"$((before + 1))" "$work/requests" | grep -c -- 'console.html?logged' || true) -lt 3 ]]; then
       failure="the pages did not log within 30 s"
-    elif ! found=$(find_color "$window" 250 60 230 760 e07a7a 8 15 filled); then
+    elif ! found=$(find_color "$window" 282 60 216 760 ff7b72 8 15 filled); then
       failure="the phone card showed no console count"
     else
       read -r _ _ x0 y0 _ _ <<< "$found"
       xdotool mousemove --window "$window" $((x0 + 10)) $((y0 + 5)) click 1
-      if ! found=$(find_color "$window" 480 60 90 80 e07a7a 8 10 filled); then
+      if ! found=$(find_color "$window" 1100 140 160 60 ff7b72 8 10 filled); then
         failure="the count did not open the Console panel"
       else
         read -r x y _ <<< "$found"
         xdotool mousemove --window "$window" "$x" "$y" click 1
-        if ! find_color "$window" 590 60 230 760 e07a7a 8 10 absent,filled >/dev/null; then
+        if ! find_color "$window" 282 60 216 760 ff7b72 8 10 absent,filled >/dev/null; then
           failure="Clear left the phone's count"
-        elif ! find_color "$window" 840 60 400 760 e07a7a 8 5 filled >/dev/null; then
+        elif ! find_color "$window" 523 60 405 760 ff7b72 8 5 filled >/dev/null; then
           failure="Clear removed the tablet's count too"
         else
           xdotool mousemove --window "$window" 900 400 key ctrl+shift+j
-          if ! find_color "$window" 480 60 90 80 e07a7a 8 10 absent,filled >/dev/null; then
+          if ! find_color "$window" 1100 140 160 60 ff7b72 8 10 absent,filled >/dev/null; then
             failure="Ctrl+Shift+J did not close the panel"
-          elif ! find_color "$window" 250 60 230 760 3b82f6 40 10 >/dev/null; then
+          elif ! find_color "$window" 282 60 216 760 3b82f6 40 10 >/dev/null; then
             failure="the phone frame did not return after the panel closed"
           fi
         fi
@@ -1195,10 +1197,9 @@ console_run() {
 # paused and hiding it need not publish any changed status. The panel must
 # still switch from its error to the tablet's warning. After browser exit,
 # Clear must work locally while the desktop's retained console stays readable.
-# The level labels are small anti-aliased text: on Xvfb with Lavapipe the
-# phone's "Error" had 19 pixels within 8 of its color, one short of
-# find_color's 20, and 39 within 32. Presence and absence use the same wider
-# tolerance, so a stale label still counts as present.
+# Entries are found by their level icons below the panel's header (x 990-1350,
+# y 285-685): small anti-aliased strokes, so presence and absence both use a
+# wide tolerance, and a stale icon still counts as present.
 console_selection_run() {
   local label=$1 before app window= failure= browser code=0 left_processes left_profiles
   before=$(wc -l < "$work/requests")
@@ -1215,16 +1216,17 @@ console_selection_run() {
       sleep 0.1
     done
     xdotool key ctrl+shift+j
-    if ! find_color "$window" 240 180 310 280 e07a7a 32 10 >/dev/null; then
+    if ! find_color "$window" 990 285 360 400 ff7b72 32 10 >/dev/null; then
       failure="phone error did not appear in its console"
     else
       # Wheel over the gap between cards scrolls the host canvas, not a page.
-      xdotool mousemove --window "$window" 824 500 click --repeat 20 --delay 30 5
+      xdotool mousemove --window "$window" 511 500 click --repeat 20 --delay 30 5
       sleep 0.5
-      xdotool mousemove --window "$window" 195 261 click 1
-      if ! find_color "$window" 240 180 310 280 e07a7a 32 5 absent >/dev/null; then
+      # Hide is the eye at the end of the phone's sidebar row.
+      xdotool mousemove --window "$window" 227 229 click 1
+      if ! find_color "$window" 990 285 360 400 ff7b72 32 5 absent >/dev/null; then
         failure="Hide changed the selection but kept the phone's console"
-      elif ! find_color "$window" 240 180 310 280 f2b872 32 5 >/dev/null; then
+      elif ! find_color "$window" 990 285 360 400 f2b35e 32 5 >/dev/null; then
         failure="Hide did not show the tablet's warning"
       else
         browser=$(pgrep -P "$app" -f -- "--user-data-dir=$TMPDIR/broxser-cdp-" || true)
@@ -1240,13 +1242,15 @@ console_selection_run() {
           if [[ $left_processes -ne 0 || $left_profiles -ne 0 ]]; then
             failure="browser did not finish cleanup"
           else
-            xdotool mousemove --window "$window" 525 122 click 1
-            if ! find_color "$window" 240 180 310 280 f2b872 32 5 absent >/dev/null; then
+            # Clear, right of Save report.
+            xdotool mousemove --window "$window" 1168 164 click 1
+            if ! find_color "$window" 990 285 360 400 f2b35e 32 5 absent >/dev/null; then
               failure="Clear left retained messages after the browser exited"
             else
               # The desktop is still inspectable, and another device is intact.
-              xdotool mousemove --window "$window" 60 385 click 1
-              if ! find_color "$window" 240 180 310 280 f2b872 32 5 >/dev/null; then
+              # The desktop's row, under the Admin session.
+              xdotool mousemove --window "$window" 100 343 click 1
+              if ! find_color "$window" 990 285 360 400 f2b35e 32 5 >/dev/null; then
                 failure="Clear removed the other device's retained messages"
               fi
             fi
@@ -1303,9 +1307,9 @@ report_run() {
     xdotool mousemove --window "$window" 900 400 key ctrl+shift+j
     # The panel is open once its Clear shows; only then does the region of
     # Save report hold no accent card border.
-    if ! find_color "$window" 480 60 90 80 e07a7a 8 10 filled >/dev/null; then
+    if ! find_color "$window" 1100 140 160 60 ff7b72 8 10 filled >/dev/null; then
       failure="Ctrl+Shift+J did not open the Console panel"
-    elif ! found=$(find_color "$window" 380 90 115 60 7ce29b 8 5 filled); then
+    elif ! found=$(find_color "$window" 990 140 140 60 c6f26b 8 5 filled); then
       failure="the Console panel showed no Save report"
     else
       read -r x y _ <<< "$found"

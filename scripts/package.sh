@@ -32,11 +32,12 @@ cargo build --release --locked -p broxser-desktop -p broxser-cli
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 root=$stage/$name
-mkdir -p "$root/bin" "$root/runtime" "$root/scripts"
+mkdir -p "$root/bin" "$root/runtime" "$root/scripts" "$root/licenses"
 install -m 0755 target/release/broxser-desktop target/release/broxser "$root/bin/"
 install -m 0644 README.md NOTICE.md SECURITY.md "$root/"
 install -m 0644 runtime/helium-linux-x86_64.json "$root/runtime/"
 install -m 0755 scripts/fetch-helium.sh "$root/scripts/"
+install -m 0644 crates/broxser-desktop/fonts/OFL.txt "$root/licenses/geist-OFL.txt"
 python3 scripts/sbom.py --output "$root/sbom.spdx.json" --summary "$root/THIRD-PARTY.md" \
   --licenses "$root/THIRD-PARTY-LICENSES.txt"
 printf '%s\n' "$commit" > "$root/COMMIT"

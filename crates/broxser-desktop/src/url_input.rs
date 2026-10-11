@@ -2,10 +2,12 @@
 //! It serves the URL bar and the answer of a prompt dialog. IME composition,
 //! partial selection and copy are not supported yet.
 
-use crate::{ACCENT, BG, BORDER, MUTED, RAISED, TEXT};
+use crate::theme::{
+    ACCENT, BORDER_STRONG, CANVAS, Icon, MONO, MUTED, TEXT, TEXT_2, icon, kbd, tint,
+};
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Keystroke, MouseButton,
-    Window, div, prelude::*, px, rgb,
+    App, BoxShadow, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Keystroke,
+    MouseButton, Window, div, point, prelude::*, px, rgb,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -19,6 +21,9 @@ pub(crate) enum UrlEvent {
 pub(crate) struct UrlInput {
     edit: LineEdit,
     focus: FocusHandle,
+    /// The toolbar's address field: a globe before the text and the Ctrl+L
+    /// hint after it while unfocused. A prompt's answer field has neither.
+    address: bool,
 }
 
 /// The text of a single-line field and how key presses edit it.
@@ -60,6 +65,15 @@ impl UrlInput {
         Self {
             edit: LineEdit::new(text, max_chars),
             focus: cx.focus_handle(),
+            address: false,
+        }
+    }
+
+    /// The toolbar's address field showing `text`.
+    pub(crate) fn address(text: String, cx: &mut Context<Self>) -> Self {
+        Self {
+            address: true,
+            ..Self::new(text, None, cx)
         }
     }
 
@@ -230,8 +244,8 @@ impl Render for UrlInput {
         let (before, after) = edit.text.split_at(edit.cursor);
         let text = if focused && edit.select_all {
             div()
-                .bg(rgb(RAISED))
-                .text_color(rgb(ACCENT))
+                .rounded(px(3.))
+                .bg(tint(ACCENT, 0x40))
                 .child(edit.text.clone())
                 .into_any_element()
         } else {
@@ -240,11 +254,12 @@ impl Render for UrlInput {
                 .items_center()
                 .child(before.to_owned())
                 .when(focused, |this| {
-                    this.child(div().w(px(1.5)).h(px(16.)).bg(rgb(TEXT)))
+                    this.child(div().w(px(1.5)).h(px(16.)).bg(rgb(ACCENT)))
                 })
                 .child(after.to_owned())
                 .into_any_element()
         };
+        let address = self.address;
         div()
             .id("url-input")
             .track_focus(&self.focus)
@@ -259,19 +274,48 @@ impl Render for UrlInput {
             )
             .flex_1()
             .min_w_0()
-            .h(px(32.))
+            .h(px(if address { 34. } else { 30. }))
             .flex()
             .items_center()
-            .px_3()
-            .rounded_md()
+            .gap(px(8.))
+            .pl(px(if address { 11. } else { 9. }))
+            .pr(px(if address { 7. } else { 9. }))
+            .rounded(px(if address { 9. } else { 7. }))
             .border_1()
-            .border_color(rgb(if focused { ACCENT } else { BORDER }))
-            .bg(rgb(BG))
-            .text_sm()
+            .border_color(rgb(if focused { ACCENT } else { BORDER_STRONG }))
+            .when(focused, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: tint(ACCENT, 0x2e).into(),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(3.),
+                }])
+            })
+            .bg(rgb(CANVAS))
+            .font_family(MONO)
+            .text_size(px(if address { 12.5 } else { 12. }))
             .text_color(rgb(if edit.text.is_empty() { MUTED } else { TEXT }))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(text)
+            .when(address, |this| {
+                this.child(icon(Icon::Globe, 14., if focused { TEXT_2 } else { MUTED }))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(text),
+            )
+            .when(address && !focused, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .gap(px(3.))
+                        .child(kbd("Ctrl"))
+                        .child(kbd("L")),
+                )
+            })
     }
 }
 

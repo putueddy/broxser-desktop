@@ -6,11 +6,13 @@
 use crate::ime::{ImeBuffer, Origin};
 use crate::lifecycle::{AfterStop, CloseRequest, Lifecycle};
 use crate::report;
-use crate::url_input::{UrlEvent, UrlInput};
-use crate::{
-    ACCENT, BG, BORDER, DANGER, FocusUrl, MUTED, Quit, RAISED, Refresh, SURFACE, TEXT,
-    ToggleConsole, TogglePanel, WARN,
+use crate::theme::{
+    self, ACCENT, ACCENT_SOFT, BORDER, BORDER_STRONG, CANVAS, CARD, CHROME, DANGER, DANGER_TEXT,
+    DIALOG_FILL, DIVIDER, FAINT, HOVER, INFO, INK, Icon, MUTED, TEXT, TEXT_2, Tone, WARN,
+    WARN_TEXT,
 };
+use crate::url_input::{UrlEvent, UrlInput};
+use crate::{FocusUrl, Quit, Refresh, ToggleConsole, TogglePanel};
 use anyhow::{Context as _, Result};
 use broxser_core::{AppState, PRESETS, WindowSize, Workspace, validate_url};
 use broxser_engine::{
@@ -26,7 +28,7 @@ use gpui::{
     AnyElement, Bounds, Context, Corners, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString,
-    Subscription, UTF16Selection, Window, canvas, div, prelude::*, px, rgb,
+    Subscription, UTF16Selection, Window, canvas, div, prelude::*, px, rgb, rgba,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -43,6 +45,12 @@ const WHEEL_LINE: f32 = 40.0;
 /// the canvas does not scroll sideways, so the panel of a wide device stays
 /// readable in a half-width window.
 const PANEL_WIDTH: f32 = 360.0;
+/// The device list left of the canvas.
+const SIDEBAR_WIDTH: f32 = 256.0;
+/// The Workspace or Console panel right of the canvas.
+const INSPECTOR_WIDTH: f32 = 380.0;
+/// Corner radius of a device frame, its image included.
+const FRAME_RADIUS: f32 = 6.0;
 
 pub(crate) struct LiveView {
     workspace: Workspace,
@@ -283,7 +291,7 @@ impl LiveView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let url = cx.new(|cx| UrlInput::new(workspace.url.clone(), None, cx));
+        let url = cx.new(|cx| UrlInput::address(workspace.url.clone(), cx));
         let url_events = cx.subscribe_in(&url, window, |view, _, event, window, cx| match event {
             UrlEvent::Submit(text) => view.navigate(text.trim(), window, cx),
             UrlEvent::Cancel => window.blur(),
@@ -741,19 +749,20 @@ impl LiveView {
             ),
         };
         let button = |id: &'static str, label: &'static str, accept: bool, primary: bool| {
-            div()
-                .id((id, index))
-                .cursor_pointer()
-                .rounded_md()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .bg(rgb(if primary { ACCENT } else { RAISED }))
-                .text_color(rgb(if primary { BG } else { TEXT }))
-                .child(label)
-                .on_click(
-                    cx.listener(move |view, _, _, cx| view.answer_dialog(index, token, accept, cx)),
-                )
+            theme::button(
+                (id, index),
+                if primary {
+                    Tone::Primary
+                } else {
+                    Tone::Secondary
+                },
+                28.,
+            )
+            .when(primary, |this| this.px(px(14.)))
+            .child(label)
+            .on_click(
+                cx.listener(move |view, _, _, cx| view.answer_dialog(index, token, accept, cx)),
+            )
         };
         let buttons = match dialog.kind {
             DialogKind::Alert => vec![button("dialog-ok", "OK", true, true)],
@@ -773,20 +782,23 @@ impl LiveView {
             .map(|field| field.input.clone());
         div()
             .w(px(width))
-            .mb_3()
-            .p_2()
-            .rounded_md()
+            .p(px(11.))
+            .rounded(px(10.))
             .border_1()
             .border_color(rgb(WARN))
-            .bg(rgb(SURFACE))
+            .bg(rgb(DIALOG_FILL))
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(10.))
             .child(
                 div()
-                    .text_xs()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .text_size(px(12.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(WARN))
+                    .text_color(rgb(WARN_TEXT))
+                    .child(theme::icon(Icon::Dialog, 13., WARN_TEXT))
                     .child(title),
             )
             .child(
@@ -794,15 +806,16 @@ impl LiveView {
                 // shortened, stay readable.
                 div()
                     .id(("dialog-message", token))
-                    .text_sm()
+                    .text_size(px(12.5))
+                    .line_height(px(18.))
                     .max_h(px(120.))
                     .overflow_y_scroll()
                     .child(message),
             )
-            .when_some(field, |this, field| this.child(field))
+            .when_some(field, |this, field| this.child(div().flex().child(field)))
             // At the panel's left edge the answers stay in the canvas, which
             // does not scroll sideways, whatever the window width.
-            .child(div().flex().gap_2().children(buttons))
+            .child(div().flex().gap(px(6.)).children(buttons))
             .into_any_element()
     }
 
@@ -1145,7 +1158,12 @@ impl LiveView {
 
     /// Opens `panel` in place of another one, or closes it.
     fn toggle(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
-        self.panel = (self.panel != Some(panel)).then_some(panel);
+        self.show_panel((self.panel != Some(panel)).then_some(panel), cx);
+    }
+
+    /// Shows `panel`, or no panel: the panel's tabs and its close button.
+    fn show_panel(&mut self, panel: Option<SidePanel>, cx: &mut Context<Self>) {
+        self.panel = panel;
         self.read_console();
         cx.notify();
     }
@@ -1799,6 +1817,8 @@ impl LiveView {
         let status = self.status.devices.get(index).cloned().unwrap_or_default();
         let width = device.width as f32 * self.scale;
         let height = device.height as f32 * self.scale;
+        // Header, notices and footer are never narrower than this.
+        let content = width.max(180.);
         let bounds = Rc::clone(&view.bounds);
         let on_screen = Rc::clone(&view.on_screen);
         let image = view.image.clone();
@@ -1823,56 +1843,235 @@ impl LiveView {
                 }
                 // GPUI uploads every painted image, including clipped ones.
                 if shown && let Some(image) = image {
-                    let _ = window.paint_image(area, Corners::default(), image, 0, false);
+                    let corners = Corners::all(px(FRAME_RADIUS));
+                    let _ = window.paint_image(area, corners, image, 0, false);
                 }
             },
         )
         .size_full();
-        let state: SharedString = match (&status.error, status.loading) {
-            (Some(error), _) => error.clone().into(),
-            (None, true) => "Loading…".into(),
-            (None, false) if status.url.is_empty() => "Starting…".into(),
-            (None, false) => status.url.clone().into(),
+        let session = self
+            .workspace
+            .sessions
+            .iter()
+            .position(|session| session.id == device.session);
+        let mut meta = format!(
+            "{} × {} · {}×",
+            device.width, device.height, device.device_scale_factor
+        );
+        if device.touch {
+            meta.push_str(" · touch");
+        }
+        let state = match (&status.error, status.loading) {
+            (Some(error), _) => div()
+                .flex()
+                .gap(px(6.))
+                .text_size(px(11.5))
+                .line_height(px(16.))
+                .text_color(rgb(WARN_TEXT))
+                .child(
+                    div()
+                        .pt(px(2.))
+                        .child(theme::icon(Icon::Warning, 12., WARN)),
+                )
+                // Wraps up to three lines, so the reason stays readable.
+                .child(div().flex_1().min_w_0().line_clamp(3).child(error.clone())),
+            (None, true) => div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(11.5))
+                .text_color(rgb(INFO))
+                .child(theme::icon(Icon::Loading, 12., INFO))
+                .child("Loading…"),
+            (None, false) if status.url.is_empty() => div()
+                .text_size(px(11.5))
+                .text_color(rgb(MUTED))
+                .child("Starting…"),
+            (None, false) => theme::mono(status.url.clone(), 11., TEXT_2).truncate(),
         };
+        let header = div()
+            .w(px(content))
+            .flex()
+            .flex_col()
+            .gap(px(5.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(theme::icon(
+                        theme::device_icon(device.width, device.mobile),
+                        14.,
+                        TEXT_2,
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(device.name.clone()),
+                    )
+                    .children(session.map(|session| {
+                        div().flex_1().flex().justify_end().child(theme::tag(
+                            self.workspace.sessions[session].name.clone(),
+                            theme::session_hue(session),
+                        ))
+                    })),
+            )
+            .child(theme::mono(meta, 11., MUTED))
+            .child(state);
+        let frame = div()
+            .id(("frame", index))
+            .w(px(width))
+            .h(px(height))
+            .flex_none()
+            .bg(rgb(CANVAS))
+            .rounded(px(FRAME_RADIUS))
+            .shadow(theme::frame_shadow())
+            .overflow_hidden()
+            .cursor_default()
+            .child(surface)
+            .on_any_mouse_down(
+                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                    view.pointer(
+                        index,
+                        PointerKind::Down,
+                        event.position,
+                        Some(event.button),
+                        event.click_count,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
+            .capture_any_mouse_up(cx.listener(move |view, event: &MouseUpEvent, window, cx| {
+                view.pointer(
+                    index,
+                    PointerKind::Up,
+                    event.position,
+                    Some(event.button),
+                    event.click_count,
+                    &event.modifiers,
+                    window,
+                    cx,
+                );
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |view, event: &MouseUpEvent, _, _| {
+                    view.release_outside(index, &event.modifiers);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |view, event: &MouseMoveEvent, window, cx| {
+                    view.pointer(
+                        index,
+                        PointerKind::Move,
+                        event.position,
+                        event.pressed_button,
+                        0,
+                        &event.modifiers,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_scroll_wheel(cx.listener(move |view, event: &ScrollWheelEvent, _, cx| {
+                view.wheel(index, event);
+                cx.stop_propagation();
+            }));
+        let stream = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .text_color(rgb(0xc9ced5))
+            .when(status.streaming, |this| {
+                this.child(theme::dot(ACCENT, 5.)).child("Streaming")
+            })
+            .when(!status.streaming, |this| {
+                this.child(theme::icon(Icon::Paused, 12., TEXT_2))
+                    .child("Paused")
+            });
+        let frames = theme::mono(
+            format!(
+                "{} frames · {} replaced",
+                status.frames, status.dropped_frames
+            ),
+            11.,
+            MUTED,
+        );
+        let footer = div()
+            .w(px(content))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .text_size(px(11.5))
+            .text_color(rgb(MUTED))
+            .child(if content >= 300. {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(stream)
+                    .child(div().flex_1().flex().justify_end().child(frames))
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(stream)
+                    .child(frames)
+            })
+            .children(activity_line(&status))
+            .when(
+                status.console_errors > 0 || status.console_warnings > 0,
+                |this| {
+                    // Filled in the danger or warning color, so a real-window
+                    // check can find it by color alone.
+                    this.child(
+                        div().flex().pt(px(4.)).child(
+                            div()
+                                .id(("console-summary", index))
+                                .h(px(24.))
+                                .pl(px(8.))
+                                .pr(px(9.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .bg(rgb(if status.console_errors > 0 {
+                                    DANGER
+                                } else {
+                                    WARN
+                                }))
+                                .text_color(rgb(INK))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(theme::icon(Icon::Console, 12., INK))
+                                .child(console_counts(&status))
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.open_console(index, window, cx)
+                                })),
+                        ),
+                    )
+                },
+            );
         div()
             .flex_none()
             .flex()
             .flex_col()
-            .rounded_lg()
+            .gap(px(12.))
+            .p(px(12.))
+            .rounded(px(14.))
             .border_1()
-            .border_color(rgb(if Some(index) == self.selected {
-                ACCENT
-            } else {
-                BORDER
-            }))
-            .bg(rgb(RAISED))
-            .p_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .mb_3()
-                    .w(px(width.max(180.)))
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(device.name.clone()),
-                    )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "{} × {} · {}× · {}",
-                        device.width, device.height, device.device_scale_factor, device.session
-                    )))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_ellipsis()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_color(rgb(if status.error.is_some() { WARN } else { MUTED }))
-                            .child(state),
-                    ),
-            )
+            .border_color(rgb(if selected { ACCENT } else { BORDER }))
+            .bg(rgb(CARD))
+            .shadow(theme::card_shadow(selected))
+            .child(header)
             .when_some(
                 open_dialog(&self.status, self.session.is_some(), index).cloned(),
                 |this, dialog| {
@@ -1880,118 +2079,17 @@ impl LiveView {
                     this.child(self.dialog_panel(index, &dialog, panel, cx))
                 },
             )
-            .child(
-                div()
-                    .id(("frame", index))
-                    .w(px(width))
-                    .h(px(height))
-                    .bg(rgb(BG))
-                    .overflow_hidden()
-                    .rounded_sm()
-                    .cursor_default()
-                    .child(surface)
-                    .on_any_mouse_down(cx.listener(
-                        move |view, event: &MouseDownEvent, window, cx| {
-                            view.pointer(
-                                index,
-                                PointerKind::Down,
-                                event.position,
-                                Some(event.button),
-                                event.click_count,
-                                &event.modifiers,
-                                window,
-                                cx,
-                            );
-                            cx.stop_propagation();
-                        },
-                    ))
-                    .capture_any_mouse_up(cx.listener(
-                        move |view, event: &MouseUpEvent, window, cx| {
-                            view.pointer(
-                                index,
-                                PointerKind::Up,
-                                event.position,
-                                Some(event.button),
-                                event.click_count,
-                                &event.modifiers,
-                                window,
-                                cx,
-                            );
-                        },
-                    ))
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |view, event: &MouseUpEvent, _, _| {
-                            view.release_outside(index, &event.modifiers);
-                        }),
-                    )
-                    .on_mouse_move(
-                        cx.listener(move |view, event: &MouseMoveEvent, window, cx| {
-                            view.pointer(
-                                index,
-                                PointerKind::Move,
-                                event.position,
-                                event.pressed_button,
-                                0,
-                                &event.modifiers,
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(move |view, event: &ScrollWheelEvent, _, cx| {
-                        view.wheel(index, event);
-                        cx.stop_propagation();
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .mt_3()
-                    .w(px(width.max(180.)))
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(format!(
-                        "{} frames · {} replaced",
-                        status.frames, status.dropped_frames
-                    ))
-                    .child(activity_line(&status))
-                    .when(
-                        status.console_errors > 0 || status.console_warnings > 0,
-                        |this| {
-                            // Filled in the danger or warning color, so a
-                            // real-window check can find it by color alone.
-                            this.child(
-                                div().flex().child(
-                                    div()
-                                        .id(("console-summary", index))
-                                        .cursor_pointer()
-                                        .rounded_md()
-                                        .bg(rgb(if status.console_errors > 0 {
-                                            DANGER
-                                        } else {
-                                            WARN
-                                        }))
-                                        .text_color(rgb(BG))
-                                        .px_2()
-                                        .py_0p5()
-                                        .child(format!("{} · Console", console_counts(&status)))
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.open_console(index, window, cx)
-                                        })),
-                                ),
-                            )
-                        },
-                    ),
-            )
+            // A viewport narrower than the card's text sits in its middle.
+            .child(div().w(px(content)).flex().justify_center().child(frame))
+            .child(footer)
             .when_some(
                 status
                     .popup
                     .clone()
                     .filter(|popup| view.dismissed_popup != Some(popup.token)),
-                |this, popup| this.child(self.popup_notice(index, &popup, width.max(180.), cx)),
+                |this, popup| {
+                    this.child(self.popup_notice(index, &popup, width.clamp(180., PANEL_WIDTH), cx))
+                },
             )
             .when_some(
                 status
@@ -2030,48 +2128,24 @@ impl LiveView {
         };
         let filename = line(&download.filename, "(no file name)");
         let url = line(&download.url, "(no address)");
-        div()
-            .w(px(width))
-            .mt_2()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_xs()
+        notice(width, Icon::Download, "Refused a download the page started")
             .child(
                 div()
-                    .text_color(rgb(MUTED))
-                    .child("Refused a download the page started"),
-            )
-            .child(
-                div()
-                    .text_ellipsis()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(filename),
-            )
-            .child(
-                div()
-                    .text_ellipsis()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(rgb(MUTED))
-                    .child(url),
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(filename),
+                    )
+                    .child(theme::mono(url, 11., MUTED).truncate()),
             )
             .child(
                 div().flex().child(
-                    div()
-                        .id(("download-dismiss", index))
-                        .cursor_pointer()
-                        .rounded_md()
-                        .px_3()
-                        .py_1()
-                        .bg(rgb(ACCENT))
-                        .text_color(rgb(BG))
+                    theme::button(("download-dismiss", index), Tone::Primary, 28.)
                         .child("Dismiss")
                         .on_click(cx.listener(move |view, _, _, cx| {
                             // Only the report this button was drawn with: after
@@ -2094,7 +2168,7 @@ impl LiveView {
 
     /// The latest window the device's page opened, which Broxser closed
     /// (ADR 0015). Opening it loads its URL in this device; nothing opens it
-    /// otherwise.
+    /// otherwise. Its answers sit at the left edge like a dialog's.
     fn popup_notice(
         &self,
         index: usize,
@@ -2108,50 +2182,30 @@ impl LiveView {
         } else {
             popup.url.clone().into()
         };
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id((id, index))
-                .cursor_pointer()
-                .rounded_md()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .bg(rgb(if primary { ACCENT } else { RAISED }))
-                .text_color(rgb(if primary { BG } else { TEXT }))
-                .child(label)
-        };
-        div()
-            .w(px(width))
-            .mt_2()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_xs()
-            .child(
-                div()
-                    .text_color(rgb(MUTED))
-                    .child("Closed a window the page opened"),
-            )
-            .child(
-                div()
-                    .text_ellipsis()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(url),
-            )
+        notice(width, Icon::Window, "Closed a window the page opened")
+            .child(theme::mono(url, 11., TEXT_2).truncate())
             .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .justify_end()
+                    .gap(px(6.))
+                    .when(popup.openable, |this| {
+                        this.child(
+                            theme::button(("popup-open", index), Tone::Primary, 28.)
+                                .child("Open here")
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.notice = None;
+                                    view.send(Command::OpenPopup {
+                                        device: index,
+                                        token,
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
-                        button("popup-dismiss", "Dismiss", false).on_click(cx.listener(
-                            move |view, _, _, cx| {
+                        theme::button(("popup-dismiss", index), Tone::Secondary, 28.)
+                            .child("Dismiss")
+                            .on_click(cx.listener(move |view, _, _, cx| {
                                 // As for downloads: only the report still shown.
                                 let shown = view
                                     .status
@@ -2164,158 +2218,152 @@ impl LiveView {
                                     device.dismissed_popup = Some(token);
                                 }
                                 cx.notify();
-                            },
-                        )),
-                    )
-                    .when(popup.openable, |this| {
-                        this.child(
-                            button("popup-open", "Open here", true).on_click(cx.listener(
-                                move |view, _, _, cx| {
-                                    view.notice = None;
-                                    view.send(Command::OpenPopup {
-                                        device: index,
-                                        token,
-                                    });
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                    }),
+                            })),
+                    ),
             )
             .into_any_element()
     }
 
+    /// Brand, the address with Go, then the selected device's reload, sync,
+    /// zoom and the panel buttons at fixed widths from the right edge.
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sync = self.sync;
-        let toggle = |id: &'static str, label: &'static str, on: bool| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(if on { ACCENT } else { BORDER }))
-                .bg(rgb(if on { SURFACE } else { RAISED }))
-                .text_color(rgb(if on { ACCENT } else { TEXT }))
-                .px_3()
-                .py_1()
-                .text_xs()
-                .child(label)
-        };
-        let button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .rounded_md()
-                .bg(rgb(RAISED))
-                .px_3()
-                .py_1()
-                .text_sm()
-                .child(label)
-        };
+        let live = div()
+            .h(px(22.))
+            .px(px(9.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .rounded_full()
+            .bg(rgba(ACCENT_SOFT))
+            .text_size(px(11.5))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(ACCENT))
+            .child(theme::dot(ACCENT, 6.))
+            .child("Live frames");
         div()
-            .h(px(58.))
+            .h(px(52.))
             .flex_none()
             .flex()
             .items_center()
-            .gap_3()
-            .px_5()
+            .gap(px(12.))
+            .pl(px(16.))
+            .pr(px(14.))
+            .bg(rgb(CHROME))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(div().size(px(11.)).rounded_full().bg(rgb(ACCENT)))
+            .child(theme::brand(live))
+            .child(theme::divider())
             .child(
                 div()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("Broxser"),
-            )
-            .child(div().text_xs().text_color(rgb(MUTED)).child("LIVE FRAMES"))
-            .child(self.url.clone())
-            .child(
-                div()
-                    .id("go")
-                    .cursor_pointer()
-                    .rounded_md()
-                    .bg(rgb(ACCENT))
-                    .text_color(rgb(BG))
-                    .px_3()
-                    .py_1()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Go")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        let text = view.url.read(cx).text().to_owned();
-                        view.navigate(&text, window, cx);
-                    })),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(self.url.clone())
+                    .child(
+                        theme::button("go", Tone::Primary, 34.)
+                            .pl(px(14.))
+                            .rounded(px(9.))
+                            .text_size(px(13.))
+                            .child("Go")
+                            .child(theme::icon(Icon::Go, 14., INK))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                let text = view.url.read(cx).text().to_owned();
+                                view.navigate(&text, window, cx);
+                            })),
+                    ),
             )
             .child(
-                button("reload", "Reload")
+                theme::button("reload", Tone::Secondary, 34.)
+                    .rounded(px(9.))
+                    .text_size(px(13.))
+                    .child(theme::icon(Icon::Reload, 14., TEXT))
+                    .child("Reload")
                     .on_click(cx.listener(|view, _, _, cx| view.reload_selected(cx))),
             )
             .child(
-                toggle(
+                theme::segmented()
+                    .child(
+                        div()
+                            .pl(px(8.))
+                            .pr(px(6.))
+                            .child(theme::caps("SYNC", MUTED)),
+                    )
+                    .child(
+                        theme::segment(
+                            "sync-navigation",
+                            Some(Icon::Links),
+                            "Links",
+                            sync.navigation,
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.set_sync(
+                                SyncSettings {
+                                    navigation: !sync.navigation,
+                                    ..sync
+                                },
+                                cx,
+                            )
+                        })),
+                    )
+                    .child(
+                        theme::segment("sync-scroll", Some(Icon::Scroll), "Scroll", sync.scroll)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.set_sync(
+                                    SyncSettings {
+                                        scroll: !sync.scroll,
+                                        ..sync
+                                    },
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
+            .child(theme::stepper(
+                format!("{}%", (self.scale * 100.).round() as u32),
+                div()
+                    .id("zoom-out")
+                    .on_click(cx.listener(|view, _, window, cx| view.zoom_by(-0.125, window, cx))),
+                div()
+                    .id("zoom-in")
+                    .on_click(cx.listener(|view, _, window, cx| view.zoom_by(0.125, window, cx))),
+            ))
+            .child(theme::divider())
+            .child(
+                theme::toggle(
                     "workspace-panel",
+                    Icon::Workspace,
                     "Workspace",
                     self.panel == Some(SidePanel::Workspace),
+                    116.,
                 )
                 .on_click(cx.listener(|view, _, _, cx| view.toggle_panel(cx))),
             )
             .child(
-                toggle(
+                theme::toggle(
                     "console-panel-toggle",
+                    Icon::Console,
                     "Console",
                     self.panel == Some(SidePanel::Console),
+                    100.,
                 )
                 .on_click(cx.listener(|view, _, _, cx| view.toggle(SidePanel::Console, cx))),
             )
-            .child(
-                toggle("sync-navigation", "Sync links", sync.navigation).on_click(cx.listener(
-                    move |view, _, _, cx| {
-                        view.set_sync(
-                            SyncSettings {
-                                navigation: !sync.navigation,
-                                ..sync
-                            },
-                            cx,
-                        )
-                    },
-                )),
-            )
-            .child(
-                toggle("sync-scroll", "Sync scroll", sync.scroll).on_click(cx.listener(
-                    move |view, _, _, cx| {
-                        view.set_sync(
-                            SyncSettings {
-                                scroll: !sync.scroll,
-                                ..sync
-                            },
-                            cx,
-                        )
-                    },
-                )),
-            )
-            .child(
-                button("zoom-out", "−")
-                    .on_click(cx.listener(|view, _, window, cx| view.zoom_by(-0.125, window, cx))),
-            )
-            .child(
-                div()
-                    .w(px(44.))
-                    .text_center()
-                    .text_sm()
-                    .child(format!("{}%", (self.scale * 100.).round() as u32)),
-            )
-            .child(
-                button("zoom-in", "+")
-                    .on_click(cx.listener(|view, _, window, cx| view.zoom_by(0.125, window, cx))),
-            )
     }
 
+    /// The workspace and its devices by session. Rows have fixed heights, so a
+    /// window check can reach them by position.
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sections: Vec<AnyElement> = self
             .workspace
             .sessions
             .iter()
-            .map(|session| {
+            .enumerate()
+            .map(|(session_index, session)| {
+                let hue = theme::session_hue(session_index);
                 let rows: Vec<AnyElement> = self
                     .workspace
                     .devices
@@ -2324,77 +2372,298 @@ impl LiveView {
                     .filter(|(_, device)| device.session == session.id)
                     .map(|(index, device)| {
                         let hidden = self.devices[index].hidden;
+                        let selected = self.selected == Some(index);
+                        let status = self.status.devices.get(index);
+                        let state = status.filter(|_| !hidden).and_then(|status| {
+                            if status.error.is_some() {
+                                Some(WARN)
+                            } else if status.loading {
+                                Some(INFO)
+                            } else {
+                                status.streaming.then_some(ACCENT)
+                            }
+                        });
                         div()
+                            .h(px(34.))
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .pl_3()
-                            .py_1()
-                            .border_l_2()
-                            .border_color(rgb(if Some(index) == self.selected {
-                                ACCENT
+                            .gap(px(2.))
+                            .pl(px(10.))
+                            .pr(px(4.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(if selected {
+                                rgb(BORDER_STRONG)
                             } else {
-                                BORDER
-                            }))
-                            .text_sm()
+                                rgba(0)
+                            })
+                            .when(selected, |this| this.bg(rgb(HOVER)))
                             .child(
                                 div()
                                     .id(("select", index))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(9.))
                                     .cursor_pointer()
-                                    .text_color(rgb(if hidden { MUTED } else { TEXT }))
-                                    .child(device.name.clone())
+                                    .text_color(rgb(if hidden {
+                                        MUTED
+                                    } else if selected {
+                                        TEXT
+                                    } else {
+                                        0xd7dbe0
+                                    }))
+                                    .child(theme::icon(
+                                        theme::device_icon(device.width, device.mobile),
+                                        15.,
+                                        if hidden {
+                                            FAINT
+                                        } else if selected {
+                                            0xc9ced5
+                                        } else {
+                                            0xa4abb5
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(13.))
+                                            .font_weight(if selected {
+                                                gpui::FontWeight::SEMIBOLD
+                                            } else {
+                                                gpui::FontWeight::MEDIUM
+                                            })
+                                            .child(device.name.clone()),
+                                    )
+                                    .children(state.map(|color| theme::dot(color, 6.)))
+                                    .child(div().flex_1().flex().justify_end().child(if hidden {
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(MUTED))
+                                            .child("Hidden")
+                                    } else {
+                                        theme::mono(
+                                            format!("{}×{}", device.width, device.height),
+                                            11.,
+                                            MUTED,
+                                        )
+                                    }))
                                     .on_click(cx.listener(move |view, _, window, cx| {
                                         view.select(index, window, cx)
                                     })),
                             )
                             .child(
-                                div()
-                                    .id(("visibility", index))
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(if hidden { "Show" } else { "Hide" })
-                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                theme::icon_button(
+                                    ("visibility", index),
+                                    if hidden { Icon::Hidden } else { Icon::Visible },
+                                    if hidden { 0xa4abb5 } else { MUTED },
+                                )
+                                .on_click(cx.listener(
+                                    move |view, _, window, cx| {
                                         view.toggle_hidden(index, window, cx)
-                                    })),
+                                    },
+                                )),
                             )
                             .into_any_element()
                     })
                     .collect();
+                let initial: String = session
+                    .name
+                    .chars()
+                    .next()
+                    .map(|first| first.to_uppercase().collect())
+                    .unwrap_or_default();
                 div()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .mb_6()
-                    .child(div().text_sm().child(session.name.clone()))
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .h(px(24.))
+                            .pb(px(6.))
+                            .px(px(6.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .size(px(18.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.))
+                                    .bg(theme::tint(hue, 0x29))
+                                    .text_size(px(10.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(hue))
+                                    .child(initial),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(session.name.clone()),
+                            )
+                            .child(
+                                theme::mono(rows.len().to_string(), 11., MUTED)
+                                    .flex_1()
+                                    .flex()
+                                    .justify_end(),
+                            ),
+                    )
                     .children(rows)
                     .into_any_element()
             })
             .collect();
         div()
-            .w(px(230.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(SURFACE))
+            .bg(rgb(CHROME))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .p_5()
-            .child(div().mb_5().text_xs().text_color(rgb(ACCENT)).child("WORKSPACE"))
-            .child(div().mb_8().text_lg().font_weight(gpui::FontWeight::SEMIBOLD).child(self.workspace.name.clone()))
-            .child(div().mb_4().text_xs().text_color(rgb(MUTED)).child("SESSIONS · EPHEMERAL"))
-            .children(sections)
             .child(
                 div()
-                    .mt_auto()
-                    .pt_4()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("Frames stream from a headless browser. Sync stays inside one session; typing, forms and clicks are never broadcast."),
+                    .h(px(80.))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(6.))
+                    .px(px(16.))
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
+                    .child(theme::caps("WORKSPACE", ACCENT))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(self.workspace.name.clone()),
+                    ),
             )
+            .child(
+                div()
+                    .id("device-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .px(px(10.))
+                    .py(px(16.))
+                    .child(
+                        div()
+                            .h(px(20.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px(px(6.))
+                            .child(theme::caps("SESSIONS", MUTED))
+                            .child(pill("Ephemeral")),
+                    )
+                    .children(sections),
+            )
+            .child(
+                div().flex_none().px(px(12.)).pt(px(8.)).pb(px(14.)).child(theme::note(
+                    Icon::Info,
+                    "Frames stream from a headless browser. Sync stays inside one session; typing, forms and clicks are never broadcast.",
+                )),
+            )
+    }
+
+    /// The panel right of the canvas: Workspace or Console, one at a time.
+    fn inspector(&self, panel: SidePanel, cx: &mut Context<Self>) -> AnyElement {
+        let tab = |id: &'static str, glyph: Icon, label: &'static str, which: SidePanel| {
+            let on = panel == which;
+            let color = if on { TEXT } else { 0xa4abb5 };
+            div()
+                .id(id)
+                .h(px(28.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(7.))
+                .border_1()
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(color))
+                .when(on, |this| {
+                    this.border_color(rgb(0x2f343b)).bg(rgb(0x1f2328))
+                })
+                .when(!on, |this| {
+                    this.border_color(rgba(0))
+                        .hover(|style| style.bg(rgb(HOVER)))
+                })
+                .child(theme::icon(glyph, 13., color))
+                .child(label)
+                .on_click(cx.listener(move |view, _, _, cx| view.show_panel(Some(which), cx)))
+        };
+        div()
+            .w(px(INSPECTOR_WIDTH))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(rgb(CHROME))
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .h(px(48.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(12.))
+                    .pr(px(10.))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(2.))
+                            .p(px(2.))
+                            .rounded(px(9.))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(CANVAS))
+                            .child(tab(
+                                "panel-tab-workspace",
+                                Icon::Workspace,
+                                "Workspace",
+                                SidePanel::Workspace,
+                            ))
+                            .child(tab(
+                                "panel-tab-console",
+                                Icon::Console,
+                                "Console",
+                                SidePanel::Console,
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        theme::icon_button("panel-close", Icon::Close, 0xa4abb5)
+                            .on_click(cx.listener(|view, _, _, cx| view.show_panel(None, cx))),
+                    ),
+            )
+            .child(match panel {
+                SidePanel::Workspace => self.workspace_panel(cx),
+                SidePanel::Console => self.console_panel(cx),
+            })
+            .into_any_element()
     }
 
     /// The workspace panel: the draft's devices with Remove, the presets with
@@ -2404,32 +2673,39 @@ impl LiveView {
         let changed = self.draft_changed();
         let removable = self.draft.devices.len() > 1;
         // Filled buttons: Add, Apply and Save in the accent color, Remove in
-        // the danger color, and muted headings, so a real-window check can
-        // find each kind of button by its color alone.
-        let small = |id: (&'static str, usize), label: &'static str, color: u32| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .rounded_md()
-                .bg(rgb(color))
-                .text_color(rgb(BG))
-                .text_xs()
-                .px_2()
-                .py_0p5()
-                .child(label)
-        };
-        let action = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .rounded_md()
-                .bg(rgb(if primary { ACCENT } else { RAISED }))
-                .text_color(rgb(if primary { BG } else { TEXT }))
-                .px_3()
-                .py_1()
-                .text_sm()
-                .child(label)
-        };
+        // the danger color, so a real-window check can find each kind of
+        // button by its color alone.
+        let save = theme::button(
+            "save-draft",
+            if !changed && self.workspace_path.is_some() && !self.saving_workspace {
+                Tone::Primary
+            } else if self.saving_workspace || self.lifecycle.is_closing() {
+                Tone::Disabled
+            } else {
+                Tone::Secondary
+            },
+            32.,
+        )
+        .child(theme::icon(
+            Icon::Save,
+            14.,
+            if !changed && self.workspace_path.is_some() && !self.saving_workspace {
+                INK
+            } else {
+                TEXT_2
+            },
+        ))
+        .child(if self.saving_workspace {
+            "Saving…"
+        } else {
+            "Save"
+        })
+        .when(
+            !self.saving_workspace && !self.lifecycle.is_closing(),
+            |button| {
+                button.on_click(cx.listener(|view, _, window, cx| view.save_draft(window, cx)))
+            },
+        );
         let devices: Vec<AnyElement> = self
             .draft
             .devices
@@ -2437,122 +2713,279 @@ impl LiveView {
             .enumerate()
             .map(|(index, device)| {
                 div()
+                    .h(px(38.))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .py_1()
-                    .text_xs()
+                    .gap(px(10.))
+                    .pl(px(2.))
+                    .pr(px(4.))
+                    .when(index > 0, |this| {
+                        this.border_t_1().border_color(rgb(DIVIDER))
+                    })
+                    .child(theme::icon(
+                        theme::device_icon(device.width, device.mobile),
+                        15.,
+                        0xa4abb5,
+                    ))
                     .child(
                         div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(format!(
-                                "{} · {}×{}{} · {}",
-                                device.name,
+                            .flex_none()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(device.name.clone()),
+                    )
+                    .child(
+                        theme::mono(
+                            format!(
+                                "{}×{}{} · {}",
                                 device.width,
                                 device.height,
                                 scale_suffix(device.device_scale_factor),
                                 device.session
-                            )),
+                            ),
+                            11.,
+                            MUTED,
+                        )
+                        .min_w_0()
+                        .truncate(),
                     )
                     .when(removable, |row| {
-                        row.child(small(("remove-device", index), "Remove", DANGER).on_click(
-                            cx.listener(move |view, _, _, cx| view.remove_draft_device(index, cx)),
-                        ))
+                        row.child(
+                            div().flex_1().flex().justify_end().child(
+                                theme::button(("remove-device", index), Tone::Danger, 24.)
+                                    .text_size(px(11.5))
+                                    .child("Remove")
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.remove_draft_device(index, cx)
+                                    })),
+                            ),
+                        )
                     })
                     .into_any_element()
             })
             .collect();
-        let presets: Vec<AnyElement> =
-            PRESETS
-                .iter()
-                .enumerate()
-                .map(|(index, preset)| {
+        let tile = |index: usize, preset: &broxser_core::DevicePreset| {
+            div()
+                .id(("add-preset", index))
+                .flex_1()
+                .min_w_0()
+                .h(px(50.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .pl(px(12.))
+                .pr(px(10.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD))
+                .cursor_pointer()
+                .hover(|style| style.border_color(rgb(BORDER_STRONG)))
+                .child(theme::icon(
+                    theme::device_icon(preset.width, preset.mobile),
+                    15.,
+                    0xa4abb5,
+                ))
+                .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(preset.name),
+                        )
+                        .child(
+                            theme::mono(
+                                format!(
+                                    "{}×{}{}",
+                                    preset.width,
+                                    preset.height,
+                                    scale_suffix(preset.device_scale_factor)
+                                ),
+                                10.5,
+                                MUTED,
+                            )
+                            .truncate(),
+                        ),
+                )
+                .child(
+                    div()
+                        .size(px(22.))
+                        .flex_none()
                         .flex()
                         .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .py_1()
-                        .text_sm()
-                        .child(format!(
-                            "{} · {}×{}{}",
-                            preset.name,
-                            preset.width,
-                            preset.height,
-                            scale_suffix(preset.device_scale_factor)
-                        ))
-                        .child(small(("add-preset", index), "Add", ACCENT).on_click(
-                            cx.listener(move |view, _, _, cx| view.add_preset(index, cx)),
-                        ))
-                        .into_any_element()
-                })
-                .collect();
-        let source = match &self.workspace_path {
-            Some(path) => path.display().to_string(),
-            None => "Demo workspace; started without --workspace, so Save has no file".to_owned(),
+                        .justify_center()
+                        .rounded(px(6.))
+                        .bg(rgb(ACCENT))
+                        .child(theme::icon(Icon::Plus, 12., INK)),
+                )
+                .on_click(cx.listener(move |view, _, _, cx| view.add_preset(index, cx)))
+                .into_any_element()
         };
-        div()
-            .id("workspace-panel-body")
-            .w(px(340.))
-            .h_full()
-            .flex_none()
+        let mut tiles = PRESETS
+            .iter()
+            .enumerate()
+            .map(|(index, preset)| tile(index, preset));
+        let mut preset_rows: Vec<AnyElement> = Vec::new();
+        while let Some(first) = tiles.next() {
+            preset_rows.push(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(first)
+                    .children(tiles.next())
+                    .into_any_element(),
+            );
+        }
+        let file = match &self.workspace_path {
+            Some(path) => div()
+                .h(px(34.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(10.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(theme::WELL))
+                .child(theme::icon(Icon::File, 14., MUTED))
+                .child(
+                    theme::mono(path.display().to_string(), 12., 0xd7dbe0)
+                        .min_w_0()
+                        .truncate(),
+                ),
+            None => div()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(rgb(TEXT_2))
+                .child("Demo workspace; started without --workspace, so Save has no file"),
+        };
+        let actions = div()
             .flex()
             .flex_col()
-            .gap_2()
-            .overflow_y_scroll()
-            .bg(rgb(SURFACE))
-            .border_r_1()
-            .border_color(rgb(BORDER))
-            .p_4()
-            .child(div().text_xs().text_color(rgb(MUTED)).child("WORKSPACE FILE"))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(source))
-            // Actions and the notice stay at the top, above the lists that may
-            // scroll: Apply and Discard while the draft differs, Save always.
+            .gap(px(12.))
+            .p(px(14.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(BORDER_STRONG))
+            .bg(rgb(CARD))
+            .when(changed, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(theme::dot(WARN, 7.))
+                                .child("Draft not applied"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .line_height(px(18.))
+                                .text_color(rgb(TEXT_2))
+                                .child("Apply restarts the runtime with this draft. Until then the running devices do not change."),
+                        ),
+                )
+            })
+            .when(!changed, |this| {
+                this.child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(rgb(TEXT_2))
+                        .child("The draft matches the running devices. Save writes it and the address to the file."),
+                )
+            })
             .child(
                 div()
-                    .mt_3()
                     .flex()
-                    .flex_wrap()
-                    .gap_2()
+                    .items_center()
+                    .gap(px(8.))
                     .when(changed, |row| {
-                        row.child(action("apply-draft", "Apply (restart)", true).on_click(
-                            cx.listener(|view, _, window, cx| view.restart(window, cx)),
-                        ))
+                        row.child(
+                            theme::button("apply-draft", Tone::Primary, 32.)
+                                .child(theme::icon(Icon::Reload, 14., INK))
+                                .child("Apply (restart)")
+                                .on_click(cx.listener(|view, _, window, cx| view.restart(window, cx))),
+                        )
                         .child(
-                            action("discard-draft", "Discard", false)
+                            theme::button("discard-draft", Tone::Secondary, 32.)
+                                .child("Discard")
                                 .on_click(cx.listener(|view, _, _, cx| view.discard_draft(cx))),
                         )
                     })
-                    .child(
-                        action(
-                            "save-draft",
-                            if self.saving_workspace { "Saving…" } else { "Save" },
-                            !changed && self.workspace_path.is_some() && !self.saving_workspace,
-                        )
-                        .when(!self.saving_workspace && !self.lifecycle.is_closing(), |button| {
-                            button.on_click(cx.listener(|view, _, window, cx| view.save_draft(window, cx)))
-                        }),
-                    ),
+                    .child(div().flex_1().flex().justify_end().child(save)),
             )
-            .children(
-                self.panel_notice
-                    .clone()
-                    .map(|notice| div().text_xs().text_color(rgb(WARN)).child(notice)),
-            )
-            .child(div().mt_3().text_xs().text_color(rgb(MUTED)).child("DEVICES"))
-            .children(devices)
-            .child(div().mt_3().text_xs().text_color(rgb(MUTED)).child("ADD A DEVICE"))
+            .children(self.panel_notice.clone().map(|notice| {
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(rgb(WARN_TEXT))
+                    .child(notice)
+            }));
+        div()
+            .id("workspace-panel-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .p(px(16.))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("Into the selected device's session. Generic viewport classes; edit the file for exact sizes."),
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(theme::caps("WORKSPACE FILE", MUTED))
+                    .child(file),
             )
-            .children(presets)
+            // The actions stay above the lists that may scroll: Apply and
+            // Discard while the draft differs, Save always.
+            .child(actions)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .pb(px(4.))
+                            .child(theme::caps("DEVICES IN THE DRAFT", MUTED))
+                            .child(theme::mono(self.draft.devices.len().to_string(), 11., MUTED)),
+                    )
+                    .children(devices),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(theme::caps("ADD A DEVICE", MUTED))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(TEXT_2))
+                            .child("Into the selected device's session. Generic viewport classes; edit the file for exact sizes."),
+                    )
+                    .children(preset_rows),
+            )
             .into_any_element()
     }
 
@@ -2565,58 +2998,138 @@ impl LiveView {
             && !self.saving_report
             && self.lifecycle.is_live()
             && matches!(self.status.runtime, RuntimeState::Running { .. });
-        let panel = div()
-            .id("console-panel")
-            .w(px(340.))
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_4()
-            .overflow_y_scroll()
-            .border_r_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
-            .child(div().text_xs().text_color(rgb(MUTED)).child("CONSOLE"));
         let Some((device, status)) = self.selected.and_then(|index| {
             Some((
                 self.workspace.devices.get(index)?,
                 self.status.devices.get(index)?,
             ))
         }) else {
-            return panel
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("Select a device to see its console."),
-                )
+            return div()
+                .flex_1()
+                .p(px(16.))
+                .text_color(rgb(MUTED))
+                .child("Select a device to see its console.")
                 .into_any_element();
         };
-        panel
+        let session = self
+            .workspace
+            .sessions
+            .iter()
+            .position(|session| session.id == device.session);
+        let count = |count: u32, one: &str, many: &str, color: u32, text: u32| {
+            div()
+                .h(px(22.))
+                .px(px(8.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(5.))
+                .rounded_full()
+                .bg(theme::tint(color, 0x21))
+                .text_size(px(11.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(text))
+                .child(theme::dot(color, 5.))
+                .child(plural(count, one, many))
+        };
+        let counts = div()
+            .flex_1()
+            .flex()
+            .justify_end()
+            .gap(px(6.))
+            .when(status.console_errors > 0, |this| {
+                this.child(count(
+                    status.console_errors,
+                    "error",
+                    "errors",
+                    DANGER,
+                    DANGER_TEXT,
+                ))
+            })
+            .when(status.console_warnings > 0, |this| {
+                this.child(count(
+                    status.console_warnings,
+                    "warning",
+                    "warnings",
+                    WARN,
+                    WARN_TEXT,
+                ))
+            })
+            .when(
+                status.console_errors == 0 && status.console_warnings == 0,
+                |this| {
+                    this.text_size(px(11.5))
+                        .text_color(rgb(MUTED))
+                        .child(console_counts(status))
+                },
+            );
+        let (report_text, report_failed): (SharedString, bool) =
+            match (&self.report_notice, &self.reports) {
+                (Some((notice, failed)), _) => (notice.clone().into(), *failed),
+                (None, _) if self.reports_loading => {
+                    ("Locating the reports directory…".into(), false)
+                }
+                (None, Some(dir)) => (
+                    format!(
+                        "Save report writes a screenshot and a redacted report to {}.",
+                        dir.display()
+                    )
+                    .into(),
+                    false,
+                ),
+                (None, None) => (
+                    "Save report needs BROXSER_REPORT_DIR or a home directory.".into(),
+                    false,
+                ),
+            };
+        let report_label = if self.saving_report {
+            "Saving…"
+        } else if self.report.is_some() {
+            "Taking…"
+        } else {
+            "Save report"
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
             .child(
                 div()
+                    .flex_none()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                    .flex_col()
+                    .gap(px(12.))
+                    .pt(px(14.))
+                    .px(px(16.))
+                    .pb(px(16.))
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .min_w_0()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(theme::icon(
+                                theme::device_icon(device.width, device.mobile),
+                                15.,
+                                TEXT_2,
+                            ))
                             .child(
                                 div()
-                                    .text_sm()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(14.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(device.name.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(console_counts(status)),
-                            ),
+                            .children(session.map(|session| {
+                                theme::tag(
+                                    self.workspace.sessions[session].name.clone(),
+                                    theme::session_hue(session),
+                                )
+                            }))
+                            .child(counts),
                     )
                     // Filled, Save report in the accent and Clear in the
                     // danger color, so a real-window check can find each by
@@ -2624,152 +3137,201 @@ impl LiveView {
                     .child(
                         div()
                             .flex()
-                            .gap_2()
+                            .gap(px(8.))
                             .child(
-                                div()
-                                    .id("console-save-report")
-                                    .w(px(100.))
-                                    .flex_none()
-                                    .text_center()
-                                    .rounded_md()
-                                    .bg(rgb(if can_save_report { ACCENT } else { RAISED }))
-                                    .text_color(rgb(if can_save_report { BG } else { MUTED }))
-                                    .px_2()
-                                    .py_1()
-                                    .text_sm()
-                                    .child(if self.saving_report {
-                                        "Saving…"
-                                    } else if self.report.is_some() {
-                                        "Taking…"
+                                theme::button(
+                                    "console-save-report",
+                                    if can_save_report {
+                                        Tone::Primary
                                     } else {
-                                        "Save report"
-                                    })
-                                    .when(can_save_report, |button| {
-                                        button.cursor_pointer().on_click(
-                                            cx.listener(|view, _, _, cx| view.save_report(cx)),
-                                        )
-                                    }),
+                                        Tone::Disabled
+                                    },
+                                    32.,
+                                )
+                                .w(px(124.))
+                                .child(theme::icon(
+                                    Icon::Report,
+                                    14.,
+                                    if can_save_report { INK } else { MUTED },
+                                ))
+                                .child(report_label)
+                                .when(can_save_report, |button| {
+                                    button.on_click(
+                                        cx.listener(|view, _, _, cx| view.save_report(cx)),
+                                    )
+                                }),
                             )
                             .child(
-                                div()
-                                    .id("console-clear")
-                                    .cursor_pointer()
-                                    .rounded_md()
-                                    .bg(rgb(DANGER))
-                                    .text_color(rgb(BG))
-                                    .px_2()
-                                    .py_1()
-                                    .text_sm()
+                                theme::button("console-clear", Tone::Danger, 32.)
+                                    .child(theme::icon(Icon::Clear, 14., INK))
                                     .child("Clear")
                                     .on_click(cx.listener(|view, _, _, cx| view.clear_console(cx))),
                             ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(if report_failed { WARN_TEXT } else { MUTED }))
+                            .child(report_text),
                     ),
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(match &self.report_notice {
-                        Some((_, true)) => WARN,
-                        _ => MUTED,
-                    }))
-                    .child(match (&self.report_notice, &self.reports) {
-                        (Some((notice, _)), _) => notice.clone(),
-                        (None, _) if self.reports_loading => {
-                            "Locating the reports directory…".into()
-                        }
-                        (None, Some(dir)) => format!(
-                            "Save report writes a screenshot and a redacted report to {}.",
-                            dir.display()
-                        ),
-                        (None, None) => {
-                            "Save report needs BROXSER_REPORT_DIR or a home directory.".into()
-                        }
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
+                    .flex_none()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
+                    .text_size(px(11.5))
                     .text_color(rgb(MUTED))
                     .child("Newest first. Kept in memory until Clear or Restart."),
             )
-            .children(self.console.is_empty().then(|| {
+            .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("No console messages.")
-            }))
-            .children(self.console.iter().rev().map(console_row))
+                    .id("console-entries")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(self.console.is_empty().then(|| {
+                        div()
+                            .p(px(16.))
+                            .text_color(rgb(MUTED))
+                            .child("No console messages.")
+                    }))
+                    .children(self.console.iter().rev().map(console_row)),
+            )
             .into_any_element()
     }
 
     fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let runtime = match &self.status.runtime {
-            _ if self.lifecycle.is_restarting() => {
-                "Restarting… stopping the previous browser".to_owned()
-            }
-            RuntimeState::Starting => "Starting browser…".to_owned(),
+        let (color, label, detail) = match &self.status.runtime {
+            _ if self.lifecycle.is_restarting() => (
+                INFO,
+                "Restarting…",
+                Some("stopping the previous browser".to_owned()),
+            ),
+            RuntimeState::Starting => (INFO, "Starting browser…", None),
             RuntimeState::Running { product, protocol } => {
-                format!("Live · {product} · CDP {protocol}")
+                (ACCENT, "Live", Some(format!("{product} · CDP {protocol}")))
             }
-            RuntimeState::Stopped { error: Some(error) } => format!("Stopped: {error}"),
-            RuntimeState::Stopped { error: None } => "Stopped".to_owned(),
+            RuntimeState::Stopped { error: Some(error) } => {
+                (DANGER, "Stopped", Some(error.clone()))
+            }
+            RuntimeState::Stopped { error: None } => (MUTED, "Stopped", None),
         };
-        let runtime = if self.selected.is_none() {
-            format!("{runtime} · All devices hidden")
-        } else {
-            runtime
-        };
+        let failed = matches!(
+            self.status.runtime,
+            RuntimeState::Stopped { error: Some(_) }
+        ) && !self.lifecycle.is_restarting();
         let stopped =
             matches!(self.status.runtime, RuntimeState::Stopped { .. }) || self.session.is_none();
-        div()
-            .min_h(px(44.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_4()
-            .px_6()
-            .border_t_1()
-            .border_color(rgb(BORDER))
-            .text_xs()
-            .text_color(rgb(MUTED))
-            .child(
-                div()
-                    .flex_1()
+        let restart = stopped && self.lifecycle.is_live() && self.browser.is_some();
+        let quiet = self.notice.is_none() && self.status.protocol_error.is_none();
+        theme::status_bar()
+            .child(theme::state(color, label))
+            .children(detail.map(|detail| {
+                theme::mono(detail, 11.5, if failed { DANGER_TEXT } else { TEXT_2 })
                     .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(runtime),
-            )
+                    .truncate()
+            }))
+            .when(self.selected.is_none(), |bar| {
+                bar.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_color(rgb(TEXT_2))
+                        .child(theme::icon(Icon::Hidden, 13., TEXT_2))
+                        .child("All devices hidden"),
+                )
+            })
             .children(self.status.protocol_error.clone().map(|error| {
                 div()
-                    .text_color(rgb(WARN))
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgb(WARN_TEXT))
                     .child(format!("Input error: {error}"))
             }))
-            .children(
-                self.notice
-                    .clone()
-                    .map(|notice| div().text_color(rgb(WARN)).child(notice)),
-            )
+            .children(self.notice.clone().map(|notice| {
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(rgb(WARN_TEXT))
+                    .child(theme::icon(Icon::Warning, 13., WARN))
+                    .child(div().min_w_0().truncate().child(notice))
+            }))
+            .child(div().flex_1())
             // Offered only while no restart or close runs (ADR 0009).
-            .when(
-                stopped && self.lifecycle.is_live() && self.browser.is_some(),
-                |bar| {
-                    bar.child(
-                        div()
-                            .id("restart")
-                            .cursor_pointer()
-                            .rounded_md()
-                            .bg(rgb(ACCENT))
-                            .text_color(rgb(BG))
-                            .px_3()
-                            .py_1()
-                            .child("Restart runtime")
-                            .on_click(cx.listener(|view, _, window, cx| view.restart(window, cx))),
-                    )
-                },
-            )
+            .when(restart, |bar| {
+                bar.child(
+                    theme::button("restart", Tone::Primary, 24.)
+                        .pl(px(8.))
+                        .pr(px(10.))
+                        .child(theme::icon(Icon::Reload, 12., INK))
+                        .child("Restart runtime")
+                        .on_click(cx.listener(|view, _, window, cx| view.restart(window, cx))),
+                )
+            })
+            .when(!restart && quiet, |bar| {
+                bar.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .gap(px(16.))
+                        .pr(px(11.))
+                        .child(theme::shortcut(&["Ctrl", "R"], "Reload selected"))
+                        .child(theme::shortcut(&["Ctrl", "Shift", "J"], "Console"))
+                        .child(theme::shortcut(&["Ctrl", "Shift", "W"], "Workspace")),
+                )
+            })
     }
+}
+
+/// A report on a card, below its frame: an icon and a title, then what the
+/// caller adds.
+fn notice(width: f32, glyph: Icon, title: &'static str) -> gpui::Div {
+    div()
+        .w(px(width))
+        .p(px(11.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(rgb(BORDER_STRONG))
+        .bg(rgb(CHROME))
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex()
+                .gap(px(7.))
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(0xd7dbe0))
+                .child(div().pt(px(1.5)).child(theme::icon(glyph, 13., 0xd7dbe0)))
+                .child(div().flex_1().min_w_0().child(title)),
+        )
+}
+
+/// A quiet outlined label, such as the sessions' lifetime.
+fn pill(label: &'static str) -> gpui::Div {
+    div()
+        .h(px(20.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(BORDER_STRONG))
+        .text_size(px(11.))
+        .text_color(rgb(0xa4abb5))
+        .child(label)
 }
 
 impl Render for LiveView {
@@ -2782,9 +3344,10 @@ impl Render for LiveView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(CANVAS))
             .text_color(rgb(TEXT))
-            .font_family("sans-serif")
+            .font_family(theme::SANS)
+            .text_size(px(13.))
             .on_action(cx.listener(|view, _: &Quit, window, cx| {
                 if view.request_close(window, cx) {
                     window.remove_window();
@@ -2809,47 +3372,31 @@ impl Render for LiveView {
                     .flex_1()
                     .min_h_0()
                     .child(self.sidebar(cx))
-                    .children(self.panel.map(|panel| match panel {
-                        SidePanel::Workspace => self.workspace_panel(cx),
-                        SidePanel::Console => self.console_panel(cx),
-                    }))
                     .child(
                         div()
+                            .id("canvas")
+                            .track_focus(&self.focus)
+                            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                                view.key_down(&event.keystroke, event.is_held, window, cx);
+                                cx.stop_propagation();
+                            }))
                             .flex_1()
                             .min_w_0()
-                            .flex()
-                            .flex_col()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p(px(24.))
                             .child(
                                 div()
-                                    .id("canvas")
-                                    .track_focus(&self.focus)
-                                    .on_key_down(cx.listener(
-                                        |view, event: &KeyDownEvent, window, cx| {
-                                            view.key_down(
-                                                &event.keystroke,
-                                                event.is_held,
-                                                window,
-                                                cx,
-                                            );
-                                            cx.stop_propagation();
-                                        },
-                                    ))
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .p_6()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .items_start()
-                                            .gap_5()
-                                            .children(cards),
-                                    ),
-                            )
-                            .child(self.status_bar(cx)),
-                    ),
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_start()
+                                    .gap(px(20.))
+                                    .children(cards),
+                            ),
+                    )
+                    .children(self.panel.map(|panel| self.inspector(panel, cx))),
             )
+            .child(self.status_bar(cx))
     }
 }
 
@@ -3229,8 +3776,6 @@ fn decode(frame: Frame) -> Result<Arc<RenderImage>> {
     Ok(Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])))
 }
 
-/// The card's activity line: the stream state, then what the page tried that
-/// Broxser closed or refused (ADR 0015, ADR 0016).
 /// ` @2×` for a device scale factor other than 1, else nothing.
 fn scale_suffix(scale: f64) -> String {
     if scale == 1.0 {
@@ -3240,19 +3785,21 @@ fn scale_suffix(scale: f64) -> String {
     }
 }
 
+/// "1 error", "2 errors".
+fn plural(count: u32, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 /// "2 errors · 1 warning", or that there are none.
 fn console_counts(status: &DeviceStatus) -> String {
-    let count = |count: u32, one: &str, many: &str| {
-        format!("{count} {}", if count == 1 { one } else { many })
-    };
     match (status.console_errors, status.console_warnings) {
         (0, 0) => "No errors or warnings".into(),
-        (errors, 0) => count(errors, "error", "errors"),
-        (0, warnings) => count(warnings, "warning", "warnings"),
+        (errors, 0) => plural(errors, "error", "errors"),
+        (0, warnings) => plural(warnings, "warning", "warnings"),
         (errors, warnings) => format!(
             "{} · {}",
-            count(errors, "error", "errors"),
-            count(warnings, "warning", "warnings")
+            plural(errors, "error", "errors"),
+            plural(warnings, "warning", "warnings")
         ),
     }
 }
@@ -3260,10 +3807,31 @@ fn console_counts(status: &DeviceStatus) -> String {
 /// One console entry as the panel shows it: its level, what reported it,
 /// its text and where it came from. Page text is shown, never interpreted.
 fn console_row(entry: &ConsoleEntry) -> AnyElement {
-    let (level, color) = match entry.level {
-        ConsoleLevel::Error => ("Error", DANGER),
-        ConsoleLevel::Warning => ("Warning", WARN),
-        ConsoleLevel::Info => ("Info", MUTED),
+    let row = div()
+        .flex()
+        .gap(px(10.))
+        .px(px(16.))
+        .border_b_1()
+        .border_color(rgb(DIVIDER));
+    if entry.kind == ConsoleKind::Navigation {
+        return row
+            .items_center()
+            .py(px(9.))
+            .text_size(px(11.5))
+            .text_color(rgb(MUTED))
+            .child(theme::icon(Icon::Navigated, 14., MUTED))
+            .child(div().flex_none().child("Navigated to"))
+            .child(
+                theme::mono(entry.location.clone(), 11., 0xa4abb5)
+                    .min_w_0()
+                    .truncate(),
+            )
+            .into_any_element();
+    }
+    let (level, glyph, color, label) = match entry.level {
+        ConsoleLevel::Error => ("Error", Icon::Error, DANGER, DANGER_TEXT),
+        ConsoleLevel::Warning => ("Warning", Icon::Warning, WARN, WARN_TEXT),
+        ConsoleLevel::Info => ("Info", Icon::Info, MUTED, 0xa4abb5),
     };
     let mut tags: Vec<String> = Vec::new();
     match entry.kind {
@@ -3280,58 +3848,73 @@ fn console_row(entry: &ConsoleEntry) -> AnyElement {
     if entry.repeats > 1 {
         tags.push(format!("×{}", entry.repeats));
     }
-    let row = div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .py_1()
-        .border_b_1()
-        .border_color(rgb(BORDER))
-        .text_xs();
-    if entry.kind == ConsoleKind::Navigation {
-        return row
-            .text_color(rgb(MUTED))
-            .child(format!("Navigated to {}", entry.location))
-            .into_any_element();
-    }
-    row.child(
-        div()
-            .flex()
-            .gap_2()
-            .child(div().text_color(rgb(color)).child(level))
-            .children(
-                tags.into_iter()
-                    .map(|tag| div().text_color(rgb(MUTED)).child(tag)),
-            ),
-    )
-    .child(div().w_full().child(entry.text.clone()))
-    .children((!entry.location.is_empty()).then(|| {
-        div()
-            .text_color(rgb(MUTED))
-            .overflow_hidden()
-            .text_ellipsis()
-            .whitespace_nowrap()
-            .child(entry.location.clone())
-    }))
-    .into_any_element()
+    row.py(px(10.))
+        // Errors and warnings get a faint wash of their color.
+        .when(entry.level != ConsoleLevel::Info, |row| {
+            row.bg(theme::tint(color, 0x0d))
+        })
+        .child(div().pt(px(1.)).child(theme::icon(glyph, 14., color)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(label))
+                                .child(level),
+                        )
+                        .children(tags.into_iter().map(|tag| {
+                            theme::mono(tag, 10.5, TEXT_2)
+                                .h(px(18.))
+                                .px(px(6.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(5.))
+                                .border_1()
+                                .border_color(rgb(0x2f343b))
+                        })),
+                )
+                .child(
+                    theme::mono(entry.text.clone(), 12., TEXT)
+                        .w_full()
+                        .line_height(px(18.)),
+                )
+                .children(
+                    (!entry.location.is_empty())
+                        .then(|| theme::mono(entry.location.clone(), 11., MUTED).truncate()),
+                ),
+        )
+        .into_any_element()
 }
 
-fn activity_line(status: &DeviceStatus) -> String {
-    let mut parts = vec![if status.streaming {
-        "Streaming".to_owned()
-    } else {
-        "Paused".to_owned()
-    }];
-    for (count, what) in [
-        (status.popups, "window(s) closed"),
-        (status.downloads, "download(s) refused"),
-        (status.file_choosers, "file chooser(s) cancelled"),
-    ] {
-        if count > 0 {
-            parts.push(format!("{count} {what}"));
-        }
-    }
-    parts.join(" · ")
+/// What the page tried that Broxser closed or refused (ADR 0015, ADR 0016),
+/// or nothing.
+fn activity_line(status: &DeviceStatus) -> Option<String> {
+    let parts: Vec<String> = [
+        (status.popups, "window closed", "windows closed"),
+        (status.downloads, "download refused", "downloads refused"),
+        (
+            status.file_choosers,
+            "file chooser cancelled",
+            "file choosers cancelled",
+        ),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, one, many)| plural(count, one, many))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 #[cfg(test)]
@@ -3923,14 +4506,20 @@ mod tests {
             streaming: true,
             ..DeviceStatus::default()
         };
-        assert_eq!(activity_line(&status), "Streaming");
-        status.streaming = false;
+        assert_eq!(activity_line(&status), None);
         status.popups = 2;
         status.downloads = 1;
         status.file_choosers = 3;
         assert_eq!(
-            activity_line(&status),
-            "Paused · 2 window(s) closed · 1 download(s) refused · 3 file chooser(s) cancelled"
+            activity_line(&status).as_deref(),
+            Some("2 windows closed · 1 download refused · 3 file choosers cancelled")
+        );
+        status.popups = 1;
+        status.downloads = 0;
+        status.file_choosers = 1;
+        assert_eq!(
+            activity_line(&status).as_deref(),
+            Some("1 window closed · 1 file chooser cancelled")
         );
     }
 

@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parent.parent / "sbom.py"
 spec = importlib.util.spec_from_file_location("sbom", SCRIPT)
@@ -78,6 +79,26 @@ class LicenseTextTests(unittest.TestCase):
         self.assertIn("Copyright (c) the crate authors\n", sbom.standard_text("MIT", "crate", []))
         self.assertIsNone(sbom.standard_text("Apache-2.0 WITH LLVM-exception", "crate", []))
         self.assertIsNone(sbom.standard_text("Zlib", "crate", []))
+
+    def test_bundled_fonts_carry_their_license_alongside_crate_texts(self):
+        fonts = self.scratch / "fonts"
+        fonts.mkdir()
+        license_text = "Copyright 2024 The Geist Project Authors\nSIL OPEN FONT LICENSE Version 1.1\n"
+        (fonts / "OFL.txt").write_text(license_text)
+        font = {"SPDXID": "SPDXRef-font-geist-font-test", "name": "geist-font",
+                "versionInfo": "git-test", "licenseDeclared": "OFL-1.1"}
+        crate_id = "SPDXRef-crate-example-1.0.0"
+        crate = {"SPDXID": crate_id, "name": "example", "versionInfo": "1.0.0",
+                 "licenseDeclared": "MIT", "downloadLocation": "NOASSERTION"}
+        packages = {crate_id: {"manifest_path": str(self.crate("example", {"LICENSE": "mit\n"}) / "Cargo.toml")}}
+        with patch.object(sbom, "FONTS", fonts):
+            text, texts, problems = sbom.license_bundle(
+                {"name": "broxser-test", "packages": [font, crate]}, packages)
+        self.assertEqual(problems, [])
+        self.assertEqual(texts, 2)
+        self.assertIn("geist-font git-test: fonts/OFL.txt", text)
+        self.assertIn(license_text, text)
+        self.assertIn("example 1.0.0: LICENSE", text)
 
     def bundle(self, crates):
         packages, entries = {}, []

@@ -3,6 +3,7 @@ mod lifecycle;
 mod live_view;
 mod report;
 mod static_view;
+mod theme;
 mod url_input;
 
 use anyhow::{Context as _, Result};
@@ -17,17 +18,6 @@ use live_view::LiveView;
 use static_view::StaticView;
 use std::borrow::Cow;
 use std::path::PathBuf;
-
-const BG: u32 = 0x111514;
-const SURFACE: u32 = 0x1b211f;
-const RAISED: u32 = 0x252c29;
-const BORDER: u32 = 0x35403a;
-const TEXT: u32 = 0xe8eee9;
-const MUTED: u32 = 0x9aa9a0;
-const ACCENT: u32 = 0x7ce29b;
-const WARN: u32 = 0xf2b872;
-/// Destructive actions, such as removing a device from the draft.
-const DANGER: u32 = 0xe07a7a;
 
 actions!(
     broxser,
@@ -77,9 +67,13 @@ fn state_path() -> Option<PathBuf> {
     Some(base.join("broxser").join("state.json"))
 }
 
+/// The embedded icons (ADR 0027), then files by path.
 struct FileAssets;
 impl AssetSource for FileAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(icon) = theme::icon_asset(path) {
+            return Ok(Some(Cow::Borrowed(icon)));
+        }
         Ok(Some(
             std::fs::read(path)
                 .with_context(|| format!("read image {path}"))?
@@ -141,6 +135,10 @@ fn main() -> Result<()> {
     Application::new()
         .with_assets(FileAssets)
         .run(move |cx: &mut App| {
+            // Without them GPUI falls back to the system faces; the shell still works.
+            if let Err(error) = cx.text_system().add_fonts(theme::fonts()) {
+                eprintln!("broxser: could not load the bundled fonts: {error:#}");
+            }
             cx.bind_keys([
                 KeyBinding::new("ctrl-q", Quit, None),
                 KeyBinding::new("ctrl-r", Refresh, None),
